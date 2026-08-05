@@ -1,15 +1,15 @@
 # Known Issues
 
-## 1. FAT write corrupts the SD/eMMC directory (U-Boot dwmmc, NOT typewriter)
+## 1. eMMC FAT writes corrupt the directory (U-Boot rockchip_sdhci, NOT typewriter) — use the microSD instead
 
-**Symptom.** After saving a file, `fatls mmc 0:1` shows garbage: filenames with
-every character doubled and the extension mangled (`a.txt` → `AA`, `AA.TTT/`),
-directories where files should be, and sizes of `4294967295` (`0xFFFFFFFF`).
-Existing files (e.g. `extlinux.conf`, `vmlinuz`) can disappear. The file may be
-unreadable from Linux.
+**Symptom.** Saving a file to the **eMMC** (`mmc 0`) corrupts the FAT: `fatls`
+shows filenames with every character doubled and the extension mangled (`a.txt`
+→ `AA`, `AA.TTT/`), directories where files should be, and sizes of
+`4294967295` (`0xFFFFFFFF`). Existing files (e.g. `extlinux.conf`, `vmlinuz`)
+can disappear.
 
-**It is NOT the typewriter command.** This reproduces with U-Boot's own
-`fatwrite`, no editor involved. On a freshly `mkfs.vfat`'d card:
+**It is NOT the typewriter command, and NOT the FAT layer.** It reproduces with
+plain `fatwrite`, no editor:
 
 ```
 => mw.b 0x02000000 41 100
@@ -19,29 +19,35 @@ unreadable from Linux.
 CCRR.TTT/
 ```
 
-`ctrl.txt` comes back as `AA` / `CCRR.TTT/` — doubled bytes — with plain
-`fatwrite`. The corruption is below U-Boot's FAT filesystem layer, in the block
-transfer.
+**Confirmed root cause: the RK3399 eMMC write path (`rockchip_sdhci` / SDHCI
+SDMA).** The corruption is specific to the **eMMC controller's write
+direction**. Established by elimination:
 
-**Root cause (under investigation).** The board (RK3399 gru/kevin) uses the
-DesignWare MMC controller (`CONFIG_MMC_DW` / `CONFIG_MMC_DW_ROCKCHIP`) with
-IDMAC DMA. The every-other-byte doubling is characteristic of a block-transfer
-defect — a DMA/cache-coherency or block-size/stride problem in the write path —
-not the FAT software (which was audited: given a clean `"a.txt"`, the LFN slot
-builder and 8.3 short-name generator produce correct entries; the directory
-slot buffer is stack-allocated and zeroed). `CONFIG_BOUNCE_BUFFER=y` is set, so
-that safety net is present. The exact defect (suspected block-size related) is
-still being pinned down.
+- Reproduces with plain `fatwrite`/`fatmkdir` → below the FS layer.
+- **Reads are fine**; only writes corrupt → controller write path.
+- Not a heap/buffer bug: typewriter's serialization is byte-exact and I/O
+  buffers are exact-size malloc()'d.
+- Not sector-size mismatch: FAT logical sector (512) == card block len (512).
+- Not multi-block cluster: reformatting `-s 1` (single-block clusters) still
+  corrupts (the doubling only lessens: `CCRR` → `CC`).
+- Not data-cache coherency: `dcache off` does not fix it, and the cache is
+  write-through anyway.
+- The FAT software was audited — given a clean `"a.txt"`, the LFN slot builder
+  and 8.3 short-name generator produce correct entries.
+
+**microSD (`mmc 1`) works correctly.** The removable TF/microSD card uses a
+different controller and driver (`dw_mmc` / IDMAC), and FAT writes to it are
+clean. **This is the working write path — save to the microSD, not the eMMC.**
 
 **Workarounds.**
-- **Use typewriter read-only** (the default) or the no-arg scratch buffer for
-  on-device use; do actual file writes from Linux. typewriter refuses to save
-  unless invoked with a trailing `rw`, precisely so an accidental run can't
-  trigger this.
-- Forcing PIO/FIFO mode on the dw_mmc controller (device-tree `fifo-mode;` on
-  the `&sdmmc` node, or the driver equivalent) bypasses the DMA path and is
-  expected to write correctly (slower). Not applied here per project preference
-  to leave U-Boot's `mmc/` and the board DTS untouched.
+- **Save to the microSD** (`typewriter mmc 1:1 <file> rw`). Writes work.
+- On the eMMC, keep typewriter read-only (the default) or use the no-arg
+  scratch buffer; do eMMC file writes from Linux. typewriter refuses to save
+  unless invoked with a trailing `rw`, so an accidental run can't corrupt.
+
+**Upstream.** The `rockchip_sdhci` eMMC write defect on RK3399 is worth a U-Boot
+bug report. Not fixed here, per project preference to leave U-Boot's `mmc/`
+untouched.
 
 **What was verified on typewriter's side.** The editor's serialization is
 byte-exact: saving `你好\nabc\n` hands `fs_write` exactly
