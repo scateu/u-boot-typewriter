@@ -136,6 +136,26 @@ int main(void){
     printf("%s eMMC lock predicate\n", e_ok?"PASS":"FAIL");
     if(!e_ok) fails++;
 
+    /* Test 10: M-0..9 slot switching auto-saves and round-trips.
+     * (uses the in-memory disk in ubstubs_fs.c; needs writable) */
+    memset(s,0,sizeof(*s)); tw_video_init(s); s->num_lines=1; s->line_len[0]=0;
+    tw_bind_ime(s); s->ime.mode=TW_IME_OFF;
+    s->writable=1; s->fs.valid=1;
+    strncpy(s->filename,"1.txt",TW_MAX_FILENAME-1);
+    feed(s,"one");                       /* 1.txt = "one" */
+    tw_handle_key(s, KEY_META_0 + 2);    /* -> switch to 2.txt (saves 1.txt) */
+    int on2 = (strcmp(s->filename,"2.txt")==0);
+    feed(s,"two");                       /* 2.txt = "two" */
+    tw_handle_key(s, KEY_META_0 + 1);    /* -> back to 1.txt (saves 2.txt) */
+    dump_line0(s,buf);
+    int back1 = (strcmp(s->filename,"1.txt")==0) && strcmp(buf,"one")==0;
+    tw_handle_key(s, KEY_META_0 + 2);    /* -> 2.txt again */
+    dump_line0(s,buf);
+    int back2 = (strcmp(s->filename,"2.txt")==0) && strcmp(buf,"two")==0;
+    printf("%s M-N slots: on2=%d 1.txt='one'?%d 2.txt='two'?%d\n",
+        (on2&&back1&&back2)?"PASS":"FAIL", on2, back1, back2);
+    if(!(on2&&back1&&back2)) fails++;
+
     printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);
     return fails?1:0;
 }

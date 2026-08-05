@@ -65,6 +65,7 @@
 #define KEY_CTRL_N    0x0E       /* next line */
 #define KEY_CTRL_O    0x0F       /* write out (save) */
 #define KEY_CTRL_P    0x10       /* previous line */
+#define KEY_CTRL_R    0x12       /* open file (read into buffer) */
 #define KEY_CTRL_W    0x17       /* delete word backward */
 #define KEY_CTRL_X    0x18       /* exit */
 #define KEY_CTRL_Y    0x19       /* yank (paste kill buffer) */
@@ -85,6 +86,8 @@
 #define KEY_META_B      0x211    /* M-b: backward one word */
 #define KEY_META_D      0x212    /* M-d: kill word forward */
 #define KEY_META_W      0x213    /* M-w: search (moved off C-w) */
+#define KEY_META_0      0x220    /* M-0 .. M-9: open slot file N.txt */
+					/* (KEY_META_0 + N, N in 0..9) */
 
 /* ---- IME (Wubi) input state -------------------------------------------- */
 #define TW_IME_OFF    0          /* English: bytes typed literally */
@@ -117,6 +120,7 @@ struct tw_fs {
 #define TW_PROMPT_SAVE   1       /* "File Name to Write: " */
 #define TW_PROMPT_SEARCH 2       /* "Search: " */
 #define TW_PROMPT_EXIT   3       /* "Save modified buffer? (Y/N/C)" */
+#define TW_PROMPT_OPEN   4       /* "File to open: " (^R) */
 
 /* ---- editor state ------------------------------------------------------ */
 struct tw_state {

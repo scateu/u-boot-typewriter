@@ -93,7 +93,9 @@ static int tw_read_key(void)
 		}
 	}
 
-	/* Meta (Alt) chord: ESC followed by a letter. */
+	/* Meta (Alt) chord: ESC followed by a letter or digit. */
+	if (c >= '0' && c <= '9')
+		return KEY_META_0 + (c - '0');   /* M-N: open slot N.txt */
 	switch (c) {
 	case 'f': case 'F': return KEY_META_F;
 	case 'b': case 'B': return KEY_META_B;
@@ -570,6 +572,50 @@ static void tw_do_save(struct tw_state *s)
 		tw_status(s, "[ Error writing %s ]", s->filename);
 }
 
+/*
+ * Switch the buffer to `name` on the current device (used by ^R open and the
+ * M-0..M-9 slot keys). AlphaSmart-style: if the current buffer is writable and
+ * modified, auto-save it first, then load the new file. Cursor/scroll reset.
+ * The device (s->fs) is unchanged - only the filename changes.
+ */
+static void tw_switch_file(struct tw_state *s, const char *name)
+{
+	int saved = 0;
+
+	if (!name || !name[0])
+		return;
+
+	/* auto-save the outgoing buffer if we can and it changed */
+	if (s->writable && s->dirty && s->filename[0]) {
+		if (tw_file_save(s) != 0) {
+			tw_status(s, "[ Save of %s failed - not switching ]",
+				  s->filename);
+			return;                 /* don't lose edits on a bad save */
+		}
+		saved = 1;
+	}
+
+	strncpy(s->filename, name, TW_MAX_FILENAME - 1);
+	s->filename[TW_MAX_FILENAME - 1] = '\0';
+
+	if (tw_file_load(s, s->filename) < 0) {
+		tw_status(s, "[ Cannot open %s ]", s->filename);
+		return;
+	}
+	if (s->num_lines == 0) {
+		s->num_lines = 1;
+		s->line_len[0] = 0;
+	}
+	s->cur_row = 0;
+	s->cur_col = 0;
+	s->scroll_top = 0;
+	s->dirty = 0;
+	s->first_paint = 1;             /* full repaint for the new content */
+
+	tw_status(s, "[ %s%s - %d line%s ]", saved ? "Saved & opened " : "Opened ",
+		  s->filename, s->num_lines, s->num_lines == 1 ? "" : "s");
+}
+
 static void tw_prompt_start(struct tw_state *s, int which)
 {
 	s->prompt = which;
@@ -617,6 +663,9 @@ static void tw_prompt_key(struct tw_state *s, int key)
 			if (!tw_search(s, s->search_last))
 				tw_status(s, "[ \"%s\" not found ]",
 					  s->search_last);
+		} else if (which == TW_PROMPT_OPEN) {
+			if (s->prompt_ans[0])
+				tw_switch_file(s, s->prompt_ans);
 		}
 		return;
 	}
@@ -712,9 +761,25 @@ static void tw_handle_key(struct tw_state *s, int key)
 		return;
 	}
 
+	/* M-0 .. M-9: switch to slot file N.txt on the current device
+	 * (auto-saves the current buffer first). Handle before the switch so
+	 * the range check is clean. */
+	if (key >= KEY_META_0 && key <= KEY_META_0 + 9) {
+		char slot[8];
+
+		snprintf(slot, sizeof(slot), "%d.txt", key - KEY_META_0);
+		tw_switch_file(s, slot);
+		tw_mark_dirty(s, &snap);
+		s->dirty_all = 1;       /* new content: full repaint */
+		return;
+	}
+
 	switch (key) {
 	case KEY_CTRL_O:
 		tw_prompt_start(s, TW_PROMPT_SAVE);
+		break;
+	case KEY_CTRL_R:            /* open a file into the buffer */
+		tw_prompt_start(s, TW_PROMPT_OPEN);
 		break;
 	case KEY_CTRL_X:
 		/* Only offer "save modified buffer?" when saving is possible.
@@ -944,10 +1009,11 @@ U_BOOT_CMD(
 	"  NOTE: mmc 0 (eMMC) is ALWAYS read-only - its FAT writes\n"
 	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
-	"  ^O write  ^X exit  ^G help\n"
+	"  ^O write  ^R open file  M-0..M-9 open slot N.txt  ^X exit  ^G help\n"
 	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  M-b/M-f word\n"
 	"  ^D del  ^W del-word-back  M-d kill-word  ^K kill-eol  ^Y yank\n"
 	"  M-w find  arrows/PgUp/PgDn move\n"
 	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"
-	"  1-9/Space commit, =/- page, Esc cancel"
+	"  1-9/Space commit, =/- page, Esc cancel\n"
+	"  (M-N opens N.txt on the launch device; auto-saves current)"
 );

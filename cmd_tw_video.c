@@ -324,6 +324,7 @@ static void draw_bar(struct tw_state *s)
 	if (s->prompt != TW_PROMPT_NONE) {
 		const char *label =
 			s->prompt == TW_PROMPT_SAVE   ? " File Name to Write: " :
+			s->prompt == TW_PROMPT_OPEN   ? " File to open: " :
 			s->prompt == TW_PROMPT_SEARCH ? " Search: " :
 			" Save modified buffer?  Y)es  N)o  C)ancel ";
 		x = draw_str(0, s->bar_y, label, C_BG, C_FG);
@@ -386,9 +387,9 @@ static void draw_bar(struct tw_state *s)
 static void draw_hints(struct tw_state *s)
 {
 	static const char *row1 =
-		" ^O Write  ^K Kill  ^Y Yank  ^W DelWord  M-f/b Word  ^Spc Wubi ";
+		" ^O Write  ^R Open  M-0..9 Slot  ^K Kill  ^Y Yank  ^Spc Wubi ";
 	static const char *row2 =
-		" ^X Exit   ^A/^E BOL/EOL  ^B/^F ^P/^N move  ^D Del  M-w Find ";
+		" ^X Exit  ^W DelWord  M-f/b Word  ^A/^E ^B/^F ^P/^N  M-w Find ";
 
 	fill_rect(0, s->hint_y, s->fb_w, 2 * TW_ROW_PX, C_FG);  /* white */
 	draw_str(TW_CELL_PX, s->hint_y, row1, C_BG, C_FG);
