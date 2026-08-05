@@ -101,6 +101,12 @@ should report `0 wanted codepoints had no unifont glyph`).
 
 ## Integration into U-Boot
 
+> Building for a **libreboot RK3399 Chromebook (gru/kevin)**? See
+> **[INSTALL.md](INSTALL.md)** for the full board-specific tutorial: building
+> from the libreboot tree, booting straight into typewriter (BOOTCOMMAND),
+> autoboot/preboot tuning, flashing, and the eMMC-vs-microSD storage story. The
+> section below is the generic U-Boot integration it builds on.
+
 There are three edits to the tree, then you enable the option. **Steps 2 and 3
 edit different files with different syntax — don't mix them up** (a `Kconfig`
 *definition* is not the same as a `.config` *assignment*; see the warning
