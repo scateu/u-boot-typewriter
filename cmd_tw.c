@@ -550,10 +550,10 @@ static int tw_ime_key(struct tw_state *s, int key)
 static void tw_do_save(struct tw_state *s)
 {
 	if (!s->writable) {
-		/* Read-only guard: saving is refused unless the user explicitly
-		 * opened the file read-write (trailing 'rw' arg). This prevents
-		 * an accidental run from ever writing to the card. */
-		tw_status(s, "[ Read-only - re-run with a trailing 'rw' to save ]");
+		/* Read-only: either the user passed 'ro', or this is the eMMC
+		 * (mmc 0), which is hard-locked because its FAT writes corrupt
+		 * the card on this board. Use the microSD (mmc 1) to save. */
+		tw_status(s, "[ Read-only (eMMC is locked; save on mmc 1) ]");
 		return;
 	}
 	if (!s->filename[0]) {
@@ -827,6 +827,19 @@ static void tw_print_usage(struct cmd_tbl *cmdtp)
 		cmd_usage(cmdtp);
 }
 
+/*
+ * Is this the eMMC (mmc device 0)? Its FAT write path corrupts the card on this
+ * board, so it is hard-locked read-only regardless of the requested mode.
+ * `devpart` is "<dev>[:<part>]"; we match device index 0 exactly (so "0", "0:1"
+ * lock, but "10:1" does not).
+ */
+static int tw_is_emmc(const char *iftype, const char *devpart)
+{
+	return !strcmp(iftype, "mmc") &&
+	       devpart[0] == '0' &&
+	       (devpart[1] == ':' || devpart[1] == '\0');
+}
+
 static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 			 int argc, char *const argv[])
 {
@@ -834,11 +847,11 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	const char *fstype = NULL;
 	/* Defaults for a bare `typewriter`: the microSD, which has a working
 	 * FAT write path on this board (the eMMC's is broken - see
-	 * KNOWN_ISSUES). Read-only until an explicit `rw` is given. */
+	 * KNOWN_ISSUES). The microSD is writable by default. */
 	const char *iftype  = "mmc";
 	const char *devpart = "1:1";
 	const char *fname   = "a.txt";
-	int writable = 0;
+	int want_ro = 0;
 	int i;
 
 	/* `typewriter -h` / `--help`: print usage to the console and return
@@ -849,19 +862,20 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	/* Argument shapes:
-	 *   typewriter                        -> default: mmc 1:1 a.txt (RO)
-	 *   typewriter <if> <dev:part> <file> [fstype] [rw]  -> explicit
+	 *   typewriter                        -> default: mmc 1:1 a.txt (RW)
+	 *   typewriter <if> <dev:part> <file> [fstype] [ro]  -> explicit
 	 * Anything with 1-3 args (an incomplete file spec) is a usage error. */
 	if (argc >= 4) {
 		iftype  = argv[1];
 		devpart = argv[2];
 		fname   = argv[3];
-		/* Trailing optional args, in any order: the literal token "rw"
-		 * enables saving (read-only by default, so an accidental run
-		 * can't write); any other trailing token is the fs type. */
+		/* Trailing optional args, in any order: the literal token "ro"
+		 * forces read-only; any other trailing token is the fs type.
+		 * (Devices are writable by default; only the eMMC below is
+		 * hard-locked read-only regardless.) */
 		for (i = 4; i < argc; i++) {
-			if (!strcmp(argv[i], "rw"))
-				writable = 1;
+			if (!strcmp(argv[i], "ro"))
+				want_ro = 1;
 			else
 				fstype = argv[i];
 		}
@@ -870,7 +884,15 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	memset(s, 0, sizeof(*s));
-	s->writable = writable;
+
+	/*
+	 * Writable unless the user forced `ro`, EXCEPT the eMMC (mmc 0:*) is
+	 * ALWAYS read-only: its FAT write path corrupts the card on this board
+	 * (see KNOWN_ISSUES), so we hard-lock it no matter what was requested.
+	 */
+	s->writable = !want_ro;
+	if (tw_is_emmc(iftype, devpart))
+		s->writable = 0;
 
 	if (tw_video_init(s) != 0) {
 		printf("typewriter: no usable video framebuffer.\n");
@@ -911,14 +933,16 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 U_BOOT_CMD(
 	typewriter, 6, 0, do_typewriter,
 	"Nano-like editor with Wubi Chinese input (framebuffer)",
-	"                        - default: open mmc 1:1 a.txt (read-only)\n"
+	"                        - default: open mmc 1:1 a.txt (writable)\n"
 	"typewriter -h                        - show this help\n"
-	"typewriter <iftype> <dev:part> <filename> [fstype] [rw]\n"
+	"typewriter <iftype> <dev:part> <filename> [fstype] [ro]\n"
 	"  iftype  : mmc usb virtio nvme sata\n"
 	"  dev:part: 0:1  1:2  ...\n"
 	"  filename: full path on the filesystem\n"
 	"  fstype  : fat ext4  (optional, auto-detect)\n"
-	"  rw      : allow saving (READ-ONLY by default)\n"
+	"  ro      : open read-only (writable by default)\n"
+	"  NOTE: mmc 0 (eMMC) is ALWAYS read-only - its FAT writes\n"
+	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
 	"  ^O write  ^X exit  ^G help\n"
 	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  M-b/M-f word\n"

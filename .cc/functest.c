@@ -123,6 +123,19 @@ int main(void){
         (mb==4&&mb2==0&&mf==3)?"PASS":"FAIL", mb, mb2, mf);
     if(!(mb==4&&mb2==0&&mf==3)) fails++;
 
+    /* Test 9: eMMC lock predicate (mmc 0 is read-only; mmc 1, usb 0 are not) */
+    struct { const char*i; const char*d; int want; } E[] = {
+        {"mmc","0",1}, {"mmc","0:1",1}, {"mmc","1:1",0}, {"mmc","10:1",0},
+        {"usb","0:1",0}, {"mmc","0:3",1},
+    };
+    int e_ok=1;
+    for (unsigned e=0;e<sizeof(E)/sizeof(E[0]);e++)
+        if (tw_is_emmc(E[e].i,E[e].d)!=E[e].want){ e_ok=0;
+            printf("  eMMC-lock FAIL: %s %s -> %d (want %d)\n",
+                E[e].i,E[e].d,tw_is_emmc(E[e].i,E[e].d),E[e].want); }
+    printf("%s eMMC lock predicate\n", e_ok?"PASS":"FAIL");
+    if(!e_ok) fails++;
+
     printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);
     return fails?1:0;
 }

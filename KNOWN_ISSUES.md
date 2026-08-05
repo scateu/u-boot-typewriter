@@ -41,9 +41,12 @@ clean. **This is the working write path — save to the microSD, not the eMMC.**
 
 **Workarounds.**
 - **Save to the microSD** (`typewriter mmc 1:1 <file> rw`). Writes work.
-- On the eMMC, keep typewriter read-only (the default) or use the no-arg
-  scratch buffer; do eMMC file writes from Linux. typewriter refuses to save
-  unless invoked with a trailing `rw`, so an accidental run can't corrupt.
+- typewriter enforces this automatically: **`mmc 0` (eMMC) is hard-locked
+  read-only** — saving is always refused there, regardless of args — while
+  other devices (the microSD `mmc 1`, etc.) are writable by default. Pass a
+  trailing `ro` to force read-only on a writable device. So the eMMC can never
+  be corrupted by typewriter, and the microSD (bare `typewriter` default) just
+  works.
 
 **Upstream.** The `rockchip_sdhci` eMMC write defect on RK3399 is worth a U-Boot
 bug report. Not fixed here, per project preference to leave U-Boot's `mmc/`
