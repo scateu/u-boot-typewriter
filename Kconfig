@@ -1,0 +1,17 @@
+config CMD_TYPEWRITER
+	bool "typewriter - Nano-like editor with Wubi Chinese input"
+	depends on VIDEO
+	depends on FS_FAT || FS_EXT4
+	help
+	  A full-screen, GNU Nano-style text editor that runs directly on
+	  U-Boot's video framebuffer, with a built-in Wubi 86 (五笔) Chinese
+	  input method. Chinese glyphs are drawn from an embedded GNU Unifont
+	  subset; the Wubi table is embedded too, so no external files are
+	  needed at runtime (this adds roughly 3 MB of read-only data to the
+	  image, plus a few MB of BSS for the line buffer).
+
+	  Requires a video display (CONFIG_VIDEO and a display driver) because
+	  U-Boot's built-in console font is ASCII-only and cannot render hanzi.
+	  Reads and writes UTF-8 files on FAT or ext4.
+
+	  Use: typewriter <iftype> <dev:part> <filename> [fstype]

@@ -1,0 +1,218 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * cmd_tw_fs.c - filesystem load/save for the typewriter command.
+ *
+ * Adapted from the vim-for-Uboot `ved` reference, updated to the U-Boot 2026.07
+ * header set (no <common.h>) and to the codepoint line model: files are UTF-8
+ * on disk, decoded into u32 codepoint lines on load and re-encoded on save.
+ * I/O uses map_sysmem(CONFIG_SYS_LOAD_ADDR) as the scratch buffer, and
+ * fs_set_blk_dev() is called before every operation because U-Boot's FS layer
+ * does not retain the active device across calls.
+ */
+#include <command.h>
+#include <fs.h>
+#include <mapmem.h>
+#include <linux/string.h>
+#include <linux/errno.h>
+#include "cmd_tw.h"
+
+int tw_fs_str_to_type(const char *s)
+{
+	if (!strcmp(s, "fat") || !strcmp(s, "vfat"))
+		return FS_TYPE_FAT;
+	if (!strcmp(s, "ext4"))
+		return FS_TYPE_EXT;
+	if (!strcmp(s, "squashfs"))
+		return FS_TYPE_SQUASHFS;
+	return FS_TYPE_ANY;
+}
+
+int tw_fs_probe(struct tw_fs *fs, const char *iftype,
+		const char *dev_part, const char *fstype)
+{
+	int fs_type;
+
+	if (!iftype || !dev_part)
+		return -1;
+
+	strncpy(fs->iftype, iftype, sizeof(fs->iftype) - 1);
+	strncpy(fs->dev_part, dev_part, sizeof(fs->dev_part) - 1);
+	fs->iftype[sizeof(fs->iftype) - 1] = '\0';
+	fs->dev_part[sizeof(fs->dev_part) - 1] = '\0';
+
+	if (fstype) {
+		strncpy(fs->fstype, fstype, sizeof(fs->fstype) - 1);
+		fs->fstype[sizeof(fs->fstype) - 1] = '\0';
+		fs_type = tw_fs_str_to_type(fstype);
+	} else {
+		fs->fstype[0] = '\0';
+		fs_type = FS_TYPE_ANY;
+	}
+
+	if (fs_set_blk_dev(fs->iftype, fs->dev_part, fs_type) != 0) {
+		fs->valid = 0;
+		return -1;
+	}
+
+	fs->valid = 1;
+	return 0;
+}
+
+static int tw_fs_set(struct tw_fs *fs)
+{
+	int fs_type;
+
+	if (!fs->valid)
+		return -1;
+
+	fs_type = fs->fstype[0] ? tw_fs_str_to_type(fs->fstype) : FS_TYPE_ANY;
+
+	return fs_set_blk_dev(fs->iftype, fs->dev_part, fs_type);
+}
+
+/* Decode one UTF-8 codepoint from s (len bytes available). Returns bytes
+ * consumed and sets *cp. Malformed input consumes 1 byte and yields U+FFFD. */
+static int utf8_decode(const char *s, int len, u32 *cp)
+{
+	unsigned char c = (unsigned char)s[0];
+
+	if (c < 0x80) {
+		*cp = c;
+		return 1;
+	}
+	if ((c & 0xE0) == 0xC0 && len >= 2) {
+		*cp = ((u32)(c & 0x1F) << 6) | ((unsigned char)s[1] & 0x3F);
+		return 2;
+	}
+	if ((c & 0xF0) == 0xE0 && len >= 3) {
+		*cp = ((u32)(c & 0x0F) << 12) |
+		      (((unsigned char)s[1] & 0x3F) << 6) |
+		      ((unsigned char)s[2] & 0x3F);
+		return 3;
+	}
+	if ((c & 0xF8) == 0xF0 && len >= 4) {
+		*cp = ((u32)(c & 0x07) << 18) |
+		      (((unsigned char)s[1] & 0x3F) << 12) |
+		      (((unsigned char)s[2] & 0x3F) << 6) |
+		      ((unsigned char)s[3] & 0x3F);
+		return 4;
+	}
+	*cp = 0xFFFD;
+	return 1;
+}
+
+/* Encode codepoint cp into buf (>= 4 bytes). Returns bytes written. */
+static int utf8_encode(u32 cp, char *buf)
+{
+	if (cp < 0x80) {
+		buf[0] = (char)cp;
+		return 1;
+	}
+	if (cp < 0x800) {
+		buf[0] = (char)(0xC0 | (cp >> 6));
+		buf[1] = (char)(0x80 | (cp & 0x3F));
+		return 2;
+	}
+	if (cp < 0x10000) {
+		buf[0] = (char)(0xE0 | (cp >> 12));
+		buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+		buf[2] = (char)(0x80 | (cp & 0x3F));
+		return 3;
+	}
+	buf[0] = (char)(0xF0 | (cp >> 18));
+	buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+	buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+	buf[3] = (char)(0x80 | (cp & 0x3F));
+	return 4;
+}
+
+static void tw_empty_buffer(struct tw_state *s)
+{
+	s->num_lines = 1;
+	s->line_len[0] = 0;
+}
+
+/* Append codepoint cp to the current last line, splitting lines on '\n'. */
+static void tw_load_cp(struct tw_state *s, u32 cp)
+{
+	int row = s->num_lines - 1;
+
+	if (cp == '\n') {
+		if (s->num_lines < TW_MAX_LINES) {
+			s->line_len[s->num_lines] = 0;
+			s->num_lines++;
+		}
+		return;
+	}
+	if (cp == '\r')
+		return;                 /* drop CR of CRLF */
+	if (s->line_len[row] < TW_MAX_COLS - 1)
+		s->lines[row][s->line_len[row]++] = cp;
+	/* else: line full, silently truncate the rest of this line */
+}
+
+int tw_file_load(struct tw_state *s, const char *path)
+{
+	loff_t len_read = 0;
+	ulong  addr = TW_LOAD_ADDR;
+	char  *buf = (char *)map_sysmem(addr, TW_FILE_BUF_SIZE);
+	int    ret, off;
+
+	if (tw_fs_set(&s->fs) != 0) {
+		unmap_sysmem(buf);
+		return -1;
+	}
+
+	ret = fs_read(path, addr, 0, 0, &len_read);
+	if (ret < 0) {
+		unmap_sysmem(buf);
+		if (ret == -ENOENT || len_read == 0) {
+			tw_empty_buffer(s);     /* new file: empty buffer */
+			return 0;
+		}
+		return ret;
+	}
+
+	tw_empty_buffer(s);
+	s->line_len[0] = 0;
+	s->num_lines = 1;
+
+	off = 0;
+	while (off < (int)len_read) {
+		u32 cp;
+
+		off += utf8_decode(buf + off, (int)len_read - off, &cp);
+		tw_load_cp(s, cp);
+	}
+
+	unmap_sysmem(buf);
+	return 0;
+}
+
+int tw_file_save(struct tw_state *s)
+{
+	ulong  addr = TW_LOAD_ADDR;
+	char  *buf = (char *)map_sysmem(addr, TW_FILE_BUF_SIZE);
+	loff_t size = 0, written = 0;
+	int    ret, i, j;
+
+	for (i = 0; i < s->num_lines; i++) {
+		for (j = 0; j < s->line_len[i]; j++)
+			size += utf8_encode(s->lines[i][j], buf + size);
+		buf[size++] = '\n';
+	}
+
+	if (tw_fs_set(&s->fs) != 0) {
+		unmap_sysmem(buf);
+		return -1;
+	}
+
+	ret = fs_write(s->filename, addr, 0, size, &written);
+	unmap_sysmem(buf);
+
+	if (ret < 0)
+		return ret;
+
+	s->dirty = 0;
+	return 0;
+}
