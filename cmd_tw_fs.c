@@ -5,13 +5,20 @@
  * Adapted from the vim-for-Uboot `ved` reference, updated to the U-Boot 2026.07
  * header set (no <common.h>) and to the codepoint line model: files are UTF-8
  * on disk, decoded into u32 codepoint lines on load and re-encoded on save.
- * I/O uses map_sysmem(CONFIG_SYS_LOAD_ADDR) as the scratch buffer, and
- * fs_set_blk_dev() is called before every operation because U-Boot's FS layer
- * does not retain the active device across calls.
+ *
+ * The I/O scratch buffer is malloc()'d from U-Boot's heap, NOT staged at a
+ * fixed CONFIG_SYS_LOAD_ADDR like the ved reference. On this board (RK3399)
+ * CONFIG_SYS_LOAD_ADDR is 0x800800, but U-Boot proper runs from DRAM at
+ * 0x00800000 with its heap right above - so a multi-MB buffer there overwrote
+ * U-Boot's own image and the FAT driver's directory/table buffers, which were
+ * then flushed to the card and CORRUPTED THE PARTITION. malloc() hands out a
+ * region distinct from both, so there is no overlap. fs_set_blk_dev() is called
+ * before every op because U-Boot's FS layer doesn't retain the active device.
  */
 #include <command.h>
 #include <fs.h>
 #include <mapmem.h>
+#include <malloc.h>
 #include <linux/string.h>
 #include <linux/errno.h>
 #include "cmd_tw.h"
@@ -154,18 +161,22 @@ static void tw_load_cp(struct tw_state *s, u32 cp)
 int tw_file_load(struct tw_state *s, const char *path)
 {
 	loff_t len_read = 0;
-	ulong  addr = TW_LOAD_ADDR;
-	char  *buf = (char *)map_sysmem(addr, TW_FILE_BUF_SIZE);
+	char  *buf = malloc(TW_FILE_BUF_SIZE);
+	ulong  addr;
 	int    ret, off;
 
+	if (!buf)
+		return -1;
+	addr = map_to_sysmem(buf);       /* physical addr for fs_read() */
+
 	if (tw_fs_set(&s->fs) != 0) {
-		unmap_sysmem(buf);
+		free(buf);
 		return -1;
 	}
 
 	ret = fs_read(path, addr, 0, 0, &len_read);
 	if (ret < 0) {
-		unmap_sysmem(buf);
+		free(buf);
 		if (ret == -ENOENT || len_read == 0) {
 			tw_empty_buffer(s);     /* new file: empty buffer */
 			return 0;
@@ -185,16 +196,20 @@ int tw_file_load(struct tw_state *s, const char *path)
 		tw_load_cp(s, cp);
 	}
 
-	unmap_sysmem(buf);
+	free(buf);
 	return 0;
 }
 
 int tw_file_save(struct tw_state *s)
 {
-	ulong  addr = TW_LOAD_ADDR;
-	char  *buf = (char *)map_sysmem(addr, TW_FILE_BUF_SIZE);
+	char  *buf = malloc(TW_FILE_BUF_SIZE);
+	ulong  addr;
 	loff_t size = 0, written = 0;
 	int    ret, i, j;
+
+	if (!buf)
+		return -1;
+	addr = map_to_sysmem(buf);       /* physical addr for fs_write() */
 
 	for (i = 0; i < s->num_lines; i++) {
 		for (j = 0; j < s->line_len[i]; j++)
@@ -203,12 +218,12 @@ int tw_file_save(struct tw_state *s)
 	}
 
 	if (tw_fs_set(&s->fs) != 0) {
-		unmap_sysmem(buf);
+		free(buf);
 		return -1;
 	}
 
 	ret = fs_write(s->filename, addr, 0, size, &written);
-	unmap_sysmem(buf);
+	free(buf);
 
 	if (ret < 0)
 		return ret;

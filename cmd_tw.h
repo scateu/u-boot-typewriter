@@ -34,9 +34,10 @@
 #define TW_CELL_PX       (TW_CELL_W * TW_SCALE)   /* narrow cell width, px */
 #define TW_ROW_PX        (TW_GLYPH_H * TW_SCALE)  /* cell height, px */
 
-/* File I/O scratch: reuse the standard load address like the ved reference. */
-#define TW_LOAD_ADDR     CONFIG_SYS_LOAD_ADDR
-/* Worst case UTF-8 file size we serialize/parse (3 bytes/BMP cp + newline). */
+/* File I/O scratch is malloc()'d at runtime (see cmd_tw_fs.c) - NOT staged at
+ * a fixed CONFIG_SYS_LOAD_ADDR, which on this board overlaps U-Boot's own DRAM
+ * image + heap and corrupted the FAT partition. This is just the buffer size:
+ * worst-case UTF-8 (3 bytes/BMP codepoint + one newline per line). */
 #define TW_FILE_BUF_SIZE (TW_MAX_LINES * TW_MAX_COLS * 3 + TW_MAX_LINES)
 
 /* ---- cooked key codes (returned by tw_read_key) ------------------------ */
@@ -112,6 +113,7 @@ struct tw_state {
 
 	int   dirty;
 	int   quit;
+	int   writable;    /* 0 = read-only (default); saving is refused */
 
 	char  filename[TW_MAX_FILENAME];
 	char  status_msg[128];

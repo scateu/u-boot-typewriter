@@ -476,6 +476,13 @@ static int tw_ime_key(struct tw_state *s, int key)
 /* -------------------------------------------------------------- prompts -- */
 static void tw_do_save(struct tw_state *s)
 {
+	if (!s->writable) {
+		/* Read-only guard: saving is refused unless the user explicitly
+		 * opened the file read-write (trailing 'rw' arg). This prevents
+		 * an accidental run from ever writing to the card. */
+		tw_status(s, "[ Read-only - re-run with a trailing 'rw' to save ]");
+		return;
+	}
 	if (!s->filename[0]) {
 		tw_status(s, "[ No file name ]");
 		return;
@@ -634,7 +641,9 @@ static void tw_handle_key(struct tw_state *s, int key)
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;
 	case KEY_CTRL_X:
-		if (s->dirty)
+		/* Only offer "save modified buffer?" when saving is possible.
+		 * Read-only: quit immediately (edits can't be written anyway). */
+		if (s->dirty && s->writable)
 			tw_prompt_start(s, TW_PROMPT_EXIT);
 		else
 			s->quit = 1;
@@ -718,14 +727,27 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 			 int argc, char *const argv[])
 {
 	struct tw_state *s = &g_tw;
-	const char *fstype;
+	const char *fstype = NULL;
+	int writable = 0;
+	int i;
 
 	if (argc < 4) {
-		printf("Usage: typewriter <iftype> <dev:part> <file> [fstype]\n");
+		printf("Usage: typewriter <iftype> <dev:part> <file> [fstype] [rw]\n");
 		return CMD_RET_USAGE;
 	}
 
 	memset(s, 0, sizeof(*s));
+
+	/* Trailing optional args, in any order: the literal token "rw" enables
+	 * saving (read-only by default, so an accidental run can't write); any
+	 * other trailing token is the filesystem type. */
+	for (i = 4; i < argc; i++) {
+		if (!strcmp(argv[i], "rw"))
+			writable = 1;
+		else
+			fstype = argv[i];
+	}
+	s->writable = writable;
 
 	if (tw_video_init(s) != 0) {
 		printf("typewriter: no usable video framebuffer.\n");
@@ -733,7 +755,6 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 		return CMD_RET_FAILURE;
 	}
 
-	fstype = (argc > 4) ? argv[4] : NULL;
 	if (tw_fs_probe(&s->fs, argv[1], argv[2], fstype) < 0) {
 		printf("typewriter: cannot access %s %s\n", argv[1], argv[2]);
 		return CMD_RET_FAILURE;
@@ -752,8 +773,9 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	tw_bind_ime(s);
-	tw_status(s, "[ Read %d line%s ]", s->num_lines,
-		  s->num_lines == 1 ? "" : "s");
+	tw_status(s, "[ Read %d line%s%s ]", s->num_lines,
+		  s->num_lines == 1 ? "" : "s",
+		  s->writable ? "" : " - read-only");
 
 	while (!s->quit) {
 		tw_render(s);
@@ -764,13 +786,14 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 }
 
 U_BOOT_CMD(
-	typewriter, 5, 0, do_typewriter,
+	typewriter, 6, 0, do_typewriter,
 	"Nano-like editor with Wubi Chinese input (framebuffer)",
-	"<iftype> <dev:part> <filename> [fstype]\n"
+	"<iftype> <dev:part> <filename> [fstype] [rw]\n"
 	"  iftype  : mmc usb virtio nvme sata\n"
 	"  dev:part: 0:1  1:2  ...\n"
 	"  filename: full path on the filesystem\n"
 	"  fstype  : fat ext4  (optional, auto-detect)\n"
+	"  rw      : allow saving (READ-ONLY by default)\n"
 	"Keys: ^O write  ^X exit  ^K cut  ^U paste  ^W search\n"
 	"      ^A home  ^E end  arrows/PgUp/PgDn move\n"
 	"      ^\\ toggle Wubi/English;  in Wubi: a-z code,\n"
