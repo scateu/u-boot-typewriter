@@ -386,9 +386,9 @@ static void draw_bar(struct tw_state *s)
 static void draw_hints(struct tw_state *s)
 {
 	static const char *row1 =
-		" ^O Write Out   ^W Where Is   ^K Cut Line   ^A Home ";
+		" ^O Write  ^K Kill  ^Y Yank  ^W DelWord  M-f/b Word  ^Spc Wubi ";
 	static const char *row2 =
-		" ^X Exit        ^Spc Wubi/En  ^U Paste      ^E End  ";
+		" ^X Exit   ^A/^E BOL/EOL  ^B/^F ^P/^N move  ^D Del  M-w Find ";
 
 	fill_rect(0, s->hint_y, s->fb_w, 2 * TW_ROW_PX, C_FG);  /* white */
 	draw_str(TW_CELL_PX, s->hint_y, row1, C_BG, C_FG);

@@ -87,15 +87,41 @@ int main(void){
         s->num_lines, s->line_len[0]);
     if(!(s->num_lines==1 && s->line_len[0]==4)) fails++;
 
-    /* Test 6: ^K cut then ^U paste restores a line */
+    /* Test 6: readline ^K kill-to-EOL then ^Y yank restores the text */
     memset(s,0,sizeof(*s)); tw_video_init(s); s->num_lines=1; s->line_len[0]=0;
     tw_bind_ime(s); s->ime.mode=TW_IME_OFF;
-    feed(s,"xy"); s->cur_col=0;
-    tw_handle_key(s, KEY_CTRL_K);  /* cut -> empties the only line */
-    tw_handle_key(s, KEY_CTRL_U);  /* paste it back */
+    feed(s,"hello"); s->cur_col=2;    /* cursor after 'he' */
+    tw_handle_key(s, KEY_CTRL_K);     /* kill "llo" -> line = "he" */
     dump_line0(s,buf);
-    printf("%s cut/paste: '%s' (want xy)\n", strcmp(buf,"xy")==0?"PASS":"FAIL", buf);
-    if(strcmp(buf,"xy")) fails++;
+    int k_ok = strcmp(buf,"he")==0;
+    tw_handle_key(s, KEY_CTRL_Y);     /* yank "llo" back at cursor */
+    dump_line0(s,buf);
+    printf("%s ^K/^Y: after kill='he'?%d final='%s' (want hello)\n",
+        (k_ok && strcmp(buf,"hello")==0)?"PASS":"FAIL", k_ok, buf);
+    if(!(k_ok && strcmp(buf,"hello")==0)) fails++;
+
+    /* Test 7: ^W delete-word-backward */
+    memset(s,0,sizeof(*s)); tw_video_init(s); s->num_lines=1; s->line_len[0]=0;
+    tw_bind_ime(s); s->ime.mode=TW_IME_OFF;
+    feed(s,"foo bar");               /* cursor at end (col 7) */
+    tw_handle_key(s, KEY_CTRL_W);    /* delete "bar" -> "foo " */
+    dump_line0(s,buf);
+    printf("%s ^W del-word: '%s' (want 'foo ')\n", strcmp(buf,"foo ")==0?"PASS":"FAIL", buf);
+    if(strcmp(buf,"foo ")) fails++;
+
+    /* Test 8: M-b / M-f word motion columns */
+    memset(s,0,sizeof(*s)); tw_video_init(s); s->num_lines=1; s->line_len[0]=0;
+    tw_bind_ime(s); s->ime.mode=TW_IME_OFF;
+    feed(s,"foo bar");               /* col 7 */
+    tw_handle_key(s, KEY_META_B);    /* -> start of "bar" = col 4 */
+    int mb = s->cur_col;
+    tw_handle_key(s, KEY_META_B);    /* -> start of "foo" = col 0 */
+    int mb2 = s->cur_col;
+    tw_handle_key(s, KEY_META_F);    /* -> end of "foo" = col 3 */
+    int mf = s->cur_col;
+    printf("%s M-b/M-f: %d %d %d (want 4 0 3)\n",
+        (mb==4&&mb2==0&&mf==3)?"PASS":"FAIL", mb, mb2, mf);
+    if(!(mb==4&&mb2==0&&mf==3)) fails++;
 
     printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);
     return fails?1:0;

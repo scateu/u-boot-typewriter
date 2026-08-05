@@ -8,3 +8,7 @@
 /.hosttest/fonttest
 /.cc/linktest
 /.cc/functest
+
+# Personal working notes / editor swap files
+/note.txt
+*.swp

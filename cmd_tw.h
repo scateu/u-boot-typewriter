@@ -54,17 +54,24 @@
 #define KEY_BS        0x08
 #define KEY_TAB       0x09
 
-#define KEY_CTRL_A    0x01
-#define KEY_CTRL_E    0x05
-#define KEY_CTRL_G    0x07
-#define KEY_CTRL_K    0x0B
-#define KEY_CTRL_O    0x0F
-#define KEY_CTRL_U    0x15
-#define KEY_CTRL_W    0x17
-#define KEY_CTRL_X    0x18
+/* readline-style Ctrl chords */
+#define KEY_CTRL_A    0x01       /* beginning of line */
+#define KEY_CTRL_B    0x02       /* back one char */
+#define KEY_CTRL_D    0x04       /* delete char under cursor */
+#define KEY_CTRL_E    0x05       /* end of line */
+#define KEY_CTRL_F    0x06       /* forward one char */
+#define KEY_CTRL_G    0x07       /* help */
+#define KEY_CTRL_K    0x0B       /* kill to end of line */
+#define KEY_CTRL_N    0x0E       /* next line */
+#define KEY_CTRL_O    0x0F       /* write out (save) */
+#define KEY_CTRL_P    0x10       /* previous line */
+#define KEY_CTRL_W    0x17       /* delete word backward */
+#define KEY_CTRL_X    0x18       /* exit */
+#define KEY_CTRL_Y    0x19       /* yank (paste kill buffer) */
 #define KEY_CTRL_SPACE 0x00      /* Ctrl-Space (a.k.a. Ctrl-@): toggle Wubi/En */
 
-/* Extended keys (> 0xFF), parsed from ANSI arrow/nav escape sequences. */
+/* Extended keys (> 0xFF), parsed from ANSI arrow/nav escape sequences and from
+ * Meta (Alt) chords, which arrive as ESC followed by the key. */
 #define KEY_ARROW_UP    0x141
 #define KEY_ARROW_DOWN  0x142
 #define KEY_ARROW_RIGHT 0x143
@@ -74,6 +81,10 @@
 #define KEY_PAGE_UP     0x200
 #define KEY_PAGE_DOWN   0x201
 #define KEY_DELETE      0x202
+#define KEY_META_F      0x210    /* M-f: forward one word */
+#define KEY_META_B      0x211    /* M-b: backward one word */
+#define KEY_META_D      0x212    /* M-d: kill word forward */
+#define KEY_META_W      0x213    /* M-w: search (moved off C-w) */
 
 /* ---- IME (Wubi) input state -------------------------------------------- */
 #define TW_IME_OFF    0          /* English: bytes typed literally */

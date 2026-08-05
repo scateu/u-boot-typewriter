@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <vsprintf.h>
 #include <u-boot/schedule.h>
+#include <linux/delay.h>
 #include <linux/string.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
@@ -42,43 +43,63 @@ static int tw_read_key(void)
 {
 	int c;
 
-	while (!tstc())
-		schedule();     /* keep the watchdog fed while blocking */
+	/*
+	 * Wait for a key. U-Boot's console has no blocking "sleep until a key"
+	 * primitive, so we poll - but with a 10 ms delay between polls instead
+	 * of a tight spin, so an idle editor doesn't peg the CPU at 100%. The
+	 * delay is far below human typing latency, so input still feels instant.
+	 */
+	while (!tstc()) {
+		schedule();          /* keep the watchdog fed */
+		udelay(10000);       /* 10 ms: ~100 polls/sec, negligible CPU */
+	}
 	c = getchar();
 
 	if (c != KEY_ESC)
 		return c;
 
+	/* ESC alone, or the start of a CSI/SS3 sequence (arrows/nav) or a Meta
+	 * chord (M-x arrives as ESC then x). If nothing follows quickly, it's a
+	 * bare ESC. */
 	if (!tstc())
 		return KEY_ESC;
 	c = getchar();
-	if (c != '[' && c != 'O')
-		return KEY_ESC;
 
-	c = getchar();
-	switch (c) {
-	case 'A': return KEY_ARROW_UP;
-	case 'B': return KEY_ARROW_DOWN;
-	case 'C': return KEY_ARROW_RIGHT;
-	case 'D': return KEY_ARROW_LEFT;
-	case 'H': return KEY_HOME_SEQ;
-	case 'F': return KEY_END_SEQ;
-	case '1': case '2': case '3':
-	case '4': case '5': case '6': {
-		int sub = c;
-		int c4 = getchar();
+	if (c == '[' || c == 'O') {
+		c = getchar();
+		switch (c) {
+		case 'A': return KEY_ARROW_UP;
+		case 'B': return KEY_ARROW_DOWN;
+		case 'C': return KEY_ARROW_RIGHT;
+		case 'D': return KEY_ARROW_LEFT;
+		case 'H': return KEY_HOME_SEQ;
+		case 'F': return KEY_END_SEQ;
+		case '1': case '2': case '3':
+		case '4': case '5': case '6': {
+			int sub = c;
+			int c4 = getchar();
 
-		if (c4 == '~') {
-			if (sub == '5') return KEY_PAGE_UP;
-			if (sub == '6') return KEY_PAGE_DOWN;
-			if (sub == '3') return KEY_DELETE;
-			if (sub == '1') return KEY_HOME_SEQ;
-			if (sub == '4') return KEY_END_SEQ;
+			if (c4 == '~') {
+				if (sub == '5') return KEY_PAGE_UP;
+				if (sub == '6') return KEY_PAGE_DOWN;
+				if (sub == '3') return KEY_DELETE;
+				if (sub == '1') return KEY_HOME_SEQ;
+				if (sub == '4') return KEY_END_SEQ;
+			}
+			return KEY_ESC;
 		}
-		return KEY_ESC;
+		default:
+			return KEY_ESC;
+		}
 	}
-	default:
-		return KEY_ESC;
+
+	/* Meta (Alt) chord: ESC followed by a letter. */
+	switch (c) {
+	case 'f': case 'F': return KEY_META_F;
+	case 'b': case 'B': return KEY_META_B;
+	case 'd': case 'D': return KEY_META_D;
+	case 'w': case 'W': return KEY_META_W;
+	default:            return KEY_ESC;
 	}
 }
 
@@ -213,47 +234,99 @@ static void tw_delete_cp(struct tw_state *s)
 	s->dirty = 1;
 }
 
-/* ^K cut current line into the cut buffer; ^U paste it back above cursor. */
-static void tw_cut_line(struct tw_state *s)
+/* readline C-k: kill from the cursor to end of line into the kill buffer. */
+static void tw_kill_to_eol(struct tw_state *s)
 {
-	int row = s->cur_row, i;
+	int row = s->cur_row, i, n;
 
-	s->cut_len = s->line_len[row];
-	for (i = 0; i < s->cut_len; i++)
-		s->cut[i] = s->lines[row][i];
-	s->cut_valid = 1;
-
-	if (s->num_lines == 1) {
-		s->line_len[0] = 0;             /* clear the only line */
-	} else {
-		for (i = row; i < s->num_lines - 1; i++) {
-			memcpy(s->lines[i], s->lines[i + 1],
-			       sizeof(u32) * TW_MAX_COLS);
-			s->line_len[i] = s->line_len[i + 1];
-		}
-		s->num_lines--;
-		if (s->cur_row >= s->num_lines)
-			s->cur_row = s->num_lines - 1;
+	n = s->line_len[row] - s->cur_col;
+	if (n <= 0) {
+		s->cut_len = 0;
+		s->cut_valid = 1;
+		return;
 	}
-	s->cur_col = 0;
+	for (i = 0; i < n; i++)
+		s->cut[i] = s->lines[row][s->cur_col + i];
+	s->cut_len = n;
+	s->cut_valid = 1;
+	s->line_len[row] = s->cur_col;    /* truncate at the cursor */
 	s->dirty = 1;
 }
 
-static void tw_paste_line(struct tw_state *s)
+/* readline C-y: yank (insert) the kill buffer at the cursor. */
+static void tw_yank(struct tw_state *s)
 {
-	int i;
+	int row = s->cur_row, i, n;
 
-	if (!s->cut_valid || s->num_lines >= TW_MAX_LINES)
+	if (!s->cut_valid || s->cut_len == 0)
 		return;
-	for (i = s->num_lines; i > s->cur_row; i--) {
-		memcpy(s->lines[i], s->lines[i - 1], sizeof(u32) * TW_MAX_COLS);
-		s->line_len[i] = s->line_len[i - 1];
-	}
-	for (i = 0; i < s->cut_len; i++)
-		s->lines[s->cur_row][i] = s->cut[i];
-	s->line_len[s->cur_row] = s->cut_len;
-	s->num_lines++;
-	s->cur_col = 0;
+	n = s->cut_len;
+	if (s->line_len[row] + n > TW_MAX_COLS - 1)
+		n = TW_MAX_COLS - 1 - s->line_len[row];
+	if (n <= 0)
+		return;
+	/* make room at the cursor */
+	for (i = s->line_len[row] - 1; i >= s->cur_col; i--)
+		s->lines[row][i + n] = s->lines[row][i];
+	for (i = 0; i < n; i++)
+		s->lines[row][s->cur_col + i] = s->cut[i];
+	s->line_len[row] += n;
+	s->cur_col += n;
+	s->dirty = 1;
+}
+
+/* A "word" character for M-f/M-b/M-d/C-w: ASCII alphanumeric, or any codepoint
+ * >= 0x80 (treat CJK/other as word content). */
+static int tw_is_word_cp(u32 cp)
+{
+	if (cp >= 0x80)
+		return 1;
+	if (cp >= '0' && cp <= '9')
+		return 1;
+	if (cp >= 'a' && cp <= 'z')
+		return 1;
+	if (cp >= 'A' && cp <= 'Z')
+		return 1;
+	return 0;
+}
+
+/* Column of the start of the previous word on the current line (readline M-b:
+ * skip non-word chars left, then skip the word). */
+static int tw_prev_word_col(struct tw_state *s)
+{
+	int row = s->cur_row, c = s->cur_col;
+
+	while (c > 0 && !tw_is_word_cp(s->lines[row][c - 1]))
+		c--;
+	while (c > 0 && tw_is_word_cp(s->lines[row][c - 1]))
+		c--;
+	return c;
+}
+
+/* Column just past the end of the next word (readline M-f). */
+static int tw_next_word_col(struct tw_state *s)
+{
+	int row = s->cur_row, c = s->cur_col, len = s->line_len[row];
+
+	while (c < len && !tw_is_word_cp(s->lines[row][c]))
+		c++;
+	while (c < len && tw_is_word_cp(s->lines[row][c]))
+		c++;
+	return c;
+}
+
+/* Delete the [from,to) range on the current line (from < to), leaving the
+ * cursor at `from`. Used by C-w (delete word back) and M-d (kill word fwd). */
+static void tw_delete_range(struct tw_state *s, int from, int to)
+{
+	int row = s->cur_row, i, n = to - from;
+
+	if (n <= 0)
+		return;
+	for (i = to; i < s->line_len[row]; i++)
+		s->lines[row][i - n] = s->lines[row][i];
+	s->line_len[row] -= n;
+	s->cur_col = from;
 	s->dirty = 1;
 }
 
@@ -651,15 +724,30 @@ static void tw_handle_key(struct tw_state *s, int key)
 		else
 			s->quit = 1;
 		break;
-	case KEY_CTRL_W:
+	/* readline kill / yank */
+	case KEY_CTRL_K:
+		tw_kill_to_eol(s);
+		break;
+	case KEY_CTRL_Y:
+		tw_yank(s);
+		break;
+	case KEY_CTRL_W: {          /* delete word backward */
+		int from = tw_prev_word_col(s);
+
+		tw_delete_range(s, from, s->cur_col);
+		break;
+	}
+	case KEY_META_D: {          /* kill word forward */
+		int to = tw_next_word_col(s);
+
+		tw_delete_range(s, s->cur_col, to);
+		break;
+	}
+	case KEY_META_W:            /* search (moved off C-w) */
 		tw_prompt_start(s, TW_PROMPT_SEARCH);
 		break;
-	case KEY_CTRL_K:
-		tw_cut_line(s);
-		break;
-	case KEY_CTRL_U:
-		tw_paste_line(s);
-		break;
+
+	/* readline cursor motion */
 	case KEY_CTRL_A:
 	case KEY_HOME_SEQ:
 		s->cur_col = 0;
@@ -668,11 +756,16 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_END_SEQ:
 		s->cur_col = s->line_len[s->cur_row];
 		break;
-
+	case KEY_CTRL_B:
 	case KEY_ARROW_LEFT:  tw_move_left(s);  break;
+	case KEY_CTRL_F:
 	case KEY_ARROW_RIGHT: tw_move_right(s); break;
+	case KEY_CTRL_P:
 	case KEY_ARROW_UP:    tw_move_up(s);    break;
+	case KEY_CTRL_N:
 	case KEY_ARROW_DOWN:  tw_move_down(s);  break;
+	case KEY_META_B:      s->cur_col = tw_prev_word_col(s); break;
+	case KEY_META_F:      s->cur_col = tw_next_word_col(s); break;
 
 	case KEY_PAGE_UP: {
 		int i;
@@ -697,6 +790,7 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_BS:
 		tw_backspace(s);
 		break;
+	case KEY_CTRL_D:
 	case KEY_DELETE:
 		tw_delete_cp(s);
 		break;
@@ -837,8 +931,11 @@ U_BOOT_CMD(
 	"  filename: full path on the filesystem\n"
 	"  fstype  : fat ext4  (optional, auto-detect)\n"
 	"  rw      : allow saving (READ-ONLY by default)\n"
-	"Keys: ^O write  ^X exit  ^K cut  ^U paste  ^W search\n"
-	"      ^A home  ^E end  arrows/PgUp/PgDn move\n"
-	"      ^Space toggle Wubi/English; in Wubi: a-z code,\n"
-	"      1-9/Space commit, =/- page, Esc cancel"
+	"Keys (readline-style):\n"
+	"  ^O write  ^X exit  ^G help\n"
+	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  M-b/M-f word\n"
+	"  ^D del  ^W del-word-back  M-d kill-word  ^K kill-eol  ^Y yank\n"
+	"  M-w find  arrows/PgUp/PgDn move\n"
+	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"
+	"  1-9/Space commit, =/- page, Esc cancel"
 );
