@@ -726,29 +726,53 @@ static void tw_bind_ime(struct tw_state *s)
 	tw_ime_reset(&s->ime);
 }
 
+static void tw_print_usage(struct cmd_tbl *cmdtp)
+{
+	/* Print the same text as `help typewriter`, then return to the shell. */
+	if (cmdtp)
+		cmd_usage(cmdtp);
+}
+
 static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 			 int argc, char *const argv[])
 {
 	struct tw_state *s = &g_tw;
 	const char *fstype = NULL;
 	int writable = 0;
+	int scratch;
 	int i;
 
-	if (argc < 4) {
-		printf("Usage: typewriter <iftype> <dev:part> <file> [fstype] [rw]\n");
+	/* `typewriter -h` / `--help`: print usage to the console and return
+	 * without launching the editor (which would take over the framebuffer). */
+	if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+		tw_print_usage(cmdtp);
+		return CMD_RET_SUCCESS;
+	}
+
+	/* Argument shapes:
+	 *   typewriter                        -> empty scratch buffer (RO)
+	 *   typewriter <if> <dev:part> <file> [fstype] [rw]  -> file-backed
+	 * Anything with 1-3 args (an incomplete file spec) is a usage error. */
+	if (argc == 1) {
+		scratch = 1;
+	} else if (argc >= 4) {
+		scratch = 0;
+	} else {
 		return CMD_RET_USAGE;
 	}
 
 	memset(s, 0, sizeof(*s));
 
-	/* Trailing optional args, in any order: the literal token "rw" enables
-	 * saving (read-only by default, so an accidental run can't write); any
-	 * other trailing token is the filesystem type. */
-	for (i = 4; i < argc; i++) {
-		if (!strcmp(argv[i], "rw"))
-			writable = 1;
-		else
-			fstype = argv[i];
+	if (!scratch) {
+		/* Trailing optional args, in any order: the literal token "rw"
+		 * enables saving (read-only by default, so an accidental run
+		 * can't write); any other trailing token is the fs type. */
+		for (i = 4; i < argc; i++) {
+			if (!strcmp(argv[i], "rw"))
+				writable = 1;
+			else
+				fstype = argv[i];
+		}
 	}
 	s->writable = writable;
 
@@ -756,6 +780,20 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 		printf("typewriter: no usable video framebuffer.\n");
 		printf("  Enable CONFIG_VIDEO and a display driver on this board.\n");
 		return CMD_RET_FAILURE;
+	}
+
+	if (scratch) {
+		/* No file: a blank in-memory buffer. s->fs stays invalid so a
+		 * save is impossible (and it's read-only anyway). */
+		s->num_lines = 1;
+		s->line_len[0] = 0;
+		tw_bind_ime(s);
+		tw_status(s, "[ New scratch buffer - read-only, ^X to exit ]");
+		while (!s->quit) {
+			tw_render(s);
+			tw_handle_key(s, tw_read_key());
+		}
+		return CMD_RET_SUCCESS;
 	}
 
 	if (tw_fs_probe(&s->fs, argv[1], argv[2], fstype) < 0) {
@@ -791,7 +829,9 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 U_BOOT_CMD(
 	typewriter, 6, 0, do_typewriter,
 	"Nano-like editor with Wubi Chinese input (framebuffer)",
-	"<iftype> <dev:part> <filename> [fstype] [rw]\n"
+	"                        - open an empty scratch buffer (read-only)\n"
+	"typewriter -h                        - show this help\n"
+	"typewriter <iftype> <dev:part> <filename> [fstype] [rw]\n"
 	"  iftype  : mmc usb virtio nvme sata\n"
 	"  dev:part: 0:1  1:2  ...\n"
 	"  filename: full path on the filesystem\n"

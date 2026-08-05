@@ -11,4 +11,5 @@ struct cmd_tbl { const char *name; };
 	static int (*const _ubcmd_##_name)(struct cmd_tbl *, int, int, \
 		char *const[]) __attribute__((unused)) = _cmd;
 int printf(const char *fmt, ...);
+int cmd_usage(const struct cmd_tbl *cmdtp);
 #endif

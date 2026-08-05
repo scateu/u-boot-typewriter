@@ -24,3 +24,4 @@ int fs_write(const char *f,unsigned long a,long long o,long long l,long long *w)
 /* printf/snprintf/vsnprintf: forward to libc (names match) */
 
 int main(void){ return 0; }
+int cmd_usage(const struct cmd_tbl *c){(void)c;return 0;}
