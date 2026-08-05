@@ -12,14 +12,14 @@ Target tree: **U-Boot 2026.07**.
 
 ```
 +--------------------------------------------------------------+
-| typewriter    /notes.txt    Modified                 [Wubi] |  title bar
+| typewriter    /notes.txt    Modified                  [Wubi] |  title bar
 |                                                              |
-|  你好，世界                                                  |  text area
+|  你好，世界                                                    |  text area
 |  boot config: setenv bootargs ...                            |  (hanzi = 2 cols)
 |                                                              |
-| [五] wq  1.你 2.低 3.父荫 4.仰卧 …                    (1/2)  |  candidate bar
+| [五] wq  1.你 2.低 3.父荫 4.仰卧 …                      (1/2)  |  candidate bar
 | ^O Write  ^R Open  M-0..9 Slot  ^K Kill  ^Y Yank  ^Spc Wubi  |  shortcut hints
-| ^X Exit  ^W DelWord  M-f/b Word  ^A/^E ^B/^F ^P/^N  M-w Find  |
+| ^X Exit  ^W DelWord  M-f/b Word  ^A/^E ^B/^F ^P/^N  M-w Find |
 +--------------------------------------------------------------+
 ```
 
