@@ -56,7 +56,7 @@
 #define KEY_CTRL_U    0x15
 #define KEY_CTRL_W    0x17
 #define KEY_CTRL_X    0x18
-#define KEY_CTRL_BSL  0x1C       /* Ctrl-\  : toggle Wubi/English */
+#define KEY_CTRL_SPACE 0x00      /* Ctrl-Space (a.k.a. Ctrl-@): toggle Wubi/En */
 
 /* Extended keys (> 0xFF), parsed from ANSI arrow/nav escape sequences. */
 #define KEY_ARROW_UP    0x141

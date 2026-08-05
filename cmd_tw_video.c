@@ -379,7 +379,7 @@ static void draw_hints(struct tw_state *s)
 	static const char *row1 =
 		" ^O Write Out   ^W Where Is   ^K Cut Line   ^A Home ";
 	static const char *row2 =
-		" ^X Exit        ^\\ Wubi/En    ^U Paste      ^E End  ";
+		" ^X Exit        ^Spc Wubi/En  ^U Paste      ^E End  ";
 
 	fill_rect(0, s->hint_y, s->fb_w, 2 * TW_ROW_PX, C_FG);  /* white */
 	draw_str(TW_CELL_PX, s->hint_y, row1, C_BG, C_FG);

@@ -1,3 +1,7 @@
+work dir: /Users/k/repo/uboot/u-boot-typewriter
+
+
+
 ## rebuild
 
 scp *.c *.h trash:/home/k/repo/libreboot/libreboot-26.01rev1_src/src/u-boot/default/cmd/
@@ -17,3 +21,8 @@ ssh kk@192.168.1.201 sudo flashrom -p internal -w uboot_gru_kevin_libgfxinit_cor
 
   CONFIG_BOOTCOMMAND="typewriter mmc 0:1 a.txt"                                                                                
 
+## 
+
+## CPU速度，耗电
+
+> Adjust Kconfig / Configuration Headers: Modify macro definitions like CONFIG_SYS_CLK_FREQ or SoC-specific frequency selectors in your board's configuration header file (include/configs/...h) or defconfig. 

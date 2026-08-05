@@ -619,8 +619,8 @@ static void tw_handle_key(struct tw_state *s, int key)
 
 	tw_clear_status(s);
 
-	/* Ctrl-\ toggles the IME in any state. */
-	if (key == KEY_CTRL_BSL) {
+	/* Ctrl-Space toggles the IME in any state. */
+	if (key == KEY_CTRL_SPACE) {
 		s->ime.mode = (s->ime.mode == TW_IME_WUBI && s->ime.ready)
 			      ? TW_IME_OFF
 			      : (s->ime.ready ? TW_IME_WUBI : TW_IME_OFF);
@@ -796,6 +796,6 @@ U_BOOT_CMD(
 	"  rw      : allow saving (READ-ONLY by default)\n"
 	"Keys: ^O write  ^X exit  ^K cut  ^U paste  ^W search\n"
 	"      ^A home  ^E end  arrows/PgUp/PgDn move\n"
-	"      ^\\ toggle Wubi/English;  in Wubi: a-z code,\n"
+	"      ^Space toggle Wubi/English; in Wubi: a-z code,\n"
 	"      1-9/Space commit, =/- page, Esc cancel"
 );
