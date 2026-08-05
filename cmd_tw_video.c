@@ -338,9 +338,18 @@ static void draw_bar(struct tw_state *s)
 		return;
 	}
 
-	x = draw_str(TW_CELL_PX, s->bar_y,
-		     im->mode == TW_IME_WUBI ? "[\344\272\224]" : "[En]",
-		     C_BG, C_FG);
+	/* Mode chip. The Wubi tag contains the hanzi 五 (U+4E94, UTF-8
+	 * e4 ba 94), which is multibyte - draw it with draw_word (UTF-8 aware),
+	 * NOT draw_str (byte-per-glyph), or the hanzi renders as blank cells and
+	 * vanishes into the white bar. [En] is ASCII so either works. */
+	if (im->mode == TW_IME_WUBI) {
+		const char tag[] = "[\344\272\224]";   /* [五] */
+
+		x = draw_word(TW_CELL_PX, s->bar_y, tag, sizeof(tag) - 1,
+			      C_BG, C_FG);
+	} else {
+		x = draw_str(TW_CELL_PX, s->bar_y, "[En]", C_BG, C_FG);
+	}
 	x += TW_CELL_PX;
 
 	if (im->mode != TW_IME_WUBI || im->code_len == 0)
