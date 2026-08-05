@@ -48,15 +48,21 @@ def load_unifont(path):
             cp_s, bmp = line.split(":", 1)
             cp = int(cp_s, 16)
             raw = bytes.fromhex(bmp)
-            if len(raw) == 16:          # 8x16 narrow
+            # Store as 16 rows x 2 bytes (rows[r*2+0] = left 8px, rows[r*2+1] =
+            # right 8px), matching the C renderer's uniform per-row indexing.
+            # A narrow glyph is 1 byte/row (8px wide): put it in the left byte
+            # and zero the right byte - NOT a flat 16+16 layout, or the renderer
+            # (which reads rows[r*2]) would only see the top 8 rows.
+            if len(raw) == 16:          # 8x16 narrow: 1 byte/row
                 width = 8
-                padded = raw + b"\x00" * 16
-            elif len(raw) == 32:        # 16x16 wide
+                padded = bytes(raw[r] if b == 0 else 0
+                               for r in range(16) for b in range(2))
+            elif len(raw) == 32:        # 16x16 wide: 2 bytes/row already
                 width = 16
                 padded = raw
             else:
                 continue                # skip exotic widths
-            glyphs[cp] = (width, padded)
+            glyphs[cp] = (width, bytes(padded))
     return glyphs
 
 

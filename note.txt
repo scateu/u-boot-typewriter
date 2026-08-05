@@ -1,0 +1,19 @@
+## rebuild
+
+scp *.c *.h trash:/home/k/repo/libreboot/libreboot-26.01rev1_src/src/u-boot/default/cmd/
+cd /home/k/repo/libreboot/libreboot-26.01rev1_src/elf/u-boot/default/gru_kevin/default; rm *; cd ~/repo/libreboot/libreboot-26.01rev1_src; ./mk -m u-boot gru_kevin; ./mk -b u-boot gru_kevin; ./mk -b coreboot gru_kevin
+
+scp  bin/gru_kevin/uboot_gru_kevin_libgfxinit_corebootfb.rom  kk@192.168.1.201:
+
+ssh kk@192.168.1.201 sudo flashrom -p internal -w uboot_gru_kevin_libgfxinit_corebootfb.rom
+
+
+## 开机BOOTCMD自动启typewriter mmc 0:1 
+
+由原来的
+
+  CONFIG_BOOTCOMMAND="load mmc 0:2 $fdt_addr_r boot/rk3399-gru-kevin.dtb;load mmc 0:2 $kernel_addr_r  boot/vmlinuz;load mmc 0:2 $ramdisk_addr_r boot/initrd.img;setenv bootargs root=/dev/mmcblk1p2 rw quiet;booti $kernel_addr_r $ramdisk_addr_r:$filesize $fdt_addr_r"                                                                                
+改为
+
+  CONFIG_BOOTCOMMAND="typewriter mmc 0:1 a.txt"                                                                                
+
