@@ -36,9 +36,15 @@
 
 /* File I/O scratch is malloc()'d at runtime (see cmd_tw_fs.c) - NOT staged at
  * a fixed CONFIG_SYS_LOAD_ADDR, which on this board overlaps U-Boot's own DRAM
- * image + heap and corrupted the FAT partition. This is just the buffer size:
- * worst-case UTF-8 (3 bytes/BMP codepoint + one newline per line). */
-#define TW_FILE_BUF_SIZE (TW_MAX_LINES * TW_MAX_COLS * 3 + TW_MAX_LINES)
+ * image + heap and corrupted the FAT partition.
+ *
+ * Size for the true worst case: utf8_encode emits up to 4 bytes per codepoint
+ * (non-BMP), plus one newline per line, plus a slack page. The previous budget
+ * of 3 bytes/cp with zero slack could overflow the buffer - and overflowing a
+ * malloc chunk during fs_write scribbles over the FAT driver's own heap
+ * allocations (directory iterator / LFN scratch), corrupting the on-disk
+ * directory. The save loop also bounds-checks every write against this size. */
+#define TW_FILE_BUF_SIZE (TW_MAX_LINES * (TW_MAX_COLS * 4 + 1) + 4096)
 
 /* ---- cooked key codes (returned by tw_read_key) ------------------------ */
 #define KEY_ESC       0x1B
@@ -114,6 +120,7 @@ struct tw_state {
 	int   dirty;
 	int   quit;
 	int   writable;    /* 0 = read-only (default); saving is refused */
+	int   last_write_bytes;  /* bytes written by the last successful save */
 
 	char  filename[TW_MAX_FILENAME];
 	char  status_msg[128];

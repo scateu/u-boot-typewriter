@@ -160,21 +160,39 @@ static void tw_load_cp(struct tw_state *s, u32 cp)
 
 int tw_file_load(struct tw_state *s, const char *path)
 {
-	loff_t len_read = 0;
-	char  *buf = malloc(TW_FILE_BUF_SIZE);
+	loff_t len_read = 0, fsize = 0;
+	size_t cap;
+	char  *buf;
 	ulong  addr;
 	int    ret, off;
 
+	/* Query the size first and allocate exactly that (+1 guard), rather than
+	 * a fixed multi-MB buffer held across fs_read() - same heap-hygiene
+	 * reason as tw_file_save(): keep the pool clean for the FS layer's own
+	 * allocations. A missing file -> empty buffer. */
+	if (tw_fs_set(&s->fs) != 0)
+		return -1;
+	ret = fs_size(path, &fsize);
+	if (ret < 0 || fsize <= 0) {
+		tw_empty_buffer(s);              /* new/empty file */
+		return 0;
+	}
+	if (fsize > TW_FILE_BUF_SIZE)        /* clamp pathologically large files */
+		fsize = TW_FILE_BUF_SIZE;
+
+	cap = (size_t)fsize + 1;
+	buf = malloc(cap);
 	if (!buf)
 		return -1;
 	addr = map_to_sysmem(buf);       /* physical addr for fs_read() */
 
+	/* fs_size() cleared the active device; re-assert before fs_read(). */
 	if (tw_fs_set(&s->fs) != 0) {
 		free(buf);
 		return -1;
 	}
 
-	ret = fs_read(path, addr, 0, 0, &len_read);
+	ret = fs_read(path, addr, 0, (loff_t)fsize, &len_read);
 	if (ret < 0) {
 		free(buf);
 		if (ret == -ENOENT || len_read == 0) {
@@ -200,21 +218,54 @@ int tw_file_load(struct tw_state *s, const char *path)
 	return 0;
 }
 
-int tw_file_save(struct tw_state *s)
+/* Compute the exact UTF-8 byte length of the whole buffer (content + one
+ * newline per line), so we can allocate precisely that much. */
+static size_t tw_serialized_len(struct tw_state *s)
 {
-	char  *buf = malloc(TW_FILE_BUF_SIZE);
-	ulong  addr;
-	loff_t size = 0, written = 0;
-	int    ret, i, j;
-
-	if (!buf)
-		return -1;
-	addr = map_to_sysmem(buf);       /* physical addr for fs_write() */
+	size_t n = 0;
+	int i, j;
+	char tmp[4];
 
 	for (i = 0; i < s->num_lines; i++) {
 		for (j = 0; j < s->line_len[i]; j++)
-			size += utf8_encode(s->lines[i][j], buf + size);
-		buf[size++] = '\n';
+			n += utf8_encode(s->lines[i][j], tmp);
+		n += 1;                          /* newline */
+	}
+	return n;
+}
+
+int tw_file_save(struct tw_state *s)
+{
+	size_t need = tw_serialized_len(s);
+	size_t cap  = need + 8;              /* small slack; bounds-checked below */
+	char  *buf, *p;
+	ulong  addr;
+	loff_t written = 0;
+	int    ret, i, j;
+
+	/*
+	 * Allocate EXACTLY what this file needs, not a fixed multi-MB buffer.
+	 * The previous fixed 3-4 MB allocation was held across fs_write() while
+	 * U-Boot's FAT writer did its own malloc()/strdup()/malloc_cache_aligned
+	 * for the directory iterator and LFN scratch; a large outstanding
+	 * allocation can fragment/stress the pool so those land on bad memory,
+	 * corrupting the on-disk directory. A tight buffer keeps the heap clean.
+	 */
+	buf = malloc(cap);
+	if (!buf)
+		return -1;
+	addr = map_to_sysmem(buf);           /* physical addr for fs_write() */
+
+	p = buf;
+	for (i = 0; i < s->num_lines; i++) {
+		for (j = 0; j < s->line_len[i]; j++) {
+			if ((size_t)(p - buf) + 4 > cap)   /* hard overflow guard */
+				goto overflow;
+			p += utf8_encode(s->lines[i][j], p);
+		}
+		if ((size_t)(p - buf) + 1 > cap)
+			goto overflow;
+		*p++ = '\n';
 	}
 
 	if (tw_fs_set(&s->fs) != 0) {
@@ -222,12 +273,19 @@ int tw_file_save(struct tw_state *s)
 		return -1;
 	}
 
-	ret = fs_write(s->filename, addr, 0, size, &written);
-	free(buf);
+	{
+		loff_t total = (loff_t)(p - buf);
 
-	if (ret < 0)
-		return ret;
-
+		ret = fs_write(s->filename, addr, 0, total, &written);
+		free(buf);
+		if (ret < 0 || written != total)
+			return -1;
+		s->last_write_bytes = (int)total;  /* on-screen diagnostic */
+	}
 	s->dirty = 0;
 	return 0;
+
+overflow:
+	free(buf);
+	return -1;
 }

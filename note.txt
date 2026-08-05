@@ -5,11 +5,13 @@ work dir: /Users/k/repo/uboot/u-boot-typewriter
 ## rebuild
 
 scp *.c *.h trash:/home/k/repo/libreboot/libreboot-26.01rev1_src/src/u-boot/default/cmd/
+
 cd /home/k/repo/libreboot/libreboot-26.01rev1_src/elf/u-boot/default/gru_kevin/default; rm *; cd ~/repo/libreboot/libreboot-26.01rev1_src; ./mk -m u-boot gru_kevin; ./mk -b u-boot gru_kevin; ./mk -b coreboot gru_kevin
 
 scp  bin/gru_kevin/uboot_gru_kevin_libgfxinit_corebootfb.rom  kk@192.168.1.201:
 
-ssh kk@192.168.1.201 sudo flashrom -p internal -w uboot_gru_kevin_libgfxinit_corebootfb.rom
+ssh kk@192.168.1.201 
+sudo flashrom -p internal -w uboot_gru_kevin_libgfxinit_corebootfb.rom
 
 
 ## 开机BOOTCMD自动启typewriter mmc 0:1 
@@ -26,3 +28,10 @@ ssh kk@192.168.1.201 sudo flashrom -p internal -w uboot_gru_kevin_libgfxinit_cor
 ## CPU速度，耗电
 
 > Adjust Kconfig / Configuration Headers: Modify macro definitions like CONFIG_SYS_CLK_FREQ or SoC-specific frequency selectors in your board's configuration header file (include/configs/...h) or defconfig. 
+
+
+# vfat 
+
+root@chromebook-kevin:/home/kk# mkfs.vfat -F 32 /dev/mmcblk1p1
+mkfs.fat 4.2 (2021-01-31)
+root@chromebook-kevin:/home/kk# fsck.vfat  /dev/mmcblk1p1

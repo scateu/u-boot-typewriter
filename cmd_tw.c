@@ -488,8 +488,11 @@ static void tw_do_save(struct tw_state *s)
 		return;
 	}
 	if (tw_file_save(s) == 0)
-		tw_status(s, "[ Wrote %d line%s ]", s->num_lines,
-			  s->num_lines == 1 ? "" : "s");
+		/* Show name + byte count so a corrupt/short write is visible
+		 * on the framebuffer status line (no serial needed to debug). */
+		tw_status(s, "[ Wrote %d line%s, %d bytes -> %s ]",
+			  s->num_lines, s->num_lines == 1 ? "" : "s",
+			  s->last_write_bytes, s->filename);
 	else
 		tw_status(s, "[ Error writing %s ]", s->filename);
 }

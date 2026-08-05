@@ -18,6 +18,7 @@ void video_damage(struct udevice *v,int x,int y,int w,int h){(void)v;(void)x;(vo
 int uclass_first_device_err(enum uclass_id id, struct udevice **d){ (void)id;(void)d; return 0; }
 void *dev_get_uclass_priv(const struct udevice *d){ (void)d; return 0; }
 int fs_set_blk_dev(const char *a,const char *b,int c){ (void)a;(void)b;(void)c; return 0; }
+int fs_size(const char *f,long long *sz){ (void)f; if(sz)*sz=0; return 0; }
 int fs_read(const char *f,unsigned long a,long long o,long long l,long long *r){ (void)f;(void)a;(void)o;(void)l; if(r)*r=0; return 0; }
 int fs_write(const char *f,unsigned long a,long long o,long long l,long long *w){ (void)f;(void)a;(void)o;(void)l; if(w)*w=l; return 0; }
 /* printf/snprintf/vsnprintf: forward to libc (names match) */
