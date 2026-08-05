@@ -815,8 +815,8 @@ static void tw_bind_ime(struct tw_state *s)
 	if (ime_table_open_mem(&s->ime.tab, wubi_tab, wubi_tab_len,
 			       IME_SCHEME_WUBI) == 0)
 		s->ime.ready = 1;
-	/* Start in Wubi if the table bound, matching the request. */
-	s->ime.mode = s->ime.ready ? TW_IME_WUBI : TW_IME_OFF;
+	/* Start in English; Ctrl-Space toggles to Wubi when the table bound. */
+	s->ime.mode = TW_IME_OFF;
 	tw_ime_reset(&s->ime);
 }
 
@@ -832,8 +832,13 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 {
 	struct tw_state *s = &g_tw;
 	const char *fstype = NULL;
+	/* Defaults for a bare `typewriter`: the microSD, which has a working
+	 * FAT write path on this board (the eMMC's is broken - see
+	 * KNOWN_ISSUES). Read-only until an explicit `rw` is given. */
+	const char *iftype  = "mmc";
+	const char *devpart = "1:1";
+	const char *fname   = "a.txt";
 	int writable = 0;
-	int scratch;
 	int i;
 
 	/* `typewriter -h` / `--help`: print usage to the console and return
@@ -844,20 +849,13 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	/* Argument shapes:
-	 *   typewriter                        -> empty scratch buffer (RO)
-	 *   typewriter <if> <dev:part> <file> [fstype] [rw]  -> file-backed
+	 *   typewriter                        -> default: mmc 1:1 a.txt (RO)
+	 *   typewriter <if> <dev:part> <file> [fstype] [rw]  -> explicit
 	 * Anything with 1-3 args (an incomplete file spec) is a usage error. */
-	if (argc == 1) {
-		scratch = 1;
-	} else if (argc >= 4) {
-		scratch = 0;
-	} else {
-		return CMD_RET_USAGE;
-	}
-
-	memset(s, 0, sizeof(*s));
-
-	if (!scratch) {
+	if (argc >= 4) {
+		iftype  = argv[1];
+		devpart = argv[2];
+		fname   = argv[3];
 		/* Trailing optional args, in any order: the literal token "rw"
 		 * enables saving (read-only by default, so an accidental run
 		 * can't write); any other trailing token is the fs type. */
@@ -867,7 +865,11 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 			else
 				fstype = argv[i];
 		}
+	} else if (argc != 1) {
+		return CMD_RET_USAGE;
 	}
+
+	memset(s, 0, sizeof(*s));
 	s->writable = writable;
 
 	if (tw_video_init(s) != 0) {
@@ -876,26 +878,12 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 		return CMD_RET_FAILURE;
 	}
 
-	if (scratch) {
-		/* No file: a blank in-memory buffer. s->fs stays invalid so a
-		 * save is impossible (and it's read-only anyway). */
-		s->num_lines = 1;
-		s->line_len[0] = 0;
-		tw_bind_ime(s);
-		tw_status(s, "[ New scratch buffer - read-only, ^X to exit ]");
-		while (!s->quit) {
-			tw_render(s);
-			tw_handle_key(s, tw_read_key());
-		}
-		return CMD_RET_SUCCESS;
-	}
-
-	if (tw_fs_probe(&s->fs, argv[1], argv[2], fstype) < 0) {
-		printf("typewriter: cannot access %s %s\n", argv[1], argv[2]);
+	if (tw_fs_probe(&s->fs, iftype, devpart, fstype) < 0) {
+		printf("typewriter: cannot access %s %s\n", iftype, devpart);
 		return CMD_RET_FAILURE;
 	}
 
-	strncpy(s->filename, argv[3], TW_MAX_FILENAME - 1);
+	strncpy(s->filename, fname, TW_MAX_FILENAME - 1);
 	s->filename[TW_MAX_FILENAME - 1] = '\0';
 
 	if (tw_file_load(s, s->filename) < 0) {
@@ -923,7 +911,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 U_BOOT_CMD(
 	typewriter, 6, 0, do_typewriter,
 	"Nano-like editor with Wubi Chinese input (framebuffer)",
-	"                        - open an empty scratch buffer (read-only)\n"
+	"                        - default: open mmc 1:1 a.txt (read-only)\n"
 	"typewriter -h                        - show this help\n"
 	"typewriter <iftype> <dev:part> <filename> [fstype] [rw]\n"
 	"  iftype  : mmc usb virtio nvme sata\n"
