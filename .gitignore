@@ -13,3 +13,6 @@
 /note.txt
 *.swp
 /note_libreboot.txt
+
+# Built ROM images (build artifacts)
+*.rom
