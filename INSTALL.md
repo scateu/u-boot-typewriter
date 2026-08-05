@@ -269,13 +269,12 @@ File keys:
 - `^O` — write out (save) to the current file.
 - `^R` — open a file: shows a list of files on the current device; `↑`/`↓` to
   select, `Enter` to open, `Esc` to cancel. Auto-saves the current buffer first.
-- `M-0` … `M-9` — jump to slot files `0.txt` … `9.txt` (auto-saves the current
-  one first — AlphaSmart style).
 - `^X` — exit.
 
-Editing is readline-style: `^B/^F/^P/^N` move, `^A/^E` line ends, `M-b/M-f`
-words, `^K` kill-to-EOL, `^Y` yank, `^W` delete-word-back, `M-w` find. Full list
-in the README and via `help typewriter` at a U-Boot prompt.
+Editing is readline-style: `^B/^F/^P/^N` and arrows move, `^A/^E` line ends,
+`^K` kill-to-EOL, `^Y` yank, `^W` delete-word-back. Full list in the README and
+via `help typewriter` at a U-Boot prompt. (Meta/Alt chords are wired but don't
+work on this Chromebook's console.)
 
 ---
 

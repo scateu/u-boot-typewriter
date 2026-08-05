@@ -14,12 +14,12 @@ Target tree: **U-Boot 2026.07**.
 +--------------------------------------------------------------+
 | typewriter    /notes.txt    Modified                  [Wubi] |  title bar
 |                                                              |
-|  你好，世界                                                    |  text area
+|  你好，世界                                                  |  text area
 |  boot config: setenv bootargs ...                            |  (hanzi = 2 cols)
 |                                                              |
-| [五] wq  1.你 2.低 3.父荫 4.仰卧 …                      (1/2)  |  candidate bar
-| ^O Write  ^R Open  M-0..9 Slot  ^K Kill  ^Y Yank  ^Spc Wubi  |  shortcut hints
-| ^X Exit  ^W DelWord  M-f/b Word  ^A/^E ^B/^F ^P/^N  M-w Find |
+| [五] wq  1.你 2.低 3.父荫 4.仰卧 …                    (1/2)  |  candidate bar
+| ^O Write  ^R Open  ^K Kill  ^Y Yank  ^W DelWord  ^Spc Wubi   |  shortcut hints
+| ^X Exit  ^A/^E BOL/EOL  ^B/^F ^P/^N move  ^D Del  arrows     |
 +--------------------------------------------------------------+
 ```
 
@@ -201,27 +201,26 @@ Modeless, readline-style — typing inserts text; Ctrl/Meta chords are commands.
 | `^B` / `^F`, `←` / `→` | back / forward one char |
 | `^P` / `^N`, `↑` / `↓` | previous / next line |
 | `^A` / `Home`, `^E` / `End` | start / end of line |
-| `M-b` / `M-f` | back / forward one word |
 | `PgUp` / `PgDn` | move a screenful |
 | `Enter` | split line |
 | `Backspace` | delete left (merges lines at column 0) |
 | `^D` / `Delete` | delete char under cursor |
 | `^W` | delete word backward |
-| `M-d` | kill word forward |
 | `^K` | kill from cursor to end of line |
 | `^Y` | yank (paste the kill buffer) |
-| `M-w` | find (search prompt, ASCII) |
 | `^O` | write out (save) — prompts for filename |
 | `^R` | open a file — **picker**: lists files (`fatls`-style), `↑`/`↓` select, `Enter` open, `Esc` cancel (auto-saves current) |
-| `M-0` … `M-9` | open slot `0.txt` … `9.txt` on the launch device (auto-saves current) |
 | `^X` | exit — if modified & writable, asks Y/N/C |
 | `Ctrl-Space` | toggle **Wubi ⇄ English** input |
 
-Opening a file or switching slots **auto-saves** the current buffer first (if
-it's writable and modified), AlphaSmart-style — so `M-1`, type, `M-2`, type,
-`M-1` returns to your first note with everything saved. On a read-only buffer
-(e.g. the eMMC, or `ro`) nothing is written and edits to the outgoing buffer are
-simply dropped on switch.
+Opening a file via `^R` **auto-saves** the current buffer first (if it's
+writable and modified) before loading the new one; on a read-only buffer (the
+eMMC, or `ro`) nothing is written and outgoing edits are dropped on switch.
+
+> **Meta (Alt) keys** (`M-b`/`M-f` word motion, `M-d` kill-word, `M-w` find)
+> are wired in the code but **do not work on the target Chromebook's console**,
+> so they're omitted above. Char/line motion and `^W` cover the same ground.
+> They may work on other terminals that deliver Alt as an ESC prefix.
 
 ### Wubi input (`Ctrl-Space` to turn on)
 

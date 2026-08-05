@@ -111,9 +111,10 @@ static int tw_read_key(void)
 		}
 	}
 
-	/* Meta (Alt) chord: ESC followed by a letter or digit. */
-	if (c >= '0' && c <= '9')
-		return KEY_META_0 + (c - '0');   /* M-N: open slot N.txt */
+	/* Meta (Alt) chord: ESC followed by a letter. NOTE: Meta keys don't work
+	 * on the target hardware/terminal, so these are effectively dormant - kept
+	 * wired (word motion / find) in case a future terminal delivers them. The
+	 * M-0..9 file slots were removed; use the ^R picker to switch files. */
 	switch (c) {
 	case 'f': case 'F': return KEY_META_F;
 	case 'b': case 'B': return KEY_META_B;
@@ -843,19 +844,6 @@ static void tw_handle_key(struct tw_state *s, int key)
 		return;
 	}
 
-	/* M-0 .. M-9: switch to slot file N.txt on the current device
-	 * (auto-saves the current buffer first). Handle before the switch so
-	 * the range check is clean. */
-	if (key >= KEY_META_0 && key <= KEY_META_0 + 9) {
-		char slot[8];
-
-		snprintf(slot, sizeof(slot), "%d.txt", key - KEY_META_0);
-		tw_switch_file(s, slot);
-		tw_mark_dirty(s, &snap);
-		s->dirty_all = 1;       /* new content: full repaint */
-		return;
-	}
-
 	switch (key) {
 	case KEY_CTRL_O:
 		tw_prompt_start(s, TW_PROMPT_SAVE);
@@ -1091,11 +1079,9 @@ U_BOOT_CMD(
 	"  NOTE: mmc 0 (eMMC) is ALWAYS read-only - its FAT writes\n"
 	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
-	"  ^O write  ^R open (pick from list)  M-0..M-9 slot N.txt  ^X exit\n"
-	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  M-b/M-f word\n"
-	"  ^D del  ^W del-word-back  M-d kill-word  ^K kill-eol  ^Y yank\n"
-	"  M-w find  arrows/PgUp/PgDn move\n"
+	"  ^O write  ^R open (pick from list)  ^X exit  ^G help\n"
+	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  arrows/PgUp/PgDn move\n"
+	"  ^D del  ^W del-word-back  ^K kill-eol  ^Y yank\n"
 	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"
-	"  1-9/Space commit, =/- page, Esc cancel\n"
-	"  (M-N opens N.txt on the launch device; auto-saves current)"
+	"  1-9/Space commit, =/- page, Esc cancel"
 );

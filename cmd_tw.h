@@ -82,12 +82,12 @@
 #define KEY_PAGE_UP     0x200
 #define KEY_PAGE_DOWN   0x201
 #define KEY_DELETE      0x202
+/* Meta (Alt) chords. NOTE: Meta keys do not work on the target hardware; these
+ * are kept wired but dormant. File switching is via the ^R picker instead. */
 #define KEY_META_F      0x210    /* M-f: forward one word */
 #define KEY_META_B      0x211    /* M-b: backward one word */
 #define KEY_META_D      0x212    /* M-d: kill word forward */
-#define KEY_META_W      0x213    /* M-w: search (moved off C-w) */
-#define KEY_META_0      0x220    /* M-0 .. M-9: open slot file N.txt */
-					/* (KEY_META_0 + N, N in 0..9) */
+#define KEY_META_W      0x213    /* M-w: search */
 
 /* ---- IME (Wubi) input state -------------------------------------------- */
 #define TW_IME_OFF    0          /* English: bytes typed literally */
