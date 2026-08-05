@@ -77,6 +77,45 @@ static int tw_fs_set(struct tw_fs *fs)
 	return fs_set_blk_dev(fs->iftype, fs->dev_part, fs_type);
 }
 
+/*
+ * List regular files in the root of the current device into s->pick_name[],
+ * for the ^R picker. Returns the count (0 on error/empty). Directories and dot
+ * entries are skipped. Names longer than the buffer are truncated.
+ */
+int tw_list_files(struct tw_state *s)
+{
+	struct fs_dir_stream *dirs;
+	struct fs_dirent *dent;
+
+	s->pick_count = 0;
+	s->pick_sel = 0;
+	s->pick_top = 0;
+
+	if (tw_fs_set(&s->fs) != 0)
+		return 0;
+
+	dirs = fs_opendir("/");
+	if (!dirs)
+		return 0;
+
+	while (s->pick_count < TW_PICK_MAX) {
+		dent = fs_readdir(dirs);
+		if (!dent)
+			break;
+		if (dent->type != FS_DT_REG)
+			continue;                       /* files only */
+		if (dent->name[0] == '.')
+			continue;                       /* skip dotfiles */
+		strncpy(s->pick_name[s->pick_count], dent->name,
+			TW_PICK_NAMELEN - 1);
+		s->pick_name[s->pick_count][TW_PICK_NAMELEN - 1] = '\0';
+		s->pick_count++;
+	}
+
+	fs_closedir(dirs);
+	return s->pick_count;
+}
+
 /* Decode one UTF-8 codepoint from s (len bytes available). Returns bytes
  * consumed and sets *cp. Malformed input consumes 1 byte and yields U+FFFD. */
 static int utf8_decode(const char *s, int len, u32 *cp)

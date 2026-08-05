@@ -26,6 +26,7 @@ int tw_fs_probe(struct tw_fs *fs, const char *iftype, const char *dev_part,
 		const char *fstype);
 int tw_file_load(struct tw_state *s, const char *path);
 int tw_file_save(struct tw_state *s);
+int tw_list_files(struct tw_state *s);
 
 /* --- from cmd_tw_video.c --- */
 int  tw_video_init(struct tw_state *s);
@@ -39,6 +40,24 @@ static struct tw_state g_tw;
  * constant (> 0xFF) parsed from an ANSI arrow/nav escape sequence. Mirrors the
  * ved reference's parser; input comes from U-Boot's console (serial or USB kbd
  * routed to stdin). */
+/*
+ * Read the next byte of an escape sequence, waiting up to ~30 ms for it. The
+ * bytes of an ESC-sequence / Meta chord arrive right after the ESC but not in
+ * the same instant, so a single tstc() races the UART and drops the follow-up
+ * (this was why M-w / M-0..9 "didn't work"). Returns -1 if nothing arrives
+ * (i.e. it really was a bare ESC).
+ */
+static int tw_getch_timeout(void)
+{
+	int spins = 30;         /* ~30 ms at 1 ms/spin */
+
+	while (!tstc() && spins-- > 0)
+		udelay(1000);
+	if (!tstc())
+		return -1;
+	return getchar();
+}
+
 static int tw_read_key(void)
 {
 	int c;
@@ -59,14 +78,13 @@ static int tw_read_key(void)
 		return c;
 
 	/* ESC alone, or the start of a CSI/SS3 sequence (arrows/nav) or a Meta
-	 * chord (M-x arrives as ESC then x). If nothing follows quickly, it's a
-	 * bare ESC. */
-	if (!tstc())
-		return KEY_ESC;
-	c = getchar();
+	 * chord (M-x arrives as ESC then x). */
+	c = tw_getch_timeout();
+	if (c < 0)
+		return KEY_ESC;         /* bare ESC */
 
 	if (c == '[' || c == 'O') {
-		c = getchar();
+		c = tw_getch_timeout();
 		switch (c) {
 		case 'A': return KEY_ARROW_UP;
 		case 'B': return KEY_ARROW_DOWN;
@@ -77,7 +95,7 @@ static int tw_read_key(void)
 		case '1': case '2': case '3':
 		case '4': case '5': case '6': {
 			int sub = c;
-			int c4 = getchar();
+			int c4 = tw_getch_timeout();
 
 			if (c4 == '~') {
 				if (sub == '5') return KEY_PAGE_UP;
@@ -616,6 +634,26 @@ static void tw_switch_file(struct tw_state *s, const char *name)
 		  s->filename, s->num_lines, s->num_lines == 1 ? "" : "s");
 }
 
+/* ^R: list files on the current device and enter the arrow-select picker. If
+ * the directory is empty or unreadable, fall back to a typed "File to open:". */
+static void tw_picker_open(struct tw_state *s)
+{
+	if (tw_list_files(s) > 0) {
+		s->prompt = TW_PROMPT_PICK;
+		/* pre-select the current file if it's in the list */
+		for (int i = 0; i < s->pick_count; i++)
+			if (!strcmp(s->pick_name[i], s->filename)) {
+				s->pick_sel = i;
+				break;
+			}
+	} else {
+		s->prompt = TW_PROMPT_OPEN;     /* nothing to pick: type a name */
+		s->prompt_ans[0] = '\0';
+		s->prompt_len = 0;
+		tw_status(s, "[ No files - type a name ]");
+	}
+}
+
 static void tw_prompt_start(struct tw_state *s, int which)
 {
 	s->prompt = which;
@@ -631,6 +669,48 @@ static void tw_prompt_start(struct tw_state *s, int which)
 /* Handle a key while a bottom-line prompt owns input. */
 static void tw_prompt_key(struct tw_state *s, int key)
 {
+	/* ^R file picker: arrow / ^P / ^N to move, Enter opens, Esc cancels. */
+	if (s->prompt == TW_PROMPT_PICK) {
+		switch (key) {
+		case KEY_ARROW_UP:
+		case KEY_CTRL_P:
+			if (s->pick_sel > 0)
+				s->pick_sel--;
+			break;
+		case KEY_ARROW_DOWN:
+		case KEY_CTRL_N:
+			if (s->pick_sel < s->pick_count - 1)
+				s->pick_sel++;
+			break;
+		case KEY_PAGE_UP:
+			s->pick_sel -= 8;
+			if (s->pick_sel < 0)
+				s->pick_sel = 0;
+			break;
+		case KEY_PAGE_DOWN:
+			s->pick_sel += 8;
+			if (s->pick_sel > s->pick_count - 1)
+				s->pick_sel = s->pick_count - 1;
+			break;
+		case KEY_ENTER:
+		case KEY_LF: {
+			char name[TW_PICK_NAMELEN];
+
+			strncpy(name, s->pick_name[s->pick_sel], sizeof(name) - 1);
+			name[sizeof(name) - 1] = '\0';
+			s->prompt = TW_PROMPT_NONE;
+			tw_switch_file(s, name);
+			return;
+		}
+		case KEY_ESC:
+		case KEY_CTRL_X:
+			s->prompt = TW_PROMPT_NONE;
+			tw_status(s, "[ Cancelled ]");
+			break;
+		}
+		return;
+	}
+
 	if (s->prompt == TW_PROMPT_EXIT) {
 		if (key == 'y' || key == 'Y') {
 			tw_do_save(s);
@@ -696,7 +776,7 @@ static void tw_prompt_key(struct tw_state *s, int key)
 struct tw_snap {
 	int num_lines, scroll_top, dirty, has_name;
 	int ime_mode, code_len, page, ncand;
-	int prompt, has_status;
+	int prompt, has_status, pick_sel;
 };
 
 static void tw_snapshot(struct tw_state *s, struct tw_snap *o)
@@ -711,6 +791,7 @@ static void tw_snapshot(struct tw_state *s, struct tw_snap *o)
 	o->ncand = s->ime.ncand;
 	o->prompt = s->prompt;
 	o->has_status = s->status_msg[0] != '\0';
+	o->pick_sel = s->pick_sel;
 }
 
 static void tw_mark_dirty(struct tw_state *s, const struct tw_snap *o)
@@ -725,7 +806,8 @@ static void tw_mark_dirty(struct tw_state *s, const struct tw_snap *o)
 	    s->ime.page != o->page || s->ime.ncand != o->ncand ||
 	    s->prompt != o->prompt ||
 	    (s->status_msg[0] != '\0') != o->has_status ||
-	    s->status_msg[0] != '\0')
+	    s->status_msg[0] != '\0' ||
+	    s->pick_sel != o->pick_sel)         /* picker selection moved */
 		s->dirty_bar = 1;
 }
 
@@ -778,8 +860,8 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_CTRL_O:
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;
-	case KEY_CTRL_R:            /* open a file into the buffer */
-		tw_prompt_start(s, TW_PROMPT_OPEN);
+	case KEY_CTRL_R:            /* open a file: arrow-select picker */
+		tw_picker_open(s);
 		break;
 	case KEY_CTRL_X:
 		/* Only offer "save modified buffer?" when saving is possible.
@@ -1009,7 +1091,7 @@ U_BOOT_CMD(
 	"  NOTE: mmc 0 (eMMC) is ALWAYS read-only - its FAT writes\n"
 	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
-	"  ^O write  ^R open file  M-0..M-9 open slot N.txt  ^X exit  ^G help\n"
+	"  ^O write  ^R open (pick from list)  M-0..M-9 slot N.txt  ^X exit\n"
 	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  M-b/M-f word\n"
 	"  ^D del  ^W del-word-back  M-d kill-word  ^K kill-eol  ^Y yank\n"
 	"  M-w find  arrows/PgUp/PgDn move\n"

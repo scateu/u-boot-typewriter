@@ -156,6 +156,34 @@ int main(void){
         (on2&&back1&&back2)?"PASS":"FAIL", on2, back1, back2);
     if(!(on2&&back1&&back2)) fails++;
 
+    /* Test 11: ^R picker navigation - up/down move selection, Enter opens.
+     * Seed a fake file list + backing files, then drive the picker keys. */
+    memset(s,0,sizeof(*s)); tw_video_init(s); s->num_lines=1; s->line_len[0]=0;
+    tw_bind_ime(s); s->ime.mode=TW_IME_OFF; s->writable=1; s->fs.valid=1;
+    /* create three files via save so the picker's switch can load one */
+    strncpy(s->filename,"a.txt",TW_MAX_FILENAME-1); feed(s,"AA"); tw_do_save(s);
+    strncpy(s->filename,"b.txt",TW_MAX_FILENAME-1); s->line_len[0]=0; s->cur_col=0;
+        feed(s,"BB"); tw_do_save(s);
+    strncpy(s->filename,"c.txt",TW_MAX_FILENAME-1); s->line_len[0]=0; s->cur_col=0;
+        feed(s,"CC"); tw_do_save(s);
+    /* enter picker mode with a known list */
+    s->prompt=TW_PROMPT_PICK; s->pick_count=3; s->pick_sel=0; s->pick_top=0;
+    strcpy(s->pick_name[0],"a.txt");
+    strcpy(s->pick_name[1],"b.txt");
+    strcpy(s->pick_name[2],"c.txt");
+    tw_handle_key(s, KEY_ARROW_DOWN);   /* sel 0 -> 1 */
+    int sel1 = s->pick_sel;
+    tw_handle_key(s, KEY_ARROW_DOWN);   /* sel 1 -> 2 */
+    tw_handle_key(s, KEY_ARROW_UP);     /* sel 2 -> 1 (b.txt) */
+    int sel2 = s->pick_sel;
+    tw_handle_key(s, KEY_ENTER);        /* open b.txt */
+    dump_line0(s,buf);
+    int ok11 = (sel1==1)&&(sel2==1)&&(strcmp(s->filename,"b.txt")==0)
+               &&(strcmp(buf,"BB")==0)&&(s->prompt==TW_PROMPT_NONE);
+    printf("%s ^R picker: sel1=%d sel2=%d opened='%s' content='%s'\n",
+        ok11?"PASS":"FAIL", sel1, sel2, s->filename, buf);
+    if(!ok11) fails++;
+
     printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);
     return fails?1:0;
 }

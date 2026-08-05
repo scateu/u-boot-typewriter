@@ -321,6 +321,16 @@ static void draw_bar(struct tw_state *s)
 
 	fill_rect(0, s->bar_y, s->fb_w, TW_ROW_PX, C_FG);   /* white bar */
 
+	if (s->prompt == TW_PROMPT_PICK) {
+		char hint[80];
+
+		snprintf(hint, sizeof(hint),
+			 " Open file  [%d/%d]  Up/Dn select  Enter open  Esc cancel ",
+			 s->pick_count ? s->pick_sel + 1 : 0, s->pick_count);
+		draw_str(0, s->bar_y, hint, C_BG, C_FG);
+		return;
+	}
+
 	if (s->prompt != TW_PROMPT_NONE) {
 		const char *label =
 			s->prompt == TW_PROMPT_SAVE   ? " File Name to Write: " :
@@ -397,6 +407,45 @@ static void draw_hints(struct tw_state *s)
 }
 
 /*
+ * ^R file picker: a bordered, scrollable list overlaying the text area.
+ * The selected row is drawn in reverse (white bar, black text). Keeps
+ * pick_top in sync so pick_sel is always visible.
+ */
+static void draw_picker(struct tw_state *s)
+{
+	int rows = s->text_rows;         /* list rows = text-area rows */
+	int i, r;
+
+	if (rows < 1)
+		rows = 1;
+
+	/* scroll so the selection is visible */
+	if (s->pick_sel < s->pick_top)
+		s->pick_top = s->pick_sel;
+	if (s->pick_sel >= s->pick_top + rows)
+		s->pick_top = s->pick_sel - rows + 1;
+
+	/* clear the text area, draw a header line, then the list */
+	fill_rect(s->text_x0, s->text_y0,
+		  s->fb_w - 2 * s->text_x0, s->bar_y - s->text_y0, C_BG);
+
+	for (r = 0; r < rows; r++) {
+		int idx = s->pick_top + r;
+		int py = s->text_y0 + r * TW_ROW_PX;
+		u32 fg = C_FG, bg = C_BG;
+
+		if (idx >= s->pick_count)
+			break;
+		if (idx == s->pick_sel) {        /* highlight selection */
+			fg = C_BG; bg = C_FG;
+			fill_rect(s->text_x0, py,
+				  s->fb_w - 2 * s->text_x0, TW_ROW_PX, C_FG);
+		}
+		draw_str(s->text_x0 + TW_CELL_PX, py, s->pick_name[idx], fg, bg);
+	}
+}
+
+/*
  * Incremental render. Repaints only what changed since the last frame:
  *  - first_paint: everything (static hints + title + full text + bar).
  *  - dirty_all / scrolled: whole text area.
@@ -425,35 +474,41 @@ void tw_render(struct tw_state *s)
 		s->dirty_title = 0;
 	}
 
-	/* Scrolling forces a full text-area repaint. */
-	if (s->scroll_top != s->last_scroll_top)
-		s->dirty_all = 1;
-
-	if (s->dirty_all) {
-		for (sr = 0; sr < s->text_rows; sr++)
-			draw_text_row(s, sr);
-		s->dirty_all = 0;
-		memset(s->dirty_row, 0, (size_t)s->text_rows);
+	/* The ^R picker takes over the text area with its file list. */
+	if (s->prompt == TW_PROMPT_PICK) {
+		draw_picker(s);
+		s->dirty_all = 1;        /* restore the text on exit */
 	} else {
-		/* erase the old caret's row region if the cursor row changed */
-		if (s->last_cur_row != s->cur_row) {
-			int osr = s->last_cur_row - s->scroll_top;
+		/* Scrolling forces a full text-area repaint. */
+		if (s->scroll_top != s->last_scroll_top)
+			s->dirty_all = 1;
 
-			if (osr >= 0 && osr < s->text_rows)
-				s->dirty_row[osr] = 1;
-		}
-		s->dirty_row[s->cur_row - s->scroll_top] = 1;
-		for (sr = 0; sr < s->text_rows; sr++) {
-			if (s->dirty_row[sr]) {
+		if (s->dirty_all) {
+			for (sr = 0; sr < s->text_rows; sr++)
 				draw_text_row(s, sr);
-				s->dirty_row[sr] = 0;
+			s->dirty_all = 0;
+			memset(s->dirty_row, 0, (size_t)s->text_rows);
+		} else {
+			/* erase old caret row if the cursor row changed */
+			if (s->last_cur_row != s->cur_row) {
+				int osr = s->last_cur_row - s->scroll_top;
+
+				if (osr >= 0 && osr < s->text_rows)
+					s->dirty_row[osr] = 1;
+			}
+			s->dirty_row[s->cur_row - s->scroll_top] = 1;
+			for (sr = 0; sr < s->text_rows; sr++) {
+				if (s->dirty_row[sr]) {
+					draw_text_row(s, sr);
+					s->dirty_row[sr] = 0;
+				}
 			}
 		}
-	}
 
-	/* caret (only when no prompt/status owns the bar area meaning) */
-	if (s->prompt == TW_PROMPT_NONE && !s->status_msg[0])
-		draw_cursor(s, s->cur_row, s->cur_col, 1);
+		/* caret (only when nothing owns the text area) */
+		if (s->prompt == TW_PROMPT_NONE && !s->status_msg[0])
+			draw_cursor(s, s->cur_row, s->cur_col, 1);
+	}
 
 	if (s->dirty_bar) {
 		draw_bar(s);

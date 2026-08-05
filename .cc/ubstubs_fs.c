@@ -8,8 +8,8 @@
 int fs_set_blk_dev(const char *a, const char *b, int c)
 { (void)a; (void)b; (void)c; return 0; }
 
-/* up to 4 files, 4 KiB each */
-#define NF 4
+/* up to 16 files, 4 KiB each */
+#define NF 16
 static char  df_name[NF][64];
 static char  df_data[NF][4096];
 static long  df_len[NF];
@@ -57,3 +57,6 @@ int fs_write(const char *f, unsigned long a, long long o, long long l, long long
 }
 
 void udelay(unsigned long u) { (void)u; }
+struct fs_dir_stream *fs_opendir(const char *f){ (void)f; return 0; }
+struct fs_dirent *fs_readdir(struct fs_dir_stream *d){ (void)d; return 0; }
+void fs_closedir(struct fs_dir_stream *d){ (void)d; }

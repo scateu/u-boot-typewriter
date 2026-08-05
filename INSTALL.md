@@ -267,7 +267,8 @@ candidate with `1`–`9`/Space.
 
 File keys:
 - `^O` — write out (save) to the current file.
-- `^R` — open a file (prompts for a name) on the current device.
+- `^R` — open a file: shows a list of files on the current device; `↑`/`↓` to
+  select, `Enter` to open, `Esc` to cancel. Auto-saves the current buffer first.
 - `M-0` … `M-9` — jump to slot files `0.txt` … `9.txt` (auto-saves the current
   one first — AlphaSmart style).
 - `^X` — exit.

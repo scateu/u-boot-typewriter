@@ -212,7 +212,7 @@ Modeless, readline-style — typing inserts text; Ctrl/Meta chords are commands.
 | `^Y` | yank (paste the kill buffer) |
 | `M-w` | find (search prompt, ASCII) |
 | `^O` | write out (save) — prompts for filename |
-| `^R` | open a file — prompts for filename (auto-saves current) |
+| `^R` | open a file — **picker**: lists files (`fatls`-style), `↑`/`↓` select, `Enter` open, `Esc` cancel (auto-saves current) |
 | `M-0` … `M-9` | open slot `0.txt` … `9.txt` on the launch device (auto-saves current) |
 | `^X` | exit — if modified & writable, asks Y/N/C |
 | `Ctrl-Space` | toggle **Wubi ⇄ English** input |

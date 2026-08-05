@@ -120,7 +120,12 @@ struct tw_fs {
 #define TW_PROMPT_SAVE   1       /* "File Name to Write: " */
 #define TW_PROMPT_SEARCH 2       /* "Search: " */
 #define TW_PROMPT_EXIT   3       /* "Save modified buffer? (Y/N/C)" */
-#define TW_PROMPT_OPEN   4       /* "File to open: " (^R) */
+#define TW_PROMPT_OPEN   4       /* "File to open: " (^R) - text entry */
+#define TW_PROMPT_PICK   5       /* ^R file picker: arrow-select from fatls */
+
+/* File picker (^R): a scrollable list of the files on the current device. */
+#define TW_PICK_MAX      128     /* max files listed */
+#define TW_PICK_NAMELEN  64      /* max filename shown */
 
 /* ---- editor state ------------------------------------------------------ */
 struct tw_state {
@@ -152,6 +157,12 @@ struct tw_state {
 	char  prompt_ans[TW_CMD_BUF];
 	int   prompt_len;
 	char  search_last[TW_CMD_BUF];
+
+	/* ^R file picker (TW_PROMPT_PICK) */
+	char  pick_name[TW_PICK_MAX][TW_PICK_NAMELEN];
+	int   pick_count;       /* number of files listed */
+	int   pick_sel;         /* selected index */
+	int   pick_top;         /* first visible row (scroll) */
 
 	/* framebuffer-derived geometry (pixels + derived cols/rows) */
 	int   fb_w, fb_h;       /* screen pixels */
