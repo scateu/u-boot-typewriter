@@ -651,7 +651,7 @@ static void tw_poweroff(struct tw_state *s)
 	 */
 	{
 		struct udevice *ec;
-		int r_co, r_h6, r_h7;
+		int r_co;
 
 		if (uclass_first_device_err(UCLASS_CROS_EC, &ec)) {
 			tw_status(s, "[ No EC - power off with the button ]");
@@ -660,23 +660,17 @@ static void tw_poweroff(struct tw_state *s)
 		tw_render(s);         /* show the status before we go dark */
 
 		/*
-		 * Diagnostic sweep: try each EC power-off primitive in turn,
-		 * capturing each return code. If any actually powers the board
-		 * off we never reach the status line. Codes shown so we can see
-		 * what the EC reports (0 = command accepted by the EC).
-		 *
-		 * The HIBERNATE calls use flags=0 (immediate hibernate - the
-		 * genuine attempt, NOT the "on AP shutdown" deferred variant).
-		 * With flags=0, cros_ec_reboot() polls the EC with hello for up
-		 * to 3s if the board doesn't power off, so each failed hibernate
-		 * costs ~3s before the next is tried - expected, not a hang.
+		 * ISOLATION TEST: try ONLY battery cutoff (the command that should
+		 * power the board OFF, not reboot). The previous sweep rebooted -
+		 * we need to know whether cutoff is the actor or whether it was one
+		 * of the hibernate calls. If cutoff powers off, we're done. If it
+		 * reboots, cutoff is the (wrong) actor. If nothing happens, the
+		 * status shows its code and the earlier reboot came from hibernate.
 		 */
 		r_co = cros_ec_battery_cutoff(ec, 0);
-		r_h7 = cros_ec_reboot(ec, EC_REBOOT_HIBERNATE_CLEAR_AP_OFF, 0);
-		r_h6 = cros_ec_reboot(ec, EC_REBOOT_HIBERNATE, 0);
 
-		tw_status(s, "[ off failed: cutoff=%d hib7=%d hib6=%d - hold power btn ]",
-			  r_co, r_h7, r_h6);
+		tw_status(s, "[ cutoff returned %d - no power off; hold power btn ]",
+			  r_co);
 		return;
 	}
 #else
