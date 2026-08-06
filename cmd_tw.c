@@ -651,7 +651,7 @@ static void tw_poweroff(struct tw_state *s)
 	 */
 	{
 		struct udevice *ec;
-		int r_h6;
+		int r_h7;
 
 		if (uclass_first_device_err(UCLASS_CROS_EC, &ec)) {
 			tw_status(s, "[ No EC - power off with the button ]");
@@ -660,18 +660,16 @@ static void tw_poweroff(struct tw_state *s)
 		tw_render(s);         /* show the status before we go dark */
 
 		/*
-		 * ISOLATION TEST (on BATTERY): try ONLY hibernate (6), immediate.
-		 * Battery cutoff works but wakes only on AC (ship mode). A true EC
-		 * hibernate is normally POWER-BUTTON-wakeable, which is what we
-		 * want. Earlier hibernate "rebooted" - but that was on AC, and the
-		 * EC behaves differently on battery, so re-test on battery:
-		 *   - powers off, wakes on power button -> this is the one we want;
-		 *   - reboots -> hibernate resets on this firmware;
-		 *   - nothing (status shows code, after ~3s hello-poll) -> inert.
+		 * ISOLATION TEST (on BATTERY): try ONLY hibernate variant 7
+		 * (HIBERNATE_CLEAR_AP_OFF), immediate. hib6 returned -110
+		 * (-ETIMEDOUT): the EC accepted it and went unresponsive but did
+		 * NOT power the AP off. Variant 7 clears the AP-off flag and may
+		 * behave differently. If it also just times out / doesn't power
+		 * off, battery cutoff is the only real off this EC offers.
 		 */
-		r_h6 = cros_ec_reboot(ec, EC_REBOOT_HIBERNATE, 0);
+		r_h7 = cros_ec_reboot(ec, EC_REBOOT_HIBERNATE_CLEAR_AP_OFF, 0);
 
-		tw_status(s, "[ hib6 returned %d - no off; hold power btn ]", r_h6);
+		tw_status(s, "[ hib7 returned %d - no off; hold power btn ]", r_h7);
 		return;
 	}
 #else
