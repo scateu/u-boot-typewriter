@@ -78,36 +78,37 @@ EC**, not a PMIC.
    (there is no FS write-back cache to flush like on Linux — once `fs_write`
    returns, the bytes are on the card). A `mdelay(200)` is added as
    belt-and-braces before cutting power.
-3. **EC hibernate.** Get the EC (`uclass_first_device_err(UCLASS_CROS_EC, …)`)
-   and call:
+3. **EC battery cutoff.** Get the EC (`uclass_first_device_err(UCLASS_CROS_EC,
+   …)`) and call:
    ```c
-   cros_ec_reboot(ec, EC_REBOOT_HIBERNATE, EC_REBOOT_FLAG_ON_AP_SHUTDOWN);
+   cros_ec_battery_cutoff(ec, 0);   /* 0 = cut off NOW, not "at shutdown" */
    ```
-   `cros_ec_reboot()` (`drivers/misc/cros_ec.c`) sends `EC_CMD_REBOOT_EC` over
-   SPI with `cmd = EC_REBOOT_HIBERNATE` (value 6).
+   This sends `EC_CMD_BATTERY_CUT_OFF` — ChromeOS "ship mode" — telling the
+   battery to **stop supplying power**, which fully powers the device down. It
+   is the truest hardware power-off this EC exposes.
 
-   **Why the `EC_REBOOT_FLAG_ON_AP_SHUTDOWN` flag matters.** Without it,
-   `cros_ec_reboot()` waits up to **3 seconds** for the EC to answer a `hello`
-   after the command ("wait for the EC to come back from reboot"). A *hibernate*
-   never comes back, so the call logged **`EC did not return from reboot`** and
-   left U-Boot **frozen**. The flag makes `cros_ec_reboot()` skip that poll and
-   return immediately, so a power-off that doesn't take just drops you back into
-   the editor — no hang.
+   **Why not `cros_ec_reboot(EC_REBOOT_HIBERNATE)`?** We tried it first. On the
+   tested units the EC accepted `HIBERNATE` (6) and `HIBERNATE_CLEAR_AP_OFF` (7)
+   but **did not power the AP off** — the EC has no `pmu` feature (`crosec
+   features`) and hibernate expects the OS's AP-shutdown handshake, which a bare
+   U-Boot payload doesn't perform. Worse, with `flags = 0`, `cros_ec_reboot()`
+   polls the EC with `hello` for **3 seconds** ("wait for it to come back"),
+   logs `EC did not return from reboot`, and **froze** U-Boot; a short
+   power-button press then *reset* the board. Battery cutoff avoids that path
+   entirely.
 
 The `^Q` key opens a **"Save & power off? (Y/N)"** confirm first, so an
 accidental press can't shut the machine off.
 
-### ⚠️ Known limitation: this EC may not power off from U-Boot
+### ⚠️ Wake behavior after battery cutoff
 
-On the units tested, **`EC_REBOOT_HIBERNATE` did not actually power the AP
-off** — the EC accepted the command but the system stayed up (and, before the
-`ON_AP_SHUTDOWN` flag was added, U-Boot froze on the 3 s poll; a short
-power-button press then *reset* the board). ChromeOS ECs normally hibernate as
-part of the OS's AP-shutdown handshake, which a bare U-Boot payload doesn't
-perform. So software power-off from the editor is **best-effort**: `^Q` saves
-your work and asks the EC to hibernate, but if the board doesn't power off,
-**hold the power button** to finish. See "If `^Q` powers off but the board
-won't wake" / the variants below.
+After a battery cutoff the device is fully off, but it typically **powers back
+on only when the charger / AC is plugged in** — not necessarily the power
+button. This is inherent to "ship mode." If that's not what you want, the plain
+alternative is the power-button long-press (which needs a ~6 s hold for full
+off but wakes normally). `^Q` still always **saves your work first**; if the
+cutoff doesn't take, it drops back to the editor with a "hold the power button"
+message — no hang.
 
 ### Build gating
 

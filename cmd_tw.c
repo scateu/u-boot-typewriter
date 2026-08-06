@@ -639,16 +639,15 @@ static void tw_poweroff(struct tw_state *s)
 
 #if CONFIG_IS_ENABLED(CROS_EC)
 	/*
-	 * 3. gru/kevin has no PMIC - the ChromeOS EC controls power - so a
-	 * software power-off asks the EC to hibernate.
+	 * 3. gru/kevin has no PMIC - the ChromeOS EC controls power. The EC's
+	 * reboot/hibernate commands did NOT power the AP off from U-Boot (the EC
+	 * has no 'pmu' feature and hibernate expects the OS AP-shutdown
+	 * handshake). The real hardware power-off is BATTERY CUTOFF ("ship
+	 * mode"): it tells the battery to stop supplying power, fully powering
+	 * the device down. flags = 0 means cut off NOW (not "at shutdown").
 	 *
-	 * Pass EC_REBOOT_FLAG_ON_AP_SHUTDOWN: it tells the EC to hibernate once
-	 * the AP powers down, AND (crucially) makes cros_ec_reboot() SKIP its
-	 * 3-second "wait for the EC to come back" hello-poll - without the flag,
-	 * a hibernate wedges U-Boot for 3s and then leaves it hung ("EC did not
-	 * return from reboot"). With the flag, control returns immediately so a
-	 * power-off that doesn't happen leaves you back in the editor, not
-	 * frozen.
+	 * NOTE: after a battery cutoff the device typically powers back on only
+	 * when the charger/AC is plugged in (not necessarily the power button).
 	 */
 	{
 		struct udevice *ec;
@@ -658,14 +657,9 @@ static void tw_poweroff(struct tw_state *s)
 			return;
 		}
 		tw_render(s);         /* show the status before we go dark */
-		/* Variant 7 (HIBERNATE_CLEAR_AP_OFF): some kevin EC builds only
-		 * power down on this one, not plain HIBERNATE (6). The
-		 * ON_AP_SHUTDOWN flag still skips the freeze-causing hello-poll. */
-		cros_ec_reboot(ec, EC_REBOOT_HIBERNATE_CLEAR_AP_OFF,
-			       EC_REBOOT_FLAG_ON_AP_SHUTDOWN);
+		cros_ec_battery_cutoff(ec, 0);
 	}
-	/* If we get here the EC didn't power the AP off. Not a hang - just say so
-	 * and let the user hold the power button. */
+	/* If we get here the cutoff didn't take. Not a hang - just say so. */
 	tw_status(s, "[ Power off: hold the power button to finish ]");
 #else
 	tw_status(s, "[ Saved. No EC power-off on this board - use button ]");

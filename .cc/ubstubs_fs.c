@@ -64,3 +64,4 @@ int cros_ec_reboot(struct udevice *d, int c, unsigned char f){(void)d;(void)c;(v
 int uclass_first_device_err(int id, struct udevice **d){ (void)id; if(d)*d=0; return 0; }
 /* test helper: bytes stored for a filename (or -1 if absent) */
 long df_find_len(const char *f){ int i=find(f); return i<0?-1:df_len[i]; }
+int cros_ec_battery_cutoff(struct udevice *d, unsigned char f){(void)d;(void)f;return 0;}
