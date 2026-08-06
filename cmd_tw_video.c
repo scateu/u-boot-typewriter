@@ -325,24 +325,32 @@ static void draw_title(struct tw_state *s)
 		 C_BG, C_FG);
 }
 
-/*
- * Draw the whole text area with soft wrapping. Logical lines from scroll_top
- * are drawn across as many screen rows as they need (wrap-before-wide), until
- * the area fills. The area is cleared once up front (wrapping breaks the 1:1
- * screen-row : file-line mapping the old per-row path relied on).
- */
-static void draw_text(struct tw_state *s)
+/* Clear one screen row's band to background. */
+static void clear_row(struct tw_state *s, int sr)
 {
-	int sr = 0;                     /* current screen row */
-	int fr = s->scroll_top;         /* current logical line */
+	fill_rect(s->text_x0, s->text_y0 + sr * TW_ROW_PX,
+		  s->fb_w - 2 * s->text_x0, TW_ROW_PX, C_BG);
+}
 
-	fill_rect(s->text_x0, s->text_y0,
-		  s->fb_w - 2 * s->text_x0, s->bar_y - s->text_y0, C_BG);
+/*
+ * Draw the wrapped text starting at screen row `sr0` from logical line `fr0`,
+ * down to the bottom of the text area. Each screen row is cleared to bg just
+ * before it's drawn (a thin per-row clear, NOT an area-wide clear - that
+ * area-wide clear was the source of the per-keystroke black flash). Rows past
+ * the last content line are cleared too. Rows above sr0 are left untouched, so
+ * a typed character only repaints its own line (and, on reflow, the lines
+ * below it) - no flicker.
+ */
+static void draw_text_from(struct tw_state *s, int sr0, int fr0)
+{
+	int sr = sr0;
+	int fr = fr0;
 
 	while (sr < s->text_rows && fr < s->num_lines) {
 		int col = 0, i;
 		int py = s->text_y0 + sr * TW_ROW_PX;
 
+		clear_row(s, sr);
 		for (i = 0; i < s->line_len[fr]; i++) {
 			u32 cp = s->lines[fr][i];
 			int cw = tw_cp_cols(cp);
@@ -353,6 +361,7 @@ static void draw_text(struct tw_state *s)
 					break;
 				col = 0;
 				py = s->text_y0 + sr * TW_ROW_PX;
+				clear_row(s, sr);
 			}
 			draw_glyph(s->text_x0 + col * TW_CELL_PX, py, cp,
 				   C_FG, C_BG);
@@ -361,6 +370,26 @@ static void draw_text(struct tw_state *s)
 		sr++;                   /* next logical line starts a new row */
 		fr++;
 	}
+	/* clear any leftover rows below the last content line */
+	while (sr < s->text_rows)
+		clear_row(s, sr++);
+}
+
+/* Repaint the whole text area (used on scroll / first paint / picker exit). */
+static void draw_text(struct tw_state *s)
+{
+	draw_text_from(s, 0, s->scroll_top);
+}
+
+/* Screen row where logical line `fr` starts, relative to scroll_top (wrap-
+ * aware). Assumes fr >= scroll_top and on-screen-ish; caller bounds it. */
+static int tw_line_screen_row(struct tw_state *s, int fr)
+{
+	int sr = 0, i;
+
+	for (i = s->scroll_top; i < fr; i++)
+		sr += tw_line_rows(s, i);
+	return sr;
 }
 
 /* Screen pixel (px,py) of logical position (row,col), wrap-aware.
@@ -546,16 +575,16 @@ static void draw_picker(struct tw_state *s)
 }
 
 /*
- * Render a frame. Soft-wrapping means an EDIT can reflow the rows below it, so
- * on an edit (dirty_all) or scroll the whole text area is repainted via
- * draw_text(). But a plain CURSOR MOVE changes no text - repainting the whole
- * area then would flicker - so we just erase the old caret (restoring the cell
- * under it) and draw the new one. Title/bar repaint only when their dirty flag
- * is set; only the damaged rectangle is synced.
+ * Render a frame with targeted repaint - the fix for the per-keystroke flash.
+ * An EDIT repaints only from the cursor's logical line downward (wrap reflow
+ * safe); a pure CURSOR MOVE just moves the caret; a SCROLL (rare) repaints the
+ * area. No path does an area-wide clear-to-black, so typing doesn't flicker.
+ * Title/bar repaint only when their dirty flag is set; only the damaged
+ * rectangle is synced.
  */
 void tw_render(struct tw_state *s)
 {
-	int text_repaint;
+	int first = s->first_paint;
 
 	d_any = 0;   /* reset per-frame damage */
 
@@ -578,15 +607,28 @@ void tw_render(struct tw_state *s)
 		draw_picker(s);
 		s->dirty_all = 1;    /* force a text repaint when the picker exits */
 	} else {
-		/* full text repaint on edit/scroll; otherwise just move the caret */
-		text_repaint = s->dirty_all ||
-			       s->scroll_top != s->last_scroll_top;
+		int scrolled = (s->scroll_top != s->last_scroll_top);
 
-		if (text_repaint) {
+		if (scrolled || first) {
+			/* whole area (rare): scroll or first paint */
 			draw_text(s);
+		} else if (s->dirty_all) {
+			/*
+			 * An edit. Repaint ONLY from the cursor's logical line
+			 * downward - this covers a reflow of the lines below it
+			 * (wrap) while leaving every row ABOVE the cursor line
+			 * untouched. No area-wide clear => no per-keystroke
+			 * flash. In the common case (typing within a line that
+			 * doesn't re-wrap) this repaints a single row.
+			 */
+			int sr = tw_line_screen_row(s, s->cur_row);
+
+			if (sr < 0)
+				sr = 0;
+			draw_text_from(s, sr, s->cur_row);
 		} else if (s->last_cur_row != s->cur_row ||
 			   s->last_cur_col != s->cur_col) {
-			/* pure cursor move: erase old caret, no full clear */
+			/* pure cursor move: erase old caret, no clear */
 			draw_cursor(s, s->last_cur_row, s->last_cur_col, 0);
 		}
 
