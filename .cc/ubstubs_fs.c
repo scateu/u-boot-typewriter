@@ -60,3 +60,7 @@ void udelay(unsigned long u) { (void)u; }
 struct fs_dir_stream *fs_opendir(const char *f){ (void)f; return 0; }
 struct fs_dirent *fs_readdir(struct fs_dir_stream *d){ (void)d; return 0; }
 void fs_closedir(struct fs_dir_stream *d){ (void)d; }
+int cros_ec_reboot(struct udevice *d, int c, unsigned char f){(void)d;(void)c;(void)f;return 0;}
+int uclass_first_device_err(int id, struct udevice **d){ (void)id; if(d)*d=0; return 0; }
+/* test helper: bytes stored for a filename (or -1 if absent) */
+long df_find_len(const char *f){ int i=find(f); return i<0?-1:df_len[i]; }

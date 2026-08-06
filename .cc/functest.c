@@ -233,6 +233,21 @@ int main(void){
         (tab1==8&&tab2==16)?"PASS":"FAIL", tab1, tab2);
     if(!(tab1==8&&tab2==16)) fails++;
 
+    /* Test 15: ^Q power-off saves the dirty buffer FIRST (data safety). */
+    extern long df_find_len(const char *f);
+    memset(s,0,sizeof(*s)); tw_video_init(s); tw_bind_ime(s); s->ime.mode=TW_IME_OFF;
+    s->writable=1; s->fs.valid=1; s->num_lines=1; s->line_len[0]=0;
+    strncpy(s->filename,"po.txt",TW_MAX_FILENAME-1);
+    feed(s,"save me");                 /* dirty, unsaved */
+    tw_handle_key(s, KEY_CTRL_Q);      /* -> poweroff confirm prompt */
+    int prompted = (s->prompt==TW_PROMPT_POWEROFF);
+    tw_handle_key(s, 'y');             /* confirm: save+sync+(stub)poweroff */
+    long saved_len = df_find_len("po.txt");   /* "save me" = 7 + newline = 8 */
+    int okpo = prompted && (saved_len==8) && (s->dirty==0);
+    printf("%s ^Q poweroff: prompted=%d saved_len=%ld dirty=%d (want 1 8 0)\n",
+        okpo?"PASS":"FAIL", prompted, saved_len, s->dirty);
+    if(!okpo) fails++;
+
     printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);
     return fails?1:0;
 }

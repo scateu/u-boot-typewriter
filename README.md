@@ -212,6 +212,7 @@ Modeless, readline-style — typing inserts text; Ctrl/Meta chords are commands.
 | `^O` | write out (save) — prompts for filename |
 | `^R` | open a file — **picker**: lists files (`fatls`-style), `↑`/`↓` select, `Enter` open, `Esc` cancel (auto-saves current) |
 | `^X` | exit — if modified & writable, asks Y/N/C |
+| `^Q` | save, sync, and **power off** (via the ChromeOS EC), with a Y/N confirm |
 | `Ctrl-Space` | toggle **Wubi ⇄ English** input |
 
 Opening a file via `^R` **auto-saves** the current buffer first (if it's

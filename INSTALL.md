@@ -270,6 +270,7 @@ File keys:
 - `^R` — open a file: shows a list of files on the current device; `↑`/`↓` to
   select, `Enter` to open, `Esc` to cancel. Auto-saves the current buffer first.
 - `^X` — exit.
+- `^Q` — save, sync, then power the board off via the EC (Y/N confirm).
 
 Editing is readline-style: `^B/^F/^P/^N` and arrows move, `^A/^E` line ends,
 `^K` kill-to-EOL, `^Y` yank, `^W` delete-word-back. Full list in the README and

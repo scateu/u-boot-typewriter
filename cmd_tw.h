@@ -66,6 +66,7 @@
 #define KEY_CTRL_N    0x0E       /* next line */
 #define KEY_CTRL_O    0x0F       /* write out (save) */
 #define KEY_CTRL_P    0x10       /* previous line */
+#define KEY_CTRL_Q    0x11       /* power off (save+sync+EC hibernate), confirmed */
 #define KEY_CTRL_R    0x12       /* open file (read into buffer) */
 #define KEY_CTRL_W    0x17       /* delete word backward */
 #define KEY_CTRL_X    0x18       /* exit */
@@ -123,6 +124,7 @@ struct tw_fs {
 #define TW_PROMPT_EXIT   3       /* "Save modified buffer? (Y/N/C)" */
 #define TW_PROMPT_OPEN   4       /* "File to open: " (^R) - text entry */
 #define TW_PROMPT_PICK   5       /* ^R file picker: arrow-select from fatls */
+#define TW_PROMPT_POWEROFF 6     /* ^Q: "Save & power off? (Y/N)" */
 
 /* File picker (^R): a scrollable list of the files on the current device. */
 #define TW_PICK_MAX      128     /* max files listed */

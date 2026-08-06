@@ -29,3 +29,4 @@ void udelay(unsigned long u){(void)u;}
 struct fs_dir_stream *fs_opendir(const char *f){ (void)f; return 0; }
 struct fs_dirent *fs_readdir(struct fs_dir_stream *d){ (void)d; return 0; }
 void fs_closedir(struct fs_dir_stream *d){ (void)d; }
+int cros_ec_reboot(struct udevice *d, int c, unsigned char f){(void)d;(void)c;(void)f;return 0;}

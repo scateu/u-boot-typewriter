@@ -402,6 +402,12 @@ static void draw_bar(struct tw_state *s)
 		return;
 	}
 
+	if (s->prompt == TW_PROMPT_POWEROFF) {
+		draw_str(0, s->bar_y,
+			 " Save & power off?   Y)es   N)o ", C_BG, C_FG);
+		return;
+	}
+
 	if (s->prompt != TW_PROMPT_NONE) {
 		const char *label =
 			s->prompt == TW_PROMPT_SAVE   ? " File Name to Write: " :
@@ -470,7 +476,7 @@ static void draw_hints(struct tw_state *s)
 	static const char *row1 =
 		" ^O Write  ^R Open  ^K Kill  ^Y Yank  ^W DelWord  ^Spc Wubi ";
 	static const char *row2 =
-		" ^X Exit  ^A/^E BOL/EOL  ^B/^F ^P/^N move  ^D Del  arrows ";
+		" ^X Exit  ^Q PowerOff  ^A/^E BOL/EOL  ^B/^F ^P/^N  ^D Del ";
 
 	fill_rect(0, s->hint_y, s->fb_w, 2 * TW_ROW_PX, C_FG);  /* white */
 	draw_str(TW_CELL_PX, s->hint_y, row1, C_BG, C_FG);

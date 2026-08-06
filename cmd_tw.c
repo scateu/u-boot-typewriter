@@ -18,6 +18,8 @@
 #include <u-boot/schedule.h>
 #include <linux/delay.h>
 #include <linux/string.h>
+#include <dm.h>
+#include <cros_ec.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 
@@ -615,6 +617,47 @@ static void tw_do_save(struct tw_state *s)
 }
 
 /*
+ * Save (if writable & dirty), let the write settle, then power the board off
+ * via the ChromeOS EC. gru/kevin has no PMIC - the EC controls power - so a
+ * software power-off means asking the EC to hibernate. Returns only if it
+ * fails (no EC, or the EC refused); on success the board is off.
+ */
+static void tw_poweroff(struct tw_state *s)
+{
+	/* 1. flush the document to disk if there's anything to save. */
+	if (s->writable && s->dirty && s->filename[0]) {
+		if (tw_file_save(s) != 0) {
+			tw_status(s, "[ Save failed - NOT powering off ]");
+			return;
+		}
+	}
+
+	/* 2. U-Boot's FAT/block writes are synchronous (write-through), so once
+	 * tw_file_save() returned the data is on the card. Small settle delay as
+	 * belt-and-braces before we cut power. */
+	mdelay(200);
+
+#if CONFIG_IS_ENABLED(CROS_EC)
+	/* 3. gru/kevin has no PMIC - the ChromeOS EC controls power - so a
+	 * software power-off means asking the EC to hibernate. */
+	{
+		struct udevice *ec;
+
+		if (uclass_first_device_err(UCLASS_CROS_EC, &ec)) {
+			tw_status(s, "[ No EC - power off with the button ]");
+			return;
+		}
+		tw_render(s);         /* show the status before we go dark */
+		cros_ec_reboot(ec, EC_REBOOT_HIBERNATE, 0);
+	}
+	/* If we get here the EC didn't power off. */
+	tw_status(s, "[ Power off failed - hold the power button ]");
+#else
+	tw_status(s, "[ Saved. No EC power-off on this board - use button ]");
+#endif
+}
+
+/*
  * Switch the buffer to `name` on the current device (used by ^R open and the
  * M-0..M-9 slot keys). AlphaSmart-style: if the current buffer is writable and
  * modified, auto-save it first, then load the new file. Cursor/scroll reset.
@@ -750,6 +793,17 @@ static void tw_prompt_key(struct tw_state *s, int key)
 		return;
 	}
 
+	if (s->prompt == TW_PROMPT_POWEROFF) {
+		if (key == 'y' || key == 'Y') {
+			s->prompt = TW_PROMPT_NONE;
+			tw_poweroff(s);        /* saves, syncs, powers off (or reports) */
+		} else if (key == 'n' || key == 'N' || key == KEY_ESC) {
+			s->prompt = TW_PROMPT_NONE;
+			tw_status(s, "[ Cancelled ]");
+		}
+		return;
+	}
+
 	if (key == KEY_ENTER || key == KEY_LF) {
 		int which = s->prompt;
 
@@ -873,6 +927,9 @@ static void tw_handle_key(struct tw_state *s, int key)
 		break;
 	case KEY_CTRL_R:            /* open a file: arrow-select picker */
 		tw_picker_open(s);
+		break;
+	case KEY_CTRL_Q:            /* power off (save + sync + EC hibernate) */
+		tw_prompt_start(s, TW_PROMPT_POWEROFF);
 		break;
 	case KEY_CTRL_X:
 		/* Only offer "save modified buffer?" when saving is possible.
@@ -1113,7 +1170,7 @@ U_BOOT_CMD(
 	"  NOTE: mmc 0 (eMMC) is ALWAYS read-only - its FAT writes\n"
 	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
-	"  ^O write  ^R open (pick from list)  ^X exit  ^G help\n"
+	"  ^O write  ^R open (pick from list)  ^X exit  ^Q power off  ^G help\n"
 	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  arrows/PgUp/PgDn move\n"
 	"  ^D del  ^W del-word-back  ^K kill-eol  ^Y yank\n"
 	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"
