@@ -68,3 +68,4 @@ int cros_ec_battery_cutoff(struct udevice *d, unsigned char f){(void)d;(void)f;r
 unsigned long invoke_psci_fn(unsigned long a,unsigned long b,unsigned long c,unsigned long d){(void)a;(void)b;(void)c;(void)d;return 0;}
 void enable_interrupts(void){}
 int disable_interrupts(void){return 0;}
+int uclass_get_device_by_name(int id,const char*n,struct udevice**d){(void)id;(void)n;if(d)*d=0;return 0;}

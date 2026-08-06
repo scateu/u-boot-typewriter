@@ -20,6 +20,7 @@
 #include <linux/string.h>
 #include <linux/psci.h>
 #include <irq_func.h>
+#include <dm.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 
@@ -651,11 +652,28 @@ static void tw_poweroff(struct tw_state *s)
 	 * hold-the-button message rather than hanging.)
 	 */
 	tw_render(s);         /* show the status before we go dark */
-	disable_interrupts();
-	invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
-	enable_interrupts();
 
-	tw_status(s, "[ Power off failed - hold the power button ]");
+	/*
+	 * The PSCI firmware driver is bound but not auto-probed (dm tree shows
+	 * "[ ]"), so psci_method was never set and invoke_psci_fn() did nothing.
+	 * Force the probe first (this runs psci_probe(), which reads method=smc
+	 * from the DT and sets the conduit). Report its return code so we can
+	 * tell "just untriggered" (ret 0 -> then SYSTEM_OFF should work) from
+	 * "probe refused" (ret<0, e.g. EL3 -> PSCI unusable from U-Boot here).
+	 */
+	{
+		struct udevice *psci;
+		int pr;
+
+		pr = uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci);
+
+		disable_interrupts();
+		invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
+		enable_interrupts();
+
+		/* Only here if SYSTEM_OFF didn't power off. */
+		tw_status(s, "[ no off: psci probe=%d - hold power button ]", pr);
+	}
 }
 
 /*
