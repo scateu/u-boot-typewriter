@@ -644,8 +644,13 @@ static void tw_boot(struct tw_state *s)
 		return;
 	tw_status(s, "[ Booting... ]");
 	tw_render(s);
+	/* Clear the framebuffer first so the editor's screen isn't left behind
+	 * the OS's boot output/menu - a clean handoff. Then scan + boot. */
+	run_command("cls", 0);
 	run_command("bootflow scan -lb", 0);
-	/* Only here if nothing booted. */
+	/* Only here if nothing booted - repaint the editor over the cleared
+	 * screen so we don't leave a blank display. */
+	s->first_paint = 1;
 	tw_status(s, "[ No bootable OS found ]");
 }
 
