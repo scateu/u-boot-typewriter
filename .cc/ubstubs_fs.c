@@ -65,3 +65,6 @@ int uclass_first_device_err(int id, struct udevice **d){ (void)id; if(d)*d=0; re
 /* test helper: bytes stored for a filename (or -1 if absent) */
 long df_find_len(const char *f){ int i=find(f); return i<0?-1:df_len[i]; }
 int cros_ec_battery_cutoff(struct udevice *d, unsigned char f){(void)d;(void)f;return 0;}
+unsigned long invoke_psci_fn(unsigned long a,unsigned long b,unsigned long c,unsigned long d){(void)a;(void)b;(void)c;(void)d;return 0;}
+void enable_interrupts(void){}
+int disable_interrupts(void){return 0;}

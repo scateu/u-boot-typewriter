@@ -18,8 +18,8 @@
 #include <u-boot/schedule.h>
 #include <linux/delay.h>
 #include <linux/string.h>
-#include <dm.h>
-#include <cros_ec.h>
+#include <linux/psci.h>
+#include <irq_func.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 
@@ -637,46 +637,27 @@ static void tw_poweroff(struct tw_state *s)
 	 * belt-and-braces before we cut power. */
 	mdelay(200);
 
-#if CONFIG_IS_ENABLED(CROS_EC)
 	/*
-	 * 3. gru/kevin has no PMIC - the ChromeOS EC controls power. The EC's
-	 * reboot/hibernate commands did NOT power the AP off from U-Boot (the EC
-	 * has no 'pmu' feature and hibernate expects the OS AP-shutdown
-	 * handshake). The real hardware power-off is BATTERY CUTOFF ("ship
-	 * mode"): it tells the battery to stop supplying power, fully powering
-	 * the device down. flags = 0 means cut off NOW (not "at shutdown").
+	 * 3. Power off via PSCI SYSTEM_OFF - an SMC call to ARM Trusted Firmware
+	 * (bl31), the standard ARM64 power-off. gru/kevin has no AP-accessible
+	 * PMIC (proven: no rk808 on any I2C bus; power is EC/firmware-managed),
+	 * and none of the EC reboot/hibernate/cutoff commands give a clean
+	 * button-wakeable off. But the board runs ATF, and ATF implements
+	 * PSCI_SYSTEM_OFF - this is the firmware-level power-off Linux ultimately
+	 * relies on. It needs no PMIC, EC command, or device tree.
 	 *
-	 * NOTE: after a battery cutoff the device typically powers back on only
-	 * when the charger/AC is plugged in (not necessarily the power button).
+	 * U-Boot's own `poweroff` command couldn't reach this because a PMIC
+	 * driver claimed CONFIG_SYSRESET_CMD_POWEROFF, so the sysreset-uclass
+	 * do_poweroff (which walks for a - nonexistent - PMIC sysreset device)
+	 * was built instead of the PSCI one. We call SYSTEM_OFF directly.
 	 */
-	{
-		struct udevice *ec;
-		int r_cold;
+	tw_render(s);         /* show the status before we go dark */
+	disable_interrupts();
+	invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
+	enable_interrupts();
 
-		if (uclass_first_device_err(UCLASS_CROS_EC, &ec)) {
-			tw_status(s, "[ No EC - power off with the button ]");
-			return;
-		}
-		tw_render(s);         /* show the status before we go dark */
-
-		/*
-		 * ISOLATION TEST (on BATTERY): EC_REBOOT_COLD (4) - the only
-		 * power-relevant reboot command this EC firmware actually has.
-		 * The kevin EC header (kevin_v1.10) defines ONLY cmds 0,1,2,4,5,6
-		 * - so 7 (-1) and 8 (-1) were rejected as invalid, and 1/2 just
-		 * jump RO/RW images (not power). 6 (hibernate) timed out (-110)
-		 * without powering off. 4 is the last untested one: a cold reboot
-		 * with no OS to bring the AP back up may leave it off on battery.
-		 */
-		r_cold = cros_ec_reboot(ec, EC_REBOOT_COLD, 0);
-
-		tw_status(s, "[ cold(4) returned %d - no off; hold power btn ]",
-			  r_cold);
-		return;
-	}
-#else
-	tw_status(s, "[ Saved. No EC power-off on this board - use button ]");
-#endif
+	/* If SYSTEM_OFF returned, ATF doesn't implement it here. */
+	tw_status(s, "[ PSCI power off unsupported - hold the power button ]");
 }
 
 /*

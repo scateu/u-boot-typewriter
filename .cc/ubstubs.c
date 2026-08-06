@@ -31,3 +31,6 @@ struct fs_dirent *fs_readdir(struct fs_dir_stream *d){ (void)d; return 0; }
 void fs_closedir(struct fs_dir_stream *d){ (void)d; }
 int cros_ec_reboot(struct udevice *d, int c, unsigned char f){(void)d;(void)c;(void)f;return 0;}
 int cros_ec_battery_cutoff(struct udevice *d, unsigned char f){(void)d;(void)f;return 0;}
+unsigned long invoke_psci_fn(unsigned long a,unsigned long b,unsigned long c,unsigned long d){(void)a;(void)b;(void)c;(void)d;return 0;}
+void enable_interrupts(void){}
+int disable_interrupts(void){return 0;}
