@@ -10,3 +10,4 @@ void TW_TEST_WFI_ESCAPE(void);
 #define wfi() do { } while (0)
 #endif
 #endif
+static inline unsigned int current_el(void){ return 2; }

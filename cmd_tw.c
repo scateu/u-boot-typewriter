@@ -21,6 +21,7 @@
 #include <linux/psci.h>
 #include <irq_func.h>
 #include <dm.h>
+#include <asm/system.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 
@@ -663,8 +664,11 @@ static void tw_poweroff(struct tw_state *s)
 	 */
 	{
 		struct udevice *psci;
-		int pr;
+		int pr, el = -1;
 
+#if defined(CONFIG_ARM64)
+		el = (int)current_el();   /* 3 => PSCI unusable (we ARE the monitor) */
+#endif
 		pr = uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci);
 
 		disable_interrupts();
@@ -672,7 +676,8 @@ static void tw_poweroff(struct tw_state *s)
 		enable_interrupts();
 
 		/* Only here if SYSTEM_OFF didn't power off. */
-		tw_status(s, "[ no off: psci probe=%d - hold power button ]", pr);
+		tw_status(s, "[ no off: EL%d psci probe=%d - hold power button ]",
+			  el, pr);
 	}
 }
 
