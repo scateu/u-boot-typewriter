@@ -1,19 +1,7 @@
 #include <stdio.h>
 #include <string.h>
-#include <setjmp.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
-
-/* tw_poweroff() ends in `for(;;) wfi();`. Escape it in the host test via a
- * longjmp so the harness doesn't hang; asm/system.h's wfi() calls this when
- * TW_TEST_WFI_ESCAPE is defined (see the compile command). */
-static jmp_buf g_wfi_jmp;
-static int g_reached_halt;
-void tw_test_wfi_escape(void)
-{
-	g_reached_halt = 1;
-	longjmp(g_wfi_jmp, 1);
-}
 
 /* Stub the video side so cmd_tw.c's tw_render() call is a no-op and geometry
  * is fixed. These satisfy the externs cmd_tw.c expects from cmd_tw_video.c. */
@@ -253,13 +241,11 @@ int main(void){
     feed(s,"save me");                 /* dirty, unsaved */
     tw_handle_key(s, KEY_CTRL_Q);      /* -> poweroff confirm prompt */
     int prompted = (s->prompt==TW_PROMPT_POWEROFF);
-    g_reached_halt = 0;
-    if (setjmp(g_wfi_jmp) == 0)
-        tw_handle_key(s, 'y');         /* save+sync, then halts (longjmps back) */
+    tw_handle_key(s, 'y');             /* save+sync, then PSCI SYSTEM_OFF (stub) */
     long saved_len = df_find_len("po.txt");   /* "save me" = 7 + newline = 8 */
-    int okpo = prompted && (saved_len==8) && (s->dirty==0) && g_reached_halt;
-    printf("%s ^Q poweroff: prompted=%d saved_len=%ld dirty=%d halted=%d (want 1 8 0 1)\n",
-        okpo?"PASS":"FAIL", prompted, saved_len, s->dirty, g_reached_halt);
+    int okpo = prompted && (saved_len==8) && (s->dirty==0);
+    printf("%s ^Q poweroff: prompted=%d saved_len=%ld dirty=%d (want 1 8 0)\n",
+        okpo?"PASS":"FAIL", prompted, saved_len, s->dirty);
     if(!okpo) fails++;
 
     printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);

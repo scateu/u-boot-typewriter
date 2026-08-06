@@ -18,10 +18,8 @@
 #include <u-boot/schedule.h>
 #include <linux/delay.h>
 #include <linux/string.h>
+#include <linux/psci.h>
 #include <irq_func.h>
-#include <dm.h>
-#include <cros_ec.h>
-#include <asm/system.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 
@@ -640,40 +638,24 @@ static void tw_poweroff(struct tw_state *s)
 	mdelay(200);
 
 	/*
-	 * 3. Power off via the ChromeOS EC + AP HALT.
+	 * 3. Power off via PSCI SYSTEM_OFF - an SMC call to ARM Trusted Firmware
+	 * (coreboot's bl31). This is exactly how Linux powers this board off:
+	 * its DT's `psci { method = "smc"; }` node lets it invoke
+	 * PSCI_0_2_FN_SYSTEM_OFF, and bl31 cuts power (button-wakeable).
 	 *
-	 * Established by exhaustive testing + Linux inspection: this board has
-	 * no AP-accessible PMIC (no rk808 on any I2C bus), PSCI SYSTEM_OFF is
-	 * NOT_SUPPORTED by coreboot's bl31 (returns -8), and no EC command alone
-	 * powers the AP off (hibernate timed out, cold rebooted). Linux DOES
-	 * power off on a button press - via the cros-EC - but only as the last
-	 * step of a full AP shutdown: it sends the EC a reboot/hibernate, then
-	 * the AP goes dark, and the EC (seeing the AP halted) cuts the rails.
-	 *
-	 * Replicate that second half: send EC hibernate, then HALT this CPU
-	 * forever (interrupts off + wfi loop) so the AP stops driving anything.
-	 * If the EC powers off when it sees the AP halt, this is a real,
-	 * button-wakeable off. If not (the EC may need hardware power-state
-	 * signals that a bare wfi doesn't produce), the board simply sits
-	 * halted until the power button is held - no worse than before.
+	 * U-Boot needs the same /psci node in its device tree to learn the SMC
+	 * conduit - without it, invoke_psci_fn() made no SMC call and every PSCI
+	 * function returned -8. The node is added in rk3399-gru-u-boot.dtsi;
+	 * with it present, this call powers the board off cleanly. (If PSCI is
+	 * still unreachable, the call returns and we fall through to the
+	 * hold-the-button message rather than hanging.)
 	 */
 	tw_render(s);         /* show the status before we go dark */
-
-#if CONFIG_IS_ENABLED(CROS_EC)
-	{
-		struct udevice *ec;
-
-		if (!uclass_first_device_err(UCLASS_CROS_EC, &ec))
-			cros_ec_reboot(ec, EC_REBOOT_HIBERNATE, 0);
-	}
-#endif
-
-	/* Halt the AP: the EC should observe this and cut power. Never returns
-	 * (if the EC doesn't power off, the CPU stays parked here until a
-	 * power-button hold). */
 	disable_interrupts();
-	for (;;)
-		wfi();
+	invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
+	enable_interrupts();
+
+	tw_status(s, "[ Power off failed - hold the power button ]");
 }
 
 /*
