@@ -35,3 +35,4 @@ unsigned long invoke_psci_fn(unsigned long a,unsigned long b,unsigned long c,uns
 void enable_interrupts(void){}
 int disable_interrupts(void){return 0;}
 int uclass_get_device_by_name(enum uclass_id id,const char*n,struct udevice**d){(void)id;(void)n;if(d)*d=0;return 0;}
+int run_command(const char*c,int f){(void)c;(void)f;return 0;}

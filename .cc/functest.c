@@ -248,6 +248,27 @@ int main(void){
         okpo?"PASS":"FAIL", prompted, saved_len, s->dirty);
     if(!okpo) fails++;
 
+    /* Test 16: ^Q -> B) saves, then runs the boot command; N cancels. */
+    extern int g_ran_boot;
+    memset(s,0,sizeof(*s)); tw_video_init(s); tw_bind_ime(s); s->ime.mode=TW_IME_OFF;
+    s->writable=1; s->fs.valid=1; s->num_lines=1; s->line_len[0]=0;
+    strncpy(s->filename,"bt.txt",TW_MAX_FILENAME-1);
+    feed(s,"boot");                    /* dirty */
+    tw_handle_key(s, KEY_CTRL_Q);
+    g_ran_boot = 0;
+    tw_handle_key(s, 'b');             /* B) save + boot */
+    int okb = (g_ran_boot==1) && (df_find_len("bt.txt")==5) && (s->dirty==0)
+              && (s->prompt==TW_PROMPT_NONE);
+    printf("%s ^Q boot: ran_boot=%d saved=%ld dirty=%d\n",
+        okb?"PASS":"FAIL", g_ran_boot, df_find_len("bt.txt"), s->dirty);
+    if(!okb) fails++;
+    /* N cancels: prompt clears, no boot */
+    tw_handle_key(s, KEY_CTRL_Q); g_ran_boot=0; tw_handle_key(s, 'n');
+    int okn = (g_ran_boot==0) && (s->prompt==TW_PROMPT_NONE);
+    printf("%s ^Q cancel: ran_boot=%d prompt=%d\n", okn?"PASS":"FAIL",
+        g_ran_boot, s->prompt);
+    if(!okn) fails++;
+
     printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);
     return fails?1:0;
 }

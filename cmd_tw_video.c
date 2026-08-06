@@ -426,7 +426,8 @@ static void draw_bar(struct tw_state *s)
 
 	if (s->prompt == TW_PROMPT_POWEROFF) {
 		draw_str(0, s->bar_y,
-			 " Save & power off?   Y)es   N)o ", C_BG, C_FG);
+			 " Save &...  Y) power off   B) boot OS   N) cancel ",
+			 C_BG, C_FG);
 		return;
 	}
 

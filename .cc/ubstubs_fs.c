@@ -69,3 +69,4 @@ unsigned long invoke_psci_fn(unsigned long a,unsigned long b,unsigned long c,uns
 void enable_interrupts(void){}
 int disable_interrupts(void){return 0;}
 int uclass_get_device_by_name(int id,const char*n,struct udevice**d){(void)id;(void)n;if(d)*d=0;return 0;}
+int g_ran_boot; int run_command(const char*c,int f){(void)f; if(c&&c[0])g_ran_boot=1; return 0;}

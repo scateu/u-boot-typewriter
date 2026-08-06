@@ -7,15 +7,19 @@ How the typewriter (`^Q`) powers the machine off, and why U-Boot's built-in
 
 ## TL;DR
 
-- `^Q` in the editor **saves + syncs**, then powers the board off via **PSCI
-  `SYSTEM_OFF`** — an SMC call to ARM Trusted Firmware (coreboot's bl31). This
-  is the same mechanism Linux uses, and it is **power-button-wakeable**.
-- Out of the box this did **not** work: U-Boot's `poweroff` just printed
-  `poweroff ...` and did nothing. The fix has **two parts**, both required:
-  1. add a `/psci` node (`method = "smc"`) to U-Boot's device tree
-     (`rk3399-gru-u-boot.dtsi`);
-  2. **probe** the PSCI firmware driver before calling `SYSTEM_OFF` (U-Boot
-     binds it but doesn't auto-probe it).
+- `^Q` opens **`Save & ...  Y) power off   B) boot OS   N) cancel`**:
+  - **Y** — save + sync, then power off via **PSCI `SYSTEM_OFF`** (SMC to
+    coreboot's bl31); the same mechanism Linux uses, **power-button-wakeable**.
+  - **B** — save, then boot the OS (`bootflow scan -lb`).
+  - **N** / Esc — cancel.
+- Power-off out of the box did **not** work: U-Boot's `poweroff` printed
+  `poweroff ...` and did nothing. **The one thing needed is to PROBE the PSCI
+  firmware driver** before calling `SYSTEM_OFF` — U-Boot binds it but never
+  probes it (`CONFIG_SYSRESET_PSCI` is off), so the SMC conduit was never set.
+- **No device-tree patch is required.** The `/psci` node already exists in
+  `rk3399-base.dtsi` (pulled in via `rk3399.dtsi`). An earlier version of this
+  doc told you to add the node to `rk3399-gru-u-boot.dtsi`; that was
+  **redundant** — the node was always present; only the probe was missing.
 
 ---
 
@@ -24,45 +28,38 @@ How the typewriter (`^Q`) powers the machine off, and why U-Boot's built-in
 `poweroff` (and `^Q`) ultimately call
 `invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, ...)`, which does an `smc` to the
 secure monitor (coreboot's bl31), which powers the board off. Two things were
-missing:
+missing.
 
-### 1. The `/psci` device-tree node
+### The `/psci` DT node already exists (no patch needed)
 
 U-Boot's PSCI driver (`drivers/firmware/psci.c`) learns the call conduit (SMC
-vs HVC) from a `/psci` DT node's `method` property. **U-Boot's device tree for
-gru/kevin had no `/psci` node at all**, so `psci_method` was never set and
-`invoke_psci_fn()` made no SMC — every PSCI function returned `-8`
-(NOT_SUPPORTED-looking garbage).
-
-Linux works because *its* device tree has the node (confirmed on the running
-system):
-
-```
-$ cat /proc/device-tree/psci/method        # -> smc
-$ cat /proc/device-tree/psci/compatible     # -> arm,psci-1.0
-$ dmesg | grep -i psci                       # -> PSCIv1.1 detected in firmware
-```
-
-Fix: add the same node to `arch/arm/dts/rk3399-gru-u-boot.dtsi`, inside the
-root `/ { }` block:
+vs HVC) from a `/psci` DT node's `method` property. That node **is already in
+the device tree** — `rk3399-base.dtsi` (included via `rk3399.dtsi`) defines:
 
 ```dts
-	psci {
-		compatible = "arm,psci-1.0", "arm,psci-0.2";
-		method = "smc";
-	};
+psci {
+	compatible = "arm,psci-1.0";
+	method = "smc";
+};
 ```
 
-Verify it landed in the built control DTB, from the U-Boot shell:
+You can confirm it's in the built control DTB from the U-Boot shell:
 
 ```
 => fdt addr $fdtcontroladdr
-=> fdt print /psci
+=> fdt print /psci        # shows compatible = "arm,psci-1.0", method = "smc"
 ```
 
-### 2. Probe the PSCI firmware driver
+So **no edit to `rk3399-gru-u-boot.dtsi` is required.** (An earlier revision of
+this document added the node there; it was harmless but redundant and has been
+removed.)
 
-Even with the node present, `poweroff` still did nothing. `dm tree` showed the
+Linux uses the same node — `/proc/device-tree/psci/method` = `smc`, and
+`dmesg | grep -i psci` shows `PSCIv1.1 detected in firmware`.
+
+### The actual fix: probe the PSCI firmware driver
+
+With the node present, `poweroff` *still* did nothing. `dm tree` showed the
 driver **bound but not probed**:
 
 ```
@@ -71,9 +68,9 @@ driver **bound but not probed**:
 ```
 
 The `[ ]` (not `[+]`) means `psci_probe()` never ran, so `psci_method` stayed
-unset. U-Boot only auto-probes the PSCI driver when `CONFIG_SYSRESET_PSCI` is
-enabled (it is **not** on this build). So `^Q` **probes it explicitly** before
-the call:
+unset and `invoke_psci_fn()` made no SMC (every call looked like `-8`). U-Boot
+only auto-probes the PSCI driver when `CONFIG_SYSRESET_PSCI` is enabled (it is
+**not** on this build). So `^Q` **probes it explicitly** before the call:
 
 ```c
 struct udevice *psci;
@@ -82,8 +79,8 @@ disable_interrupts();
 invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);            /* powers off */
 ```
 
-`psci_probe()` reads `method = "smc"` from the node, sets the conduit, and the
-subsequent `SYSTEM_OFF` powers the board off cleanly.
+`psci_probe()` reads `method = "smc"`, sets the conduit, and the subsequent
+`SYSTEM_OFF` powers the board off cleanly (button-wakeable).
 
 > Alternative to the explicit probe: enable **`CONFIG_SYSRESET_PSCI=y`** in the
 > U-Boot config. Then the PSCI sysreset device is registered and probed
@@ -95,16 +92,20 @@ subsequent `SYSTEM_OFF` powers the board off cleanly.
 
 ## What `^Q` does
 
-1. **Save.** If the buffer is writable and modified, save it. If the save
-   **fails, power-off is aborted** (a `[ Save failed ... ]` message) so edits
-   are never lost.
-2. **Settle.** `mdelay(200)` — U-Boot FAT writes are synchronous/write-through,
-   so the data is already on the card; this is belt-and-braces.
-3. **Power off.** Probe PSCI, then `invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF)`.
-   The board powers down. **Press the power button to turn it back on.**
+`^Q` opens a confirm line: **`Save & ...  Y) power off   B) boot OS   N) cancel`**
+(so an accidental press does nothing until you choose). All three first
+**save + sync** the buffer if it's writable and modified — and if that save
+**fails, the action is aborted** (`[ Save failed ... ]`) so edits are never
+lost. U-Boot FAT writes are synchronous/write-through, so once the save
+returns the data is on the card (a 200 ms settle is added before power-off as
+belt-and-braces).
 
-`^Q` opens a **"Save & power off? (Y/N)"** confirm first, so an accidental
-press can't shut the machine off.
+- **Y** — power off via `invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF)` (after probing
+  PSCI). The board powers down; **press the power button to turn it back on.**
+- **B** — hand off to the OS with `run_command("bootflow scan -lb", 0)` — the
+  libreboot default that scans partitions (incl. `extlinux.conf`) and boots.
+  If nothing bootable is found it returns to the editor.
+- **N** / Esc — cancel.
 
 ---
 
@@ -112,23 +113,23 @@ press can't shut the machine off.
 
 If `^Q` (or `poweroff`) doesn't power off:
 
-1. **Is the `/psci` node in the DTB?**
+1. **Is the `/psci` node in the DTB?** (should already be, from
+   `rk3399-base.dtsi` — no patch needed):
    ```
    => fdt addr $fdtcontroladdr
    => fdt print /psci
    ```
-   It must show `compatible = "arm,psci-1.0" ...` and `method = "smc"`. If
-   "not found", the dtsi edit didn't make it into the build — clean-rebuild
-   U-Boot (see below), don't forget to clear the staged ELF so coreboot
-   re-pulls it.
+   It shows `compatible = "arm,psci-1.0"` and `method = "smc"`. If it's somehow
+   "not found", your DT is unusual — the node can be added to
+   `rk3399-gru-u-boot.dtsi`, but that shouldn't be necessary here.
 
-2. **Is the PSCI driver probed?**
+2. **Is the PSCI driver probed?** (this is the usual culprit)
    ```
    => dm tree
    ```
-   Look for `firmware 0 [+] psci`. `[ ]` = bound-but-unprobed (the explicit
-   probe in `^Q` handles this; U-Boot's builtin `poweroff` would need
-   `CONFIG_SYSRESET_PSCI`).
+   `firmware 0 [ ] psci` (empty brackets) = bound-but-unprobed → the conduit
+   was never set. The explicit probe in `^Q` handles this. U-Boot's builtin
+   `poweroff` would instead need `CONFIG_SYSRESET_PSCI=y` to get it probed.
 
 3. **Does the builtin `poweroff` work?** With the node present and
    `CONFIG_SYSRESET_PSCI=y`, `=> poweroff` should power the board off — a quick
@@ -153,25 +154,31 @@ recorded here so nobody repeats them:
   without powering off; `EC_REBOOT_COLD` rebooted; variants 7/8 don't exist in
   this EC firmware (`-1`). EC **battery cutoff** *does* power off but wakes only
   on AC (ship mode) — not what we want.
-- **The answer was PSCI**, matching how Linux powers off — it just needed the
-  DT node **and** an explicit driver probe. All the EC/PMIC exploration was a
-  detour.
+- **The answer was PSCI**, matching how Linux powers off. The `/psci` node was
+  present all along (`rk3399-base.dtsi`); the only missing piece was that
+  U-Boot never *probed* the PSCI driver. All the EC/PMIC exploration, and the
+  brief detour of adding a redundant `/psci` node to the board dtsi, were dead
+  ends.
 
 ---
 
-## Rebuilding after the DTS change
+## Deploying
 
-The DTS edit is in U-Boot's tree, so U-Boot must be cleaned and rebuilt, and the
-staged ELF cleared so coreboot re-pulls it:
+Only `cmd/cmd_tw.c` changes for this — **no device-tree edit needed.** Copy the
+typewriter sources into the libreboot U-Boot tree and rebuild:
 
 ```sh
 cd $LB                                   # libreboot source dir
+cp /path/to/u-boot-typewriter/cmd_tw*.c /path/to/.../*.h  src/u-boot/default/cmd/
 ./mk -c u-boot gru_kevin
 ./mk -b u-boot gru_kevin
-rm -f elf/u-boot/default/gru_kevin/default/*
+rm -f elf/u-boot/default/gru_kevin/default/*   # clear staged ELF so coreboot re-pulls
 ./mk -b coreboot gru_kevin
 # flash bin/gru_kevin/uboot_gru_kevin_libgfxinit_corebootfb.rom
 ```
+
+(Optional: set `CONFIG_SYSRESET_PSCI=y` to also make U-Boot's builtin
+`poweroff` work on its own; the `^Q` probe makes it unnecessary.)
 
 ---
 

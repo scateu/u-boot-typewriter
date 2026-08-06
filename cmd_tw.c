@@ -617,21 +617,45 @@ static void tw_do_save(struct tw_state *s)
 		tw_status(s, "[ Error writing %s ]", s->filename);
 }
 
+/* Save (if writable & dirty) - abort on failure. Returns 0 to proceed. */
+static int tw_save_before_exit(struct tw_state *s)
+{
+	if (s->writable && s->dirty && s->filename[0]) {
+		if (tw_file_save(s) != 0) {
+			tw_status(s, "[ Save failed - aborted ]");
+			return -1;
+		}
+	}
+	return 0;
+}
+
 /*
- * Save (if writable & dirty), let the write settle, then power the board off
- * via the ChromeOS EC. gru/kevin has no PMIC - the EC controls power - so a
- * software power-off means asking the EC to hibernate. Returns only if it
- * fails (no EC, or the EC refused); on success the board is off.
+ * Save, then hand control to the OS boot flow (`bootflow scan -lb` - the
+ * libreboot default that scans partitions incl. extlinux.conf and boots). If
+ * a bootable target is found this does not return; otherwise it falls back to
+ * the editor.
+ */
+static void tw_boot(struct tw_state *s)
+{
+	if (tw_save_before_exit(s) != 0)
+		return;
+	tw_status(s, "[ Booting... ]");
+	tw_render(s);
+	run_command("bootflow scan -lb", 0);
+	/* Only here if nothing booted. */
+	tw_status(s, "[ No bootable OS found ]");
+}
+
+/*
+ * Save, let the write settle, then power the board off via PSCI SYSTEM_OFF
+ * (SMC to coreboot's bl31 - button-wakeable, exactly how Linux powers off).
+ * The PSCI driver is probed explicitly first; see the body + POWEROFF.md.
  */
 static void tw_poweroff(struct tw_state *s)
 {
 	/* 1. flush the document to disk if there's anything to save. */
-	if (s->writable && s->dirty && s->filename[0]) {
-		if (tw_file_save(s) != 0) {
-			tw_status(s, "[ Save failed - NOT powering off ]");
-			return;
-		}
-	}
+	if (tw_save_before_exit(s) != 0)
+		return;
 
 	/* 2. U-Boot's FAT/block writes are synchronous (write-through), so once
 	 * tw_file_save() returned the data is on the card. Small settle delay as
@@ -808,6 +832,9 @@ static void tw_prompt_key(struct tw_state *s, int key)
 		if (key == 'y' || key == 'Y') {
 			s->prompt = TW_PROMPT_NONE;
 			tw_poweroff(s);        /* saves, syncs, powers off (or reports) */
+		} else if (key == 'b' || key == 'B') {
+			s->prompt = TW_PROMPT_NONE;
+			tw_boot(s);            /* saves, then boots the OS (or reports) */
 		} else if (key == 'n' || key == 'N' || key == KEY_ESC) {
 			s->prompt = TW_PROMPT_NONE;
 			tw_status(s, "[ Cancelled ]");
@@ -950,7 +977,7 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_CTRL_R:            /* open a file: arrow-select picker */
 		tw_picker_open(s);
 		break;
-	case KEY_CTRL_Q:            /* power off (save + sync + EC hibernate) */
+	case KEY_CTRL_Q:            /* save + power off / boot OS (Y/B/N) */
 		tw_prompt_start(s, TW_PROMPT_POWEROFF);
 		break;
 	case KEY_CTRL_X:
@@ -1192,7 +1219,7 @@ U_BOOT_CMD(
 	"  NOTE: mmc 0 (eMMC) is ALWAYS read-only - its FAT writes\n"
 	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
-	"  ^O write  ^R open (pick from list)  ^X exit  ^Q power off  ^G help\n"
+	"  ^O write  ^R open (pick)  ^X exit  ^Q power off / boot OS  ^G help\n"
 	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  arrows/PgUp/PgDn move\n"
 	"  ^D del  ^W del-word-back  ^K kill-eol  ^Y yank\n"
 	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"

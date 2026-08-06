@@ -12,4 +12,5 @@ struct cmd_tbl { const char *name; };
 		char *const[]) __attribute__((unused)) = _cmd;
 int printf(const char *fmt, ...);
 int cmd_usage(const struct cmd_tbl *cmdtp);
+int run_command(const char *cmd, int flag);
 #endif
