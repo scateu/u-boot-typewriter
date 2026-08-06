@@ -651,7 +651,7 @@ static void tw_poweroff(struct tw_state *s)
 	 */
 	{
 		struct udevice *ec;
-		int r_c8;
+		int r_cold;
 
 		if (uclass_first_device_err(UCLASS_CROS_EC, &ec)) {
 			tw_status(s, "[ No EC - power off with the button ]");
@@ -660,19 +660,18 @@ static void tw_poweroff(struct tw_state *s)
 		tw_render(s);         /* show the status before we go dark */
 
 		/*
-		 * ISOLATION TEST (on BATTERY): try raw reboot cmd = 8, which is
-		 * EC_REBOOT_COLD_AP_OFF in newer ChromeOS EC firmware ("cold reboot
-		 * the EC, but leave the AP OFF"). This header's enum stops at 7 so
-		 * we pass the literal 8; cros_ec_reboot() forwards the byte and the
-		 * EC firmware decides. This is the real "power off (and stay off)"
-		 * primitive and should be POWER-BUTTON-wakeable (unlike ship-mode
-		 * battery cutoff, which wakes only on AC).
-		 *   hib6 -> -110 (timeout, no off);  hib7 -> -1 (rejected).
+		 * ISOLATION TEST (on BATTERY): EC_REBOOT_COLD (4) - the only
+		 * power-relevant reboot command this EC firmware actually has.
+		 * The kevin EC header (kevin_v1.10) defines ONLY cmds 0,1,2,4,5,6
+		 * - so 7 (-1) and 8 (-1) were rejected as invalid, and 1/2 just
+		 * jump RO/RW images (not power). 6 (hibernate) timed out (-110)
+		 * without powering off. 4 is the last untested one: a cold reboot
+		 * with no OS to bring the AP back up may leave it off on battery.
 		 */
-		r_c8 = cros_ec_reboot(ec, (enum ec_reboot_cmd)8, 0);
+		r_cold = cros_ec_reboot(ec, EC_REBOOT_COLD, 0);
 
-		tw_status(s, "[ cold_ap_off(8) returned %d - no off; hold power btn ]",
-			  r_c8);
+		tw_status(s, "[ cold(4) returned %d - no off; hold power btn ]",
+			  r_cold);
 		return;
 	}
 #else
