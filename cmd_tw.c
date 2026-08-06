@@ -652,12 +652,32 @@ static void tw_poweroff(struct tw_state *s)
 	 * was built instead of the PSCI one. We call SYSTEM_OFF directly.
 	 */
 	tw_render(s);         /* show the status before we go dark */
-	disable_interrupts();
-	invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
-	enable_interrupts();
 
-	/* If SYSTEM_OFF returned, ATF doesn't implement it here. */
-	tw_status(s, "[ PSCI power off unsupported - hold the power button ]");
+	/*
+	 * DIAGNOSTIC: query PSCI first, so we can see whether the secure monitor
+	 * (coreboot's bl31) is even reachable and whether SYSTEM_OFF is
+	 * implemented, rather than guessing from a silent return.
+	 *   ver  = PSCI_VERSION (0 or garbage => PSCI not responding at all)
+	 *   feat = PSCI_FEATURES(SYSTEM_OFF): 0 => supported, negative/large =>
+	 *          NOT_SUPPORTED (bl31 lacks it - e.g. reset-only bl31)
+	 * Then attempt SYSTEM_OFF anyway. If it returns, show the codes.
+	 */
+	{
+		unsigned long ver, feat;
+
+		ver  = invoke_psci_fn(PSCI_0_2_FN_PSCI_VERSION, 0, 0, 0);
+		feat = invoke_psci_fn(PSCI_1_0_FN_PSCI_FEATURES,
+				      PSCI_0_2_FN_SYSTEM_OFF, 0, 0);
+
+		disable_interrupts();
+		invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
+		enable_interrupts();
+
+		/* Only reached if SYSTEM_OFF returned (unimplemented). */
+		tw_status(s,
+			  "[ no off: PSCI ver=%lx SYSTEM_OFF feat=%ld - hold power btn ]",
+			  ver, (long)feat);
+	}
 }
 
 /*
