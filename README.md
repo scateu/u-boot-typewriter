@@ -108,6 +108,11 @@ should report `0 wanted codepoints had no unifont glyph`).
 > from the libreboot tree, booting straight into typewriter (BOOTCOMMAND),
 > autoboot/preboot tuning, flashing, and the eMMC-vs-microSD storage story. The
 > section below is the generic U-Boot integration it builds on.
+>
+> Board-specific companion docs: **[POWEROFF.md](POWEROFF.md)** (how `^Q`
+> powers off / boots the OS via PSCI), **[POWERSAVE.md](POWERSAVE.md)** (cutting
+> idle power/heat via the event-stream `udelay` + 408 MHz), and
+> **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** (the eMMC FAT-write defect).
 
 There are three edits to the tree, then you enable the option. **Steps 2 and 3
 edit different files with different syntax — don't mix them up** (a `Kconfig`
@@ -214,7 +219,7 @@ Modeless, readline-style — typing inserts text; Ctrl/Meta chords are commands.
 | `^O` | write out (save) — prompts for filename |
 | `^R` | open a file — **picker**: lists files (`fatls`-style), `↑`/`↓` select, `Enter` open, `Esc` cancel (auto-saves current) |
 | `^X` | exit — if modified & writable, asks Y/N/C |
-| `^Q` | save, sync, and **power off** (via the ChromeOS EC), with a Y/N confirm — see [POWEROFF.md](POWEROFF.md) |
+| `^Q` | save + sync, then **Y)** power off (PSCI), **B)** boot the OS, **N)** cancel — see [POWEROFF.md](POWEROFF.md) |
 | `Ctrl-Space` | toggle **Wubi ⇄ English** input |
 
 Opening a file via `^R` **auto-saves** the current buffer first (if it's
