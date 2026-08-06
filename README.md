@@ -1,5 +1,7 @@
 # typewriter — a Nano-like editor with Wubi Chinese input for U-Boot
 
+ - Youtube Demo: [1](https://youtu.be/vDTKMEDWPtY) [2](https://youtube.com/shorts/Up-6oE29sNA)
+
 `typewriter` adds a full-screen, GNU **Nano**-style text editor to the U-Boot
 shell that runs **on the video framebuffer** and lets you type Chinese with a
 built-in **Wubi 86 (五笔)** input method. It reads and writes UTF-8 files on a
