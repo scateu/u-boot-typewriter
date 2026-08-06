@@ -658,7 +658,10 @@ static void tw_poweroff(struct tw_state *s)
 			return;
 		}
 		tw_render(s);         /* show the status before we go dark */
-		cros_ec_reboot(ec, EC_REBOOT_HIBERNATE,
+		/* Variant 7 (HIBERNATE_CLEAR_AP_OFF): some kevin EC builds only
+		 * power down on this one, not plain HIBERNATE (6). The
+		 * ON_AP_SHUTDOWN flag still skips the freeze-causing hello-poll. */
+		cros_ec_reboot(ec, EC_REBOOT_HIBERNATE_CLEAR_AP_OFF,
 			       EC_REBOOT_FLAG_ON_AP_SHUTDOWN);
 	}
 	/* If we get here the EC didn't power the AP off. Not a hang - just say so
