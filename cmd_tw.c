@@ -651,7 +651,7 @@ static void tw_poweroff(struct tw_state *s)
 	 */
 	{
 		struct udevice *ec;
-		int r_h7;
+		int r_c8;
 
 		if (uclass_first_device_err(UCLASS_CROS_EC, &ec)) {
 			tw_status(s, "[ No EC - power off with the button ]");
@@ -660,16 +660,19 @@ static void tw_poweroff(struct tw_state *s)
 		tw_render(s);         /* show the status before we go dark */
 
 		/*
-		 * ISOLATION TEST (on BATTERY): try ONLY hibernate variant 7
-		 * (HIBERNATE_CLEAR_AP_OFF), immediate. hib6 returned -110
-		 * (-ETIMEDOUT): the EC accepted it and went unresponsive but did
-		 * NOT power the AP off. Variant 7 clears the AP-off flag and may
-		 * behave differently. If it also just times out / doesn't power
-		 * off, battery cutoff is the only real off this EC offers.
+		 * ISOLATION TEST (on BATTERY): try raw reboot cmd = 8, which is
+		 * EC_REBOOT_COLD_AP_OFF in newer ChromeOS EC firmware ("cold reboot
+		 * the EC, but leave the AP OFF"). This header's enum stops at 7 so
+		 * we pass the literal 8; cros_ec_reboot() forwards the byte and the
+		 * EC firmware decides. This is the real "power off (and stay off)"
+		 * primitive and should be POWER-BUTTON-wakeable (unlike ship-mode
+		 * battery cutoff, which wakes only on AC).
+		 *   hib6 -> -110 (timeout, no off);  hib7 -> -1 (rejected).
 		 */
-		r_h7 = cros_ec_reboot(ec, EC_REBOOT_HIBERNATE_CLEAR_AP_OFF, 0);
+		r_c8 = cros_ec_reboot(ec, (enum ec_reboot_cmd)8, 0);
 
-		tw_status(s, "[ hib7 returned %d - no off; hold power btn ]", r_h7);
+		tw_status(s, "[ cold_ap_off(8) returned %d - no off; hold power btn ]",
+			  r_c8);
 		return;
 	}
 #else
