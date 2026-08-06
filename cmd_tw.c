@@ -21,7 +21,6 @@
 #include <linux/psci.h>
 #include <irq_func.h>
 #include <dm.h>
-#include <asm/system.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 
@@ -641,44 +640,32 @@ static void tw_poweroff(struct tw_state *s)
 
 	/*
 	 * 3. Power off via PSCI SYSTEM_OFF - an SMC call to ARM Trusted Firmware
-	 * (coreboot's bl31). This is exactly how Linux powers this board off:
-	 * its DT's `psci { method = "smc"; }` node lets it invoke
-	 * PSCI_0_2_FN_SYSTEM_OFF, and bl31 cuts power (button-wakeable).
+	 * (coreboot's bl31). This is exactly how Linux powers this board off,
+	 * and it is button-wakeable (unlike the EC "ship mode" battery cutoff,
+	 * which wakes only on AC).
 	 *
-	 * U-Boot needs the same /psci node in its device tree to learn the SMC
-	 * conduit - without it, invoke_psci_fn() made no SMC call and every PSCI
-	 * function returned -8. The node is added in rk3399-gru-u-boot.dtsi;
-	 * with it present, this call powers the board off cleanly. (If PSCI is
-	 * still unreachable, the call returns and we fall through to the
-	 * hold-the-button message rather than hanging.)
+	 * Two things were needed to make it work, both now in place:
+	 *  a) a /psci node with `method = "smc"` in the U-Boot device tree
+	 *     (added in rk3399-gru-u-boot.dtsi) - without it the PSCI driver
+	 *     couldn't learn the conduit and every SMC returned -8;
+	 *  b) the PSCI firmware driver must be PROBED - U-Boot binds it but
+	 *     doesn't auto-probe (CONFIG_SYSRESET_PSCI is off), so we probe it
+	 *     explicitly here, which runs psci_probe() and sets the conduit.
+	 *
+	 * With both done, SYSTEM_OFF powers the board off and never returns. If
+	 * for some reason it does return (PSCI unavailable), we fall through to
+	 * the hold-the-button message rather than hanging.
 	 */
 	tw_render(s);         /* show the status before we go dark */
-
-	/*
-	 * The PSCI firmware driver is bound but not auto-probed (dm tree shows
-	 * "[ ]"), so psci_method was never set and invoke_psci_fn() did nothing.
-	 * Force the probe first (this runs psci_probe(), which reads method=smc
-	 * from the DT and sets the conduit). Report its return code so we can
-	 * tell "just untriggered" (ret 0 -> then SYSTEM_OFF should work) from
-	 * "probe refused" (ret<0, e.g. EL3 -> PSCI unusable from U-Boot here).
-	 */
 	{
 		struct udevice *psci;
-		int pr, el = -1;
 
-#if defined(CONFIG_ARM64)
-		el = (int)current_el();   /* 3 => PSCI unusable (we ARE the monitor) */
-#endif
-		pr = uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci);
-
+		uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci);
 		disable_interrupts();
 		invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
 		enable_interrupts();
-
-		/* Only here if SYSTEM_OFF didn't power off. */
-		tw_status(s, "[ no off: EL%d psci probe=%d - hold power button ]",
-			  el, pr);
 	}
+	tw_status(s, "[ Power off failed - hold the power button ]");
 }
 
 /*
