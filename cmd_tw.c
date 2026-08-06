@@ -21,6 +21,7 @@
 #include <linux/psci.h>
 #include <irq_func.h>
 #include <dm.h>
+#include <asm/system.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 
@@ -67,14 +68,21 @@ static int tw_read_key(void)
 	int c;
 
 	/*
-	 * Wait for a key. U-Boot's console has no blocking "sleep until a key"
-	 * primitive, so we poll - but with a 10 ms delay between polls instead
-	 * of a tight spin, so an idle editor doesn't peg the CPU at 100%. The
-	 * delay is far below human typing latency, so input still feels instant.
+	 * Wait for a key. U-Boot's console is polled (no "sleep until key"), and
+	 * a plain udelay() is a BUSY-SPIN - the core runs flat out the whole time,
+	 * which on this board draws ~3x the idle power of Linux (Linux idles the
+	 * core in WFI). So each poll iteration issues WFI to actually halt the
+	 * core until the next interrupt (EC/USB keypress, timer, etc.), then a
+	 * small udelay FLOOR bounds the loop in case no interrupt is pending
+	 * (WFI is a hint and may return immediately - then the udelay throttles
+	 * us to ~100 polls/sec instead of spinning). This can't hang: WFI never
+	 * blocks past the next interrupt, and the udelay guarantees forward
+	 * progress and responsiveness either way.
 	 */
 	while (!tstc()) {
 		schedule();          /* keep the watchdog fed */
-		udelay(10000);       /* 10 ms: ~100 polls/sec, negligible CPU */
+		wfi();               /* halt the core until an interrupt (low power) */
+		udelay(2000);        /* floor: bound the loop if WFI no-ops */
 	}
 	c = getchar();
 
