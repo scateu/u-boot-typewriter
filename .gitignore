@@ -10,9 +10,13 @@
 /.cc/functest
 
 # Personal working notes / editor swap files
-/note.txt
+/note.md
 *.swp
 /note_libreboot.txt
 
 # Built ROM images (build artifacts)
 *.rom
+
+.DS_Store
+# board DTSI dumps kept for reference, not build inputs
+/dtsi/
