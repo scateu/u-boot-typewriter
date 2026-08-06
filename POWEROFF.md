@@ -81,14 +81,33 @@ EC**, not a PMIC.
 3. **EC hibernate.** Get the EC (`uclass_first_device_err(UCLASS_CROS_EC, …)`)
    and call:
    ```c
-   cros_ec_reboot(ec, EC_REBOOT_HIBERNATE, 0);
+   cros_ec_reboot(ec, EC_REBOOT_HIBERNATE, EC_REBOOT_FLAG_ON_AP_SHUTDOWN);
    ```
    `cros_ec_reboot()` (`drivers/misc/cros_ec.c`) sends `EC_CMD_REBOOT_EC` over
-   SPI with `cmd = EC_REBOOT_HIBERNATE` (value 6). The EC then powers the system
-   down.
+   SPI with `cmd = EC_REBOOT_HIBERNATE` (value 6).
+
+   **Why the `EC_REBOOT_FLAG_ON_AP_SHUTDOWN` flag matters.** Without it,
+   `cros_ec_reboot()` waits up to **3 seconds** for the EC to answer a `hello`
+   after the command ("wait for the EC to come back from reboot"). A *hibernate*
+   never comes back, so the call logged **`EC did not return from reboot`** and
+   left U-Boot **frozen**. The flag makes `cros_ec_reboot()` skip that poll and
+   return immediately, so a power-off that doesn't take just drops you back into
+   the editor — no hang.
 
 The `^Q` key opens a **"Save & power off? (Y/N)"** confirm first, so an
 accidental press can't shut the machine off.
+
+### ⚠️ Known limitation: this EC may not power off from U-Boot
+
+On the units tested, **`EC_REBOOT_HIBERNATE` did not actually power the AP
+off** — the EC accepted the command but the system stayed up (and, before the
+`ON_AP_SHUTDOWN` flag was added, U-Boot froze on the 3 s poll; a short
+power-button press then *reset* the board). ChromeOS ECs normally hibernate as
+part of the OS's AP-shutdown handshake, which a bare U-Boot payload doesn't
+perform. So software power-off from the editor is **best-effort**: `^Q` saves
+your work and asks the EC to hibernate, but if the board doesn't power off,
+**hold the power button** to finish. See "If `^Q` powers off but the board
+won't wake" / the variants below.
 
 ### Build gating
 
@@ -150,18 +169,30 @@ device:
 4. Power on with the button, reopen the file (`^R` or relaunch) — your text
    should be there.
 
-### 4. If `^Q` powers off but the board won't wake
+### 4. If `^Q` doesn't power off (observed on the tested units)
 
-Some ECs need a different hibernate variant. The one-line change is in
-`tw_poweroff()`:
+`EC_REBOOT_HIBERNATE` was accepted by the EC but the AP stayed powered. If you
+want to try harder to make it power off, the change is one line in
+`tw_poweroff()` (`cros_ec_reboot(ec, <cmd>, <flags>)`). Variants, in order to
+try:
 
-- `EC_REBOOT_HIBERNATE` (6) — current; EC hibernate.
-- `EC_REBOOT_HIBERNATE_CLEAR_AP_OFF` (7) — hibernate and clear the AP-off flag,
-  so the next power-button press boots the AP.
-- plain `EC_CMD_REBOOT` (0x00D1, "die") — a harder cut, via a raw
-  `ec_command`.
+1. **`EC_REBOOT_HIBERNATE` + `EC_REBOOT_FLAG_ON_AP_SHUTDOWN`** — the current
+   code. No freeze; hibernates on AP-shutdown (may not trigger from U-Boot).
+2. **`EC_REBOOT_HIBERNATE_CLEAR_AP_OFF` (7)** + the same flag — hibernate and
+   clear the AP-off flag so the power button wakes cleanly.
+3. **plain `EC_CMD_REBOOT` (0x00D1, "die")** via a raw `ec_command` — a hard EC
+   reset (likely reboots rather than powers off; matches the observed
+   "short power-button press = reset").
 
-If the button doesn't wake it, try variant **7** first.
+Reality check: ChromeOS ECs hibernate as part of the OS's AP-shutdown sequence,
+which a bare U-Boot payload doesn't perform, so none of these may cleanly power
+the board off from the editor. The dependable power-off is the **power-button
+long-press** (hardware off). `^Q`'s real value is that it **saves your work
+first**; treat the actual power-down as best-effort.
+
+**IMPORTANT:** always keep `EC_REBOOT_FLAG_ON_AP_SHUTDOWN` in the flags when
+using a HIBERNATE cmd — without it, `cros_ec_reboot()` does a 3-second
+hello-poll that freezes U-Boot when the EC doesn't answer.
 
 ### 5. If `^Q` does nothing / says "No EC"
 
