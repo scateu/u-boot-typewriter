@@ -363,26 +363,48 @@ static void draw_text(struct tw_state *s)
 	}
 }
 
-/* Block cursor at the insertion point (wrap-aware), on or erased (bg). */
-static void draw_cursor(struct tw_state *s, int row, int col, int on)
+/* Screen pixel (px,py) of logical position (row,col), wrap-aware.
+ * Returns 0 and fills px/py if on-screen, -1 if off-screen. */
+static int tw_screen_xy(struct tw_state *s, int row, int col, int *px, int *py)
 {
-	int base = 0, fr, wr, wc, sr, px, py;
+	int base = 0, fr, wr, wc, sr;
 
-	/* screen rows consumed by whole lines from scroll_top up to `row` */
 	if (row < s->scroll_top)
-		return;
+		return -1;
 	for (fr = s->scroll_top; fr < row; fr++)
 		base += tw_line_rows(s, fr);
-
 	tw_wrap_pos(s, row, col, &wr, &wc);
 	sr = base + wr;
 	if (sr < 0 || sr >= s->text_rows)
+		return -1;
+	*px = s->text_x0 + wc * TW_CELL_PX;
+	*py = s->text_y0 + sr * TW_ROW_PX;
+	return 0;
+}
+
+/* Draw (on=1) or erase (on=0) the block caret at logical (row,col). Erasing
+ * restores the cell: bg fill, then the glyph living there (if any) so moving
+ * the caret doesn't leave a hole or require a full-screen repaint. */
+static void draw_cursor(struct tw_state *s, int row, int col, int on)
+{
+	int px, py;
+
+	if (tw_screen_xy(s, row, col, &px, &py) != 0)
 		return;
 
-	px = s->text_x0 + wc * TW_CELL_PX;
-	py = s->text_y0 + sr * TW_ROW_PX;
-	/* a 2px-wide (scaled) caret */
-	fill_rect(px, py, 2 * TW_SCALE, TW_ROW_PX, on ? C_FG : C_BG);
+	if (on) {
+		fill_rect(px, py, 2 * TW_SCALE, TW_ROW_PX, C_FG);
+		return;
+	}
+
+	/* erase: repaint the cell under the caret (bg + its glyph, if present) */
+	if (col < s->line_len[row]) {
+		u32 cp = s->lines[row][col];
+
+		draw_glyph(px, py, cp, C_FG, C_BG);   /* draw_glyph bg-fills first */
+	} else {
+		fill_rect(px, py, TW_CELL_PX, TW_ROW_PX, C_BG);
+	}
 }
 
 static void draw_bar(struct tw_state *s)
@@ -491,7 +513,7 @@ static void draw_hints(struct tw_state *s)
 static void draw_picker(struct tw_state *s)
 {
 	int rows = s->text_rows;         /* list rows = text-area rows */
-	int i, r;
+	int r;
 
 	if (rows < 1)
 		rows = 1;
@@ -523,15 +545,17 @@ static void draw_picker(struct tw_state *s)
 }
 
 /*
- * Render a frame. Soft-wrapping breaks the old 1:1 screen-row : file-line
- * mapping (editing a line reflows the rows below it), so the text area is
- * repainted in one pass via draw_text() rather than a per-row dirty list. The
- * title and bar still repaint only when their dirty flag is set, and only the
- * accumulated damage rectangle is handed to video_sync(), so a keystroke still
- * flushes just the changed pixels.
+ * Render a frame. Soft-wrapping means an EDIT can reflow the rows below it, so
+ * on an edit (dirty_all) or scroll the whole text area is repainted via
+ * draw_text(). But a plain CURSOR MOVE changes no text - repainting the whole
+ * area then would flicker - so we just erase the old caret (restoring the cell
+ * under it) and draw the new one. Title/bar repaint only when their dirty flag
+ * is set; only the damaged rectangle is synced.
  */
 void tw_render(struct tw_state *s)
 {
+	int text_repaint;
+
 	d_any = 0;   /* reset per-frame damage */
 
 	if (s->first_paint) {
@@ -540,6 +564,7 @@ void tw_render(struct tw_state *s)
 		s->first_paint = 0;
 		s->dirty_title = 1;
 		s->dirty_bar = 1;
+		s->dirty_all = 1;
 	}
 
 	if (s->dirty_title) {
@@ -550,12 +575,25 @@ void tw_render(struct tw_state *s)
 	/* The ^R picker takes over the text area with its file list. */
 	if (s->prompt == TW_PROMPT_PICK) {
 		draw_picker(s);
+		s->dirty_all = 1;    /* force a text repaint when the picker exits */
 	} else {
-		draw_text(s);
+		/* full text repaint on edit/scroll; otherwise just move the caret */
+		text_repaint = s->dirty_all ||
+			       s->scroll_top != s->last_scroll_top;
+
+		if (text_repaint) {
+			draw_text(s);
+		} else if (s->last_cur_row != s->cur_row ||
+			   s->last_cur_col != s->cur_col) {
+			/* pure cursor move: erase old caret, no full clear */
+			draw_cursor(s, s->last_cur_row, s->last_cur_col, 0);
+		}
+
 		if (s->prompt == TW_PROMPT_NONE && !s->status_msg[0])
 			draw_cursor(s, s->cur_row, s->cur_col, 1);
+
+		s->dirty_all = 0;
 	}
-	s->dirty_all = 0;
 
 	if (s->dirty_bar) {
 		draw_bar(s);

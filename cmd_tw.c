@@ -855,6 +855,7 @@ struct tw_snap {
 	int num_lines, scroll_top, dirty, has_name;
 	int ime_mode, code_len, page, ncand;
 	int prompt, has_status, pick_sel;
+	int cur_row, cur_len;   /* to detect an in-line content edit */
 };
 
 static void tw_snapshot(struct tw_state *s, struct tw_snap *o)
@@ -870,11 +871,21 @@ static void tw_snapshot(struct tw_state *s, struct tw_snap *o)
 	o->prompt = s->prompt;
 	o->has_status = s->status_msg[0] != '\0';
 	o->pick_sel = s->pick_sel;
+	o->cur_row = s->cur_row;
+	o->cur_len = s->line_len[s->cur_row];
 }
 
 static void tw_mark_dirty(struct tw_state *s, const struct tw_snap *o)
 {
-	if (s->num_lines != o->num_lines || s->scroll_top != o->scroll_top)
+	/* Repaint the whole text area on any content change: line count or
+	 * scroll changed (join/split/scroll), or - while staying on the same
+	 * line - that line's length changed (insert/delete/tab/kill/yank). A
+	 * pure cursor move (incl. vertical, which changes cur_row but no
+	 * content) leaves these equal, so the renderer only moves the caret and
+	 * doesn't flicker. */
+	if (s->num_lines != o->num_lines || s->scroll_top != o->scroll_top ||
+	    (s->cur_row == o->cur_row &&
+	     s->line_len[s->cur_row] != o->cur_len))
 		s->dirty_all = 1;
 	if (s->dirty != o->dirty ||
 	    (s->filename[0] != '\0') != o->has_name ||
