@@ -32,6 +32,7 @@ int tw_list_files(struct tw_state *s);
 int  tw_video_init(struct tw_state *s);
 void tw_render(struct tw_state *s);
 int  tw_cp_cols(u32 cp);
+int  tw_line_rows(struct tw_state *s, int fr);
 
 static struct tw_state g_tw;
 
@@ -139,14 +140,29 @@ static void tw_clear_status(struct tw_state *s)
 }
 
 /* ---------------------------------------------------------- scrolling ---- */
+/*
+ * Keep the cursor's logical line visible, counting SCREEN rows (soft-wrapped),
+ * not logical lines - a wrapped long line can occupy several rows, so a
+ * screenful holds fewer lines than text_rows. If the cursor line is above the
+ * viewport, snap scroll_top to it; if the rows from scroll_top through the
+ * cursor line exceed the screen, advance scroll_top until they fit.
+ */
 static void tw_scroll_adjust(struct tw_state *s)
 {
 	if (s->cur_row < s->scroll_top)
 		s->scroll_top = s->cur_row;
-	if (s->cur_row >= s->scroll_top + s->text_rows)
-		s->scroll_top = s->cur_row - s->text_rows + 1;
 	if (s->scroll_top < 0)
 		s->scroll_top = 0;
+
+	for (;;) {
+		int rows = 0, fr;
+
+		for (fr = s->scroll_top; fr <= s->cur_row; fr++)
+			rows += tw_line_rows(s, fr);
+		if (rows <= s->text_rows || s->scroll_top >= s->cur_row)
+			break;
+		s->scroll_top++;        /* cursor line overflows: scroll down */
+	}
 }
 
 static void tw_clamp_col(struct tw_state *s)
@@ -255,15 +271,22 @@ static void tw_delete_cp(struct tw_state *s)
 	s->dirty = 1;
 }
 
-/* readline C-k: kill from the cursor to end of line into the kill buffer. */
+/*
+ * readline C-k: kill from the cursor to end of line into the kill buffer.
+ * When there's nothing to the right of the cursor (empty line, or cursor
+ * already at EOL), C-k instead deletes the line break - joining the next line
+ * up - so repeated C-k on an empty line eats lines rather than stalling.
+ */
 static void tw_kill_to_eol(struct tw_state *s)
 {
 	int row = s->cur_row, i, n;
 
 	n = s->line_len[row] - s->cur_col;
 	if (n <= 0) {
-		s->cut_len = 0;
-		s->cut_valid = 1;
+		/* nothing to kill on this line: pull the next line up (like Del
+		 * at EOL). Does nothing on the very last line. */
+		if (row + 1 < s->num_lines)
+			tw_delete_cp(s);
 		return;
 	}
 	for (i = 0; i < n; i++)
@@ -929,6 +952,17 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_DELETE:
 		tw_delete_cp(s);
 		break;
+
+	case KEY_TAB: {
+		/* Expand Tab to spaces up to the next tab stop (every TW_TABW
+		 * columns). Spaces render cleanly in the fixed font and keep the
+		 * column model simple; a literal tab codepoint would not. */
+		int n = TW_TABW - (s->cur_col % TW_TABW);
+
+		while (n-- > 0)
+			tw_insert_cp(s, (u32)' ');
+		break;
+	}
 
 	default:
 		/* printable ASCII typed literally (English mode, or punctuation

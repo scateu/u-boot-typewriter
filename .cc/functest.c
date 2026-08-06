@@ -6,6 +6,18 @@
 /* Stub the video side so cmd_tw.c's tw_render() call is a no-op and geometry
  * is fixed. These satisfy the externs cmd_tw.c expects from cmd_tw_video.c. */
 int tw_cp_cols(u32 cp){ return cp >= 0x80 ? 2 : 1; }
+/* mirror of cmd_tw_video.c's wrap-row counter, so scroll_adjust + wrap tests
+ * work in the harness (same wrap-before-wide rule). */
+int tw_line_rows(struct tw_state *s, int fr){
+    int i, col=0, rows=1;
+    if (fr < 0 || fr >= s->num_lines) return 1;
+    for (i=0;i<s->line_len[fr];i++){
+        int cw = tw_cp_cols(s->lines[fr][i]);
+        if (col+cw > s->text_cols){ rows++; col=0; }
+        col += cw;
+    }
+    return rows;
+}
 void tw_render(struct tw_state *s){ (void)s; }
 int tw_video_init(struct tw_state *s){
     s->fb_w=640; s->fb_h=480; s->text_x0=8; s->text_y0=16;
@@ -183,6 +195,43 @@ int main(void){
     printf("%s ^R picker: sel1=%d sel2=%d opened='%s' content='%s'\n",
         ok11?"PASS":"FAIL", sel1, sel2, s->filename, buf);
     if(!ok11) fails++;
+
+    /* Test 12: soft-wrap row counting (tw_line_rows), narrow + wide + boundary */
+    memset(s,0,sizeof(*s)); tw_video_init(s); s->text_cols=10; /* small for test */
+    s->num_lines=4;
+    s->line_len[0]=0;                              /* empty -> 1 row */
+    s->line_len[1]=10; for(int i=0;i<10;i++) s->lines[1][i]='a'; /* exactly 10 -> 1 */
+    s->line_len[2]=11; for(int i=0;i<11;i++) s->lines[2][i]='a'; /* 11 -> 2 rows */
+    s->line_len[3]=6;  for(int i=0;i<6;i++)  s->lines[3][i]=0x4F60; /* 6 wide=12 cols -> 2 rows, wrap-before-wide at col10 */
+    int r0=tw_line_rows(s,0), r1=tw_line_rows(s,1),
+        r2=tw_line_rows(s,2), r3=tw_line_rows(s,3);
+    int okw = (r0==1)&&(r1==1)&&(r2==2)&&(r3==2);
+    printf("%s wrap rows: empty=%d 10-narrow=%d 11-narrow=%d 6-wide=%d (want 1 1 2 2)\n",
+        okw?"PASS":"FAIL", r0, r1, r2, r3);
+    if(!okw) fails++;
+
+    /* Test 13: C-k on empty/at-EOL line deletes the line (joins next). */
+    memset(s,0,sizeof(*s)); tw_video_init(s); tw_bind_ime(s); s->ime.mode=TW_IME_OFF;
+    s->num_lines=2; s->line_len[0]=0; s->line_len[1]=2;
+    s->lines[1][0]='x'; s->lines[1][1]='y';
+    s->cur_row=0; s->cur_col=0;
+    tw_handle_key(s, KEY_CTRL_K);   /* empty line 0: should join line 1 up */
+    dump_line0(s,buf);
+    int okk = (s->num_lines==1) && strcmp(buf,"xy")==0;
+    printf("%s C-k join: lines=%d line0='%s' (want 1 'xy')\n",
+        okk?"PASS":"FAIL", s->num_lines, buf);
+    if(!okk) fails++;
+
+    /* Test 14: Tab expands to spaces up to the next TW_TABW stop. */
+    memset(s,0,sizeof(*s)); tw_video_init(s); tw_bind_ime(s); s->ime.mode=TW_IME_OFF;
+    s->num_lines=1; s->line_len[0]=0; s->cur_row=0; s->cur_col=0;
+    tw_handle_key(s, KEY_TAB);              /* at col 0 -> 8 spaces */
+    int tab1 = s->line_len[0];
+    feed(s,"ab"); tw_handle_key(s, KEY_TAB);/* at col 10 -> to col 16 = 6 spaces */
+    int tab2 = s->line_len[0];
+    printf("%s Tab: after1=%d after'ab'+tab=%d (want 8 16)\n",
+        (tab1==8&&tab2==16)?"PASS":"FAIL", tab1, tab2);
+    if(!(tab1==8&&tab2==16)) fails++;
 
     printf(fails?"\n%d FAIL\n":"\nALL PASS\n", fails);
     return fails?1:0;

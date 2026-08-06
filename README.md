@@ -203,6 +203,7 @@ Modeless, readline-style — typing inserts text; Ctrl/Meta chords are commands.
 | `^A` / `Home`, `^E` / `End` | start / end of line |
 | `PgUp` / `PgDn` | move a screenful |
 | `Enter` | split line |
+| `Tab` | insert spaces to the next 8-column stop |
 | `Backspace` | delete left (merges lines at column 0) |
 | `^D` / `Delete` | delete char under cursor |
 | `^W` | delete word backward |
@@ -266,10 +267,11 @@ Example: with Wubi on, type `w q` then `1` (or `Space`) → 你.
 | Candidates fetched / page | 64 / 9 | `TW_MAX_CANDS` / `TW_PAGE` |
 
 The line buffer is `TW_MAX_LINES × TW_MAX_COLS × 4` bytes of BSS (~4 MB at the
-defaults). Halve either constant to shrink it on memory-tight boards. Long lines
-are clipped at the right edge (no soft-wrap). Search is ASCII-only (you can't
-search for hanzi yet). There is no undo. These are deliberate v1 simplifications
-for a bootloader-resident editor.
+defaults). Halve either constant to shrink it on memory-tight boards. Long
+lines **soft-wrap** to the next screen row (never splitting a wide hanzi across
+the wrap). `Tab` expands to spaces at `TW_TABW` (8) stops. Search is ASCII-only
+(you can't search for hanzi yet). There is no undo. These are deliberate v1
+simplifications for a bootloader-resident editor.
 
 ## Provenance
 

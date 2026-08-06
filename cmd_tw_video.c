@@ -141,6 +141,55 @@ int tw_cp_cols(u32 cp)
 }
 
 /*
+ * Number of screen rows a logical line occupies when soft-wrapped to text_cols
+ * columns. A codepoint that wouldn't fit in the remaining columns wraps to the
+ * next row *before* being placed - so a 2-column hanzi is never split across
+ * the wrap boundary. An empty line still takes one row.
+ */
+int tw_line_rows(struct tw_state *s, int fr)
+{
+	int i, col = 0, rows = 1;
+
+	if (fr < 0 || fr >= s->num_lines)
+		return 1;
+	for (i = 0; i < s->line_len[fr]; i++) {
+		int cw = tw_cp_cols(s->lines[fr][i]);
+
+		if (col + cw > s->text_cols) {
+			rows++;
+			col = 0;
+		}
+		col += cw;
+	}
+	return rows;
+}
+
+/* Screen (row offset within the line, column) of codepoint index `cc` on
+ * logical line `fr`, using the same wrap-before-wide rule. */
+static void tw_wrap_pos(struct tw_state *s, int fr, int cc, int *out_row,
+			int *out_col)
+{
+	int i, col = 0, row = 0;
+
+	for (i = 0; i < cc && i < s->line_len[fr]; i++) {
+		int cw = tw_cp_cols(s->lines[fr][i]);
+
+		if (col + cw > s->text_cols) {
+			row++;
+			col = 0;
+		}
+		col += cw;
+	}
+	/* if the cursor sits exactly at a wrap boundary, it's on the next row */
+	if (cc <= s->line_len[fr] && col > s->text_cols) {
+		row++;
+		col = 0;
+	}
+	*out_row = row;
+	*out_col = col;
+}
+
+/*
  * Draw one glyph at pixel (px,py), scaled by TW_SCALE, fg on bg. Returns the
  * cell width in *unscaled* px (8 or 16) so callers can advance columns. The
  * background is painted first (one fill_rect), then set foreground pixels are
@@ -276,39 +325,61 @@ static void draw_title(struct tw_state *s)
 		 C_BG, C_FG);
 }
 
-/* Draw a single text row sr (screen row) from the file line scroll_top+sr. */
-static void draw_text_row(struct tw_state *s, int sr)
+/*
+ * Draw the whole text area with soft wrapping. Logical lines from scroll_top
+ * are drawn across as many screen rows as they need (wrap-before-wide), until
+ * the area fills. The area is cleared once up front (wrapping breaks the 1:1
+ * screen-row : file-line mapping the old per-row path relied on).
+ */
+static void draw_text(struct tw_state *s)
 {
-	int fr = s->scroll_top + sr;
-	int py = s->text_y0 + sr * TW_ROW_PX;
-	int col = 0, i;
+	int sr = 0;                     /* current screen row */
+	int fr = s->scroll_top;         /* current logical line */
 
-	/* clear the whole row band to bg first */
-	fill_rect(s->text_x0, py, s->fb_w - 2 * s->text_x0, TW_ROW_PX, C_BG);
-	if (fr >= s->num_lines)
-		return;
-	for (i = 0; i < s->line_len[fr]; i++) {
-		u32 cp = s->lines[fr][i];
-		int cw = tw_cp_cols(cp);
+	fill_rect(s->text_x0, s->text_y0,
+		  s->fb_w - 2 * s->text_x0, s->bar_y - s->text_y0, C_BG);
 
-		if (col + cw > s->text_cols)
-			break;                    /* clip long lines (no wrap) */
-		draw_glyph(s->text_x0 + col * TW_CELL_PX, py, cp, C_FG, C_BG);
-		col += cw;
+	while (sr < s->text_rows && fr < s->num_lines) {
+		int col = 0, i;
+		int py = s->text_y0 + sr * TW_ROW_PX;
+
+		for (i = 0; i < s->line_len[fr]; i++) {
+			u32 cp = s->lines[fr][i];
+			int cw = tw_cp_cols(cp);
+
+			if (col + cw > s->text_cols) {   /* wrap to next row */
+				sr++;
+				if (sr >= s->text_rows)
+					break;
+				col = 0;
+				py = s->text_y0 + sr * TW_ROW_PX;
+			}
+			draw_glyph(s->text_x0 + col * TW_CELL_PX, py, cp,
+				   C_FG, C_BG);
+			col += cw;
+		}
+		sr++;                   /* next logical line starts a new row */
+		fr++;
 	}
 }
 
-/* Block cursor: draw (white) at the insertion point, or erase (bg) it. */
+/* Block cursor at the insertion point (wrap-aware), on or erased (bg). */
 static void draw_cursor(struct tw_state *s, int row, int col, int on)
 {
-	int sr = row - s->scroll_top;
-	int cx = 0, i, px, py;
+	int base = 0, fr, wr, wc, sr, px, py;
 
+	/* screen rows consumed by whole lines from scroll_top up to `row` */
+	if (row < s->scroll_top)
+		return;
+	for (fr = s->scroll_top; fr < row; fr++)
+		base += tw_line_rows(s, fr);
+
+	tw_wrap_pos(s, row, col, &wr, &wc);
+	sr = base + wr;
 	if (sr < 0 || sr >= s->text_rows)
 		return;
-	for (i = 0; i < col && i < s->line_len[row]; i++)
-		cx += tw_cp_cols(s->lines[row][i]);
-	px = s->text_x0 + cx * TW_CELL_PX;
+
+	px = s->text_x0 + wc * TW_CELL_PX;
 	py = s->text_y0 + sr * TW_ROW_PX;
 	/* a 2px-wide (scaled) caret */
 	fill_rect(px, py, 2 * TW_SCALE, TW_ROW_PX, on ? C_FG : C_BG);
@@ -446,18 +517,15 @@ static void draw_picker(struct tw_state *s)
 }
 
 /*
- * Incremental render. Repaints only what changed since the last frame:
- *  - first_paint: everything (static hints + title + full text + bar).
- *  - dirty_all / scrolled: whole text area.
- *  - otherwise: the cursor's old + new rows (marked in dirty_row) and, if the
- *    cursor moved off a row, erase the stale caret there.
- * The candidate/status bar and title repaint only when their dirty flag is set.
- * Only the accumulated damage rectangle is handed to video_sync().
+ * Render a frame. Soft-wrapping breaks the old 1:1 screen-row : file-line
+ * mapping (editing a line reflows the rows below it), so the text area is
+ * repainted in one pass via draw_text() rather than a per-row dirty list. The
+ * title and bar still repaint only when their dirty flag is set, and only the
+ * accumulated damage rectangle is handed to video_sync(), so a keystroke still
+ * flushes just the changed pixels.
  */
 void tw_render(struct tw_state *s)
 {
-	int sr;
-
 	d_any = 0;   /* reset per-frame damage */
 
 	if (s->first_paint) {
@@ -466,7 +534,6 @@ void tw_render(struct tw_state *s)
 		s->first_paint = 0;
 		s->dirty_title = 1;
 		s->dirty_bar = 1;
-		s->dirty_all = 1;
 	}
 
 	if (s->dirty_title) {
@@ -477,38 +544,12 @@ void tw_render(struct tw_state *s)
 	/* The ^R picker takes over the text area with its file list. */
 	if (s->prompt == TW_PROMPT_PICK) {
 		draw_picker(s);
-		s->dirty_all = 1;        /* restore the text on exit */
 	} else {
-		/* Scrolling forces a full text-area repaint. */
-		if (s->scroll_top != s->last_scroll_top)
-			s->dirty_all = 1;
-
-		if (s->dirty_all) {
-			for (sr = 0; sr < s->text_rows; sr++)
-				draw_text_row(s, sr);
-			s->dirty_all = 0;
-			memset(s->dirty_row, 0, (size_t)s->text_rows);
-		} else {
-			/* erase old caret row if the cursor row changed */
-			if (s->last_cur_row != s->cur_row) {
-				int osr = s->last_cur_row - s->scroll_top;
-
-				if (osr >= 0 && osr < s->text_rows)
-					s->dirty_row[osr] = 1;
-			}
-			s->dirty_row[s->cur_row - s->scroll_top] = 1;
-			for (sr = 0; sr < s->text_rows; sr++) {
-				if (s->dirty_row[sr]) {
-					draw_text_row(s, sr);
-					s->dirty_row[sr] = 0;
-				}
-			}
-		}
-
-		/* caret (only when nothing owns the text area) */
+		draw_text(s);
 		if (s->prompt == TW_PROMPT_NONE && !s->status_msg[0])
 			draw_cursor(s, s->cur_row, s->cur_col, 1);
 	}
+	s->dirty_all = 0;
 
 	if (s->dirty_bar) {
 		draw_bar(s);

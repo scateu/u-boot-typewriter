@@ -22,6 +22,7 @@
 #define TW_MAX_COLS      512      /* codepoints per line (+1 guard) */
 #define TW_MAX_FILENAME  256
 #define TW_CMD_BUF       128      /* prompt answer buffer (filename / search) */
+#define TW_TABW          8        /* Tab expands to spaces to the next stop */
 
 /* Font cell geometry (GNU Unifont): 16px tall, 8px per narrow column, scaled
  * up by TW_SCALE so text is legible on a hi-res panel. A narrow cell is
