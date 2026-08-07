@@ -123,12 +123,24 @@ static void tw_wfi_nap(unsigned int ms)
 static void tw_wfi_nap(unsigned int ms) { udelay(ms * 1000); }
 #endif
 
-/* Nap `ms` ms in a real WFI sleep (timer/keypress woken). The PPI-enable fix
- * (see above) makes this reliable on gru/kevin; there is no runtime fallback
- * because the freeze cause is now understood and fixed at the source. */
+/*
+ * Nap `ms` ms. DEFAULT = WFE via udelay (proven, never hangs).
+ *
+ * WFI is DISABLED (TW_USE_WFI = 0): even after enabling the arch-timer PPI
+ * (INTID 30) in the GIC redistributor, WFI still froze on gru/kevin - so the
+ * wake model is still wrong (the armed CNTP timer is not producing a WFI wake-up
+ * event here). The WFI code (tw_wfi_nap) is kept for further debugging; flip
+ * TW_USE_WFI to 1 to try it. Using a runtime `if` on a constant (not #if) keeps
+ * tw_wfi_nap referenced so it doesn't warn as unused; the dead branch is
+ * eliminated by the optimiser when the flag is 0.
+ */
+#define TW_USE_WFI 0
 static void tw_idle_nap(unsigned int ms)
 {
-	tw_wfi_nap(ms);
+	if (TW_USE_WFI)
+		tw_wfi_nap(ms);
+	else
+		udelay(ms * 1000);
 }
 
 /* ----------------------------------------------------------- key input --- */
