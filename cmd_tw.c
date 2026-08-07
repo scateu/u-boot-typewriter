@@ -23,6 +23,7 @@
 #include <dm.h>
 #include <cros_ec.h>
 #include <asm/system.h>
+#include <asm/io.h>
 #include <time.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
@@ -56,16 +57,23 @@ static struct tw_state g_tw;
  * idles with real WFI (cpuidle state 0 = "ARM WFI"), woken by the non-secure
  * physical timer (arch_timer = GICv3 INTID 30), CPUs at EL2. We do the same:
  *
+ *   enable INTID 30 in the GIC redistributor (once), then per nap:
  *   arm CNTP to fire in `ms`, WFI, disable CNTP.
  *
- * The timer wakes WFI when ENABLE=1 and the count expires, REGARDLESS of IMASK -
- * so we keep the interrupt MASKED (IMASK=1) and never touch DAIF or the GIC:
- * WFI still wakes, but no exception is taken and no handler is needed (bl31
- * already initialised the GICv3). A pending cros_ec keyboard IRQ is also a WFI
- * wake event, so a keypress can wake us early; if it doesn't, the timer tick
- * does within `ms` - same latency ceiling as the old poll, but the core is
- * genuinely asleep in between. Because a timer is ALWAYS armed before WFI, it
- * can never hang the way a bare WFI did (nothing was armed then).
+ * WHY THE FIRST TRY FROZE, and the fix (debugged live via md/mw on hardware):
+ * a bare "arm CNTP + WFI" hung because **INTID 30 was DISABLED in CPU0's GIC
+ * redistributor** (GICR_ISENABLER0 read 0x20004000 - bit 30 clear). The timer's
+ * condition fired, but with the PPI disabled the GICv3 never forwarded it, so no
+ * WFI wake-up event reached the core. Linux works because its arch_timer driver
+ * enables that PPI; we never did. Setting bit 30 (write-1-to-set) fixed it, and
+ * doing so did NOT storm (nothing was pending), confirmed on the board.
+ *
+ * We keep the timer IRQ MASKED (CNTP_CTL.IMASK=1) and leave DAIF masked, so the
+ * interrupt WAKES WFI (a pending enabled interrupt is a wake event regardless of
+ * PSTATE mask) but is never TAKEN - so U-Boot's panicking do_irq never runs and
+ * we need no handler. A cros_ec keypress IRQ is also a wake event (early wake);
+ * if it isn't, the timer tick wakes us within `ms`. A timer is always armed
+ * before WFI, so it can't hang the way the un-enabled first attempt did.
  */
 /* Real timer+WFI only in the actual arm64 U-Boot build. The host functest
  * (.cc/) defines neither CONFIG_ARM64 nor the U-Boot build context, so it takes
@@ -75,10 +83,29 @@ static struct tw_state g_tw;
 #define CNTP_CTL_ENABLE  (1U << 0)
 #define CNTP_CTL_IMASK   (1U << 1)
 
+/* GICv3 redistributor for CPU0 on rk3399 (verified by md/mw from the U-Boot
+ * shell): SGI_base = 0xfef10000, so GICR_ISENABLER0 = 0xfef10100. INTID 30 =
+ * the non-secure physical arch-timer PPI. ISENABLER is write-1-to-set. */
+#define TW_GICR_ISENABLER0  0xfef10100UL
+#define TW_TIMER_PPI_BIT    (1U << 30)
+
+/* Enable the arch-timer PPI once so its interrupt can wake WFI. */
+static void tw_timer_ppi_enable(void)
+{
+	static int done;
+
+	if (!done) {
+		done = 1;
+		writel(TW_TIMER_PPI_BIT, (void *)TW_GICR_ISENABLER0);
+	}
+}
+
 static void tw_wfi_nap(unsigned int ms)
 {
 	unsigned long rate = get_tbclk();          /* 24 MHz on RK3399 */
 	unsigned long ticks = (rate / 1000) * ms;
+
+	tw_timer_ppi_enable();
 
 	/* Arm the physical timer: down-count `ticks`, enabled but IRQ masked. */
 	asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
@@ -92,51 +119,15 @@ static void tw_wfi_nap(unsigned int ms)
 	asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
 	isb();
 }
-
-/* Read the raw counter (for the one-time WFI self-test). */
-static unsigned long tw_cntpct(void)
-{
-	unsigned long v;
-
-	isb();
-	asm volatile("mrs %0, cntpct_el0" : "=r" (v));
-	return v;
-}
 #else   /* host build / non-arm64: just delay */
 static void tw_wfi_nap(unsigned int ms) { udelay(ms * 1000); }
-static unsigned long tw_cntpct(void) { return 0; }
 #endif
 
-/*
- * Nap `ms` milliseconds as low-power as we safely can. Prefers real WFI sleep;
- * self-tests it ONCE and permanently falls back to the WFE `udelay` if WFI turns
- * out not to sleep on this board (returns far too quickly). The architectural
- * guarantee (armed timer -> WFI must wake) means it can't hang; the self-test
- * only guards the soft failure "WFI returns immediately, saving nothing".
- */
+/* Nap `ms` ms in a real WFI sleep (timer/keypress woken). The PPI-enable fix
+ * (see above) makes this reliable on gru/kevin; there is no runtime fallback
+ * because the freeze cause is now understood and fixed at the source. */
 static void tw_idle_nap(unsigned int ms)
 {
-	static int wfi_ok = -1;    /* -1 = untested, 1 = use WFI, 0 = use WFE */
-
-	if (wfi_ok == 0) {
-		udelay(ms * 1000);
-		return;
-	}
-	if (wfi_ok < 0) {
-		/* First nap: time a short WFI and check it actually slept. */
-		unsigned long rate = get_tbclk();
-		unsigned long t0 = tw_cntpct();
-		unsigned long slept;
-
-		tw_wfi_nap(ms);
-		slept = tw_cntpct() - t0;
-		/* Expect ~ms of ticks; accept >= half. If WFI returned nearly
-		 * instantly, it isn't sleeping here - fall back to WFE. */
-		wfi_ok = (slept >= (rate / 1000) * ms / 2) ? 1 : 0;
-		if (!wfi_ok)
-			udelay(ms * 1000);   /* make this nap the full length */
-		return;
-	}
 	tw_wfi_nap(ms);
 }
 
@@ -189,9 +180,9 @@ static int tw_read_key(void)
 	 *
 	 * Power: each nap is a real WFI sleep (tw_idle_nap -> tw_wfi_nap) - the core
 	 * clock-gates until an armed CNTP timer expiry (our tick) or a keypress IRQ
-	 * wakes it. A bare WFI froze the board before ONLY because nothing was armed;
-	 * arming the timer first makes it always wake. (If WFI turns out not to sleep
-	 * on this board, tw_idle_nap self-tests once and falls back to WFE udelay.)
+	 * wakes it. The earlier bare WFI froze because the arch-timer PPI (INTID 30)
+	 * was disabled in the GIC redistributor, so the timer never woke it; we now
+	 * enable that PPI once (see tw_wfi_nap) and it wakes reliably.
 	 * TW_KEY_NAP_MS (25 ms) is the worst-case keystroke latency.
 	 *
 	 * Power-saving mode: after TW_IDLE_SAVE_MS with no key, we return KEY_PWRSAVE
@@ -232,7 +223,7 @@ static int tw_read_key(void)
 			return KEY_PWRSAVE;   /* enter power-saving */
 
 		schedule();               /* keep the watchdog fed */
-		tw_idle_nap(nap);         /* real WFI sleep (timer-woken), or WFE */
+		tw_idle_nap(nap);         /* real WFI sleep (timer/keypress woken) */
 	}
 
 	last_input = get_timer(0);

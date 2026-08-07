@@ -312,31 +312,52 @@ really a 500 ms *busy spin* — the core never slept, it just did the EC/keyboar
 work less often. Measured: 35 min → 9 % (~15 %/hr), i.e. **no CPU idle benefit**.
 (Thanks to the ARM review that caught this.)
 
-**The real fix: WFI woken by an armed timer.** Linux on this board proves it —
-cpuidle state 0 is *"ARM WFI"*, woken by `arch_timer` (GICv3 **INTID 30**, the
-non-secure physical timer `CNTP`), CPUs at **EL2**. So the editor now naps with:
+**The real fix: WFI woken by an armed timer whose PPI is enabled.** Linux on this
+board proves the path — cpuidle state 0 is *"ARM WFI"*, woken by `arch_timer`
+(GICv3 **INTID 30**, the non-secure physical timer `CNTP`), CPUs at **EL2**. The
+editor now naps with:
 
 ```
+enable INTID 30 in the GIC redistributor (once)      ; GICR_ISENABLER0 |= 1<<30
 arm CNTP to fire in `ms`  (cntp_tval_el0 = ms·rate, cntp_ctl_el0 = ENABLE|IMASK)
 wfi()                     ; core clock-gates until timer expiry OR a keypress IRQ
 disable CNTP
 ```
 
-Why this is safe where the *bare* WFI froze (see "root cause" above): a WFI wake
-event is now **always armed** (the timer). The timer wakes WFI when it expires
-*regardless of IMASK*, so we keep the interrupt **masked** — WFI wakes, but no
-exception is taken and **no GIC init / no handler** is needed (bl31 already
-brought the GICv3 up). A cros_ec keypress IRQ is also a WFI wake event, so a key
-can wake us early; if it doesn't, the timer tick does within `ms`.
+### Why the FIRST attempt froze (debugged live via `md`/`mw`)
 
-**Fail-safe.** `tw_idle_nap()` self-tests WFI *once*: it times a nap across the
-counter and, if WFI returned nearly instantly (didn't sleep on this board),
-permanently falls back to the old WFE `udelay` for the session — so a board where
-WFI-wake misbehaves degrades to today's behaviour instead of stalling. (A true
-hang can't be caught from inside WFI, but the armed-timer guarantee plus the
-Linux evidence make that path effectively impossible here.)
+The first version did only "arm CNTP + WFI" and **hung**. Reading the GIC from
+the U-Boot shell found the cause:
 
-Host-build note: the real `mrs`/`msr`/`wfi` is compiled only under
+```
+=> md.l 0xfef10100 1      # GICR_ISENABLER0 (CPU0 redistributor)
+   0xfef10100: 20004000   # bit 30 CLEAR -> INTID 30 (arch timer PPI) DISABLED
+```
+
+The `CNTP` condition fired, but with its PPI **disabled in the redistributor**
+the GICv3 never forwarded it, so **no WFI wake-up event reached the core** → it
+slept forever. Linux avoids this because its `arch_timer` driver enables the PPI
+(`enable_percpu_irq`); we never did. Enabling bit 30 live confirmed the fix:
+
+```
+=> mw.l 0xfef10100 0x40000000   # write-1-to-set bit 30
+=> md.l 0xfef10100 1
+   0xfef10100: 60004000         # bit 30 now set; board stayed alive (no storm)
+```
+
+So `tw_wfi_nap()` writes `GICR_ISENABLER0 |= (1<<30)` once (`tw_timer_ppi_enable`)
+before its first WFI. We keep the timer IRQ **masked** (`CNTP_CTL.IMASK=1`) and
+leave DAIF masked: a *pending enabled* interrupt still wakes WFI regardless of the
+PSTATE mask, but is never **taken**, so U-Boot's panicking `do_irq` never runs and
+no handler is needed (bl31 already brought the GICv3 up). A cros_ec keypress IRQ
+is likewise a wake event (early wake); if not, the timer tick wakes us within
+`ms`. No self-test / fallback is needed now that the freeze cause is fixed at the
+source.
+
+The redistributor address (`GICR_ISENABLER0 = 0xfef10100` for CPU0 on rk3399) was
+verified by the `md`/`mw` session above; it is a `#define` in `cmd_tw.c`.
+
+Host-build note: the real `mrs`/`msr`/`wfi` + `writel` are compiled only under
 `CONFIG_ARM64 && __aarch64__`; the `.cc` functest (and any non-arm64 build) uses
 a `udelay` stub — important on Apple-Silicon hosts where `__aarch64__` is true
 but EL0 can't run these.
