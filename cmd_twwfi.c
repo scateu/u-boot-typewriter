@@ -37,6 +37,17 @@
 #define GICR_IPRIORITYR   0xfef10400UL   /* +0x400: priority (byte/INTID) */
 #define GICR_IGRPMODR0    0xfef10d00UL   /* +0xD00: group modifier */
 
+/* GIC Distributor (GICD) base - for SPIs (INTID >= 32). Register arrays are
+ * indexed by INTID: IGROUPR/IGRPMODR are 1 bit/INTID, IPRIORITYR 1 byte/INTID,
+ * ISENABLER 1 bit/INTID. */
+#define GICD_BASE         0xfee00000UL
+#define GICD_CTLR         (GICD_BASE + 0x0000)
+#define GICD_IGROUPR      (GICD_BASE + 0x0080)
+#define GICD_ISENABLER    (GICD_BASE + 0x0100)
+#define GICD_IPRIORITYR   (GICD_BASE + 0x0400)
+#define GICD_IROUTER      (GICD_BASE + 0x6000)   /* 64-bit/INTID, affinity route */
+#define GICD_IGRPMODR     (GICD_BASE + 0x0D00)
+
 #define CTL_ENABLE  (1U << 0)
 #define CTL_IMASK   (1U << 1)
 #define CTL_ISTATUS (1U << 2)
@@ -295,6 +306,48 @@ static int do_wfi_test(int hyp, unsigned int ms)
 	return 0;
 }
 
+/*
+ * Inspect an SPI (INTID >= 32) in the distributor - group/priority/enable/route
+ * - WITHOUT touching it. Used to check whether a candidate NonSecure wake source
+ * (e.g. the GPIO0 bank IRQ = GIC_SPI 14 = INTID 46, which carries the cros_ec
+ * keypress line) is even visible to NonSecure Group1 before we invest in the
+ * GPIO-IRQ setup. Reads only; safe.
+ */
+static int do_spi_probe(unsigned int intid)
+{
+	unsigned int word = intid / 32, bit = intid % 32;
+	unsigned int grp  = (readl((void *)(GICD_IGROUPR  + word * 4)) >> bit) & 1;
+	unsigned int gmod = (readl((void *)(GICD_IGRPMODR + word * 4)) >> bit) & 1;
+	unsigned int en   = (readl((void *)(GICD_ISENABLER + word * 4)) >> bit) & 1;
+	unsigned int prio = (readl((void *)(GICD_IPRIORITYR + (intid & ~3)))
+			     >> ((intid & 3) * 8)) & 0xff;
+	unsigned int ctlr = readl((void *)GICD_CTLR);
+	unsigned long route;
+
+	/* IROUTER is 64-bit per INTID; read the low word (affinity 0-2). */
+	route = readl((void *)(GICD_IROUTER + (unsigned long)intid * 8));
+
+	printf("SPI INTID %u (GIC_SPI %u) in the distributor:\n",
+	       intid, intid - 32);
+	printf("  GICD_CTLR   = 0x%08x (bit6 DS=%u)\n", ctlr, (ctlr >> 6) & 1);
+	printf("  IGROUPR     bit = %u (1=Group1/NS)\n", grp);
+	printf("  IGRPMODR    bit = %u  -> (grp,gmod)=(%u,%u): %s\n",
+	       gmod, grp, gmod,
+	       (grp && !gmod) ? "Group1-NS (NS-visible, GOOD)" :
+	       (!grp && !gmod) ? "Group0 (secure)" :
+	       (!grp && gmod) ? "Secure Group1" : "reserved");
+	printf("  ISENABLER   bit = %u (enabled in distributor?)\n", en);
+	printf("  IPRIORITYR      = 0x%02x\n", prio);
+	printf("  IROUTER(lo)     = 0x%08lx (target affinity)\n", route);
+	if (grp && !gmod)
+		printf("  => NS-visible: a keypress GPIO IRQ COULD wake WFI (if the\n"
+		       "     GPIO0 bank IRQ is wired up). Worth pursuing.\n");
+	else
+		printf("  => NOT NS Group1: same wall as the timer. Not usable from\n"
+		       "     NonSecure EL2. Stop here.\n");
+	return 0;
+}
+
 static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		    char *const argv[])
 {
@@ -311,6 +364,11 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	else if (argc >= 3 && strcmp(argv[1], "probe"))
 		ms = simple_strtoul(argv[2], NULL, 10);
 
+	if (!strcmp(argv[1], "spi")) {
+		unsigned int n = (argc >= 3) ? simple_strtoul(argv[2], NULL, 10) : 46;
+
+		return do_spi_probe(n);   /* default 46 = GPIO0 bank (GIC_SPI 14) */
+	}
 	if (!strcmp(argv[1], "probe")) {
 		int hyp = (argc >= 3 && !strcmp(argv[2], "hp"));
 
@@ -321,7 +379,7 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (!strcmp(argv[1], "p"))
 		return do_wfi_test(0, ms);
 
-	printf("usage: twwfi [probe [p|hp]] [p|hp] [ms]\n");
+	printf("usage: twwfi [probe [p|hp]] [p|hp] [spi [intid]] [ms]\n");
 	return CMD_RET_USAGE;
 }
 
@@ -329,9 +387,10 @@ U_BOOT_CMD(
 	twwfi, 4, 0, do_twwfi,
 	"WFI-wake test (timer idle debug)",
 	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
-	"twwfi probe [p|hp] - SAFE: arm timer, poll (no WFI), report how far the\n"
-	"                     interrupt propagated (timer->redist->PE). Run FIRST.\n"
+	"twwfi probe [p|hp] - SAFE: arm timer, poll (no WFI), report propagation\n"
+	"twwfi spi [intid]  - SAFE: read an SPI's group/prio in GICD (default 46 =\n"
+	"                     GPIO0 bank = cros_ec keypress line); is it NS-visible?\n"
 	"twwfi hp [ms]    - arm CNTHP (EL2 timer, INTID 26) + one WFI\n"
 	"twwfi p  [ms]    - arm CNTP  (EL1 timer, INTID 30) + one WFI\n"
-	"  If a WFI test hangs, power-cycle. `probe` never hangs."
+	"  If a WFI test hangs, power-cycle. `probe`/`spi`/dump never hang."
 );
