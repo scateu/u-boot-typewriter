@@ -144,12 +144,20 @@ static int do_wfi_test(int hyp, unsigned int ms)
 	dsb();
 
 	/*
-	 * CRITICAL: arm with IMASK=0. The timer only ASSERTS its interrupt when
-	 * ENABLE=1 && ISTATUS=1 && IMASK=0. With IMASK=1 (our earlier bug) the
-	 * output is masked at the source, so nothing ever becomes pending and WFI
-	 * never wakes. We keep PSTATE.I MASKED (DAIF.I=1) so the fired interrupt
-	 * WAKES wfi but is not TAKEN as an exception (U-Boot's do_irq panics), then
-	 * we disable the timer to drop the assertion.
+	 * THE FIX (found via the state dump): ICC_IGRPEN1 was 0, i.e. Group 1
+	 * interrupts were DISABLED at the GIC CPU interface, so a pending INTID 30
+	 * was never signalled to the PE and WFI never woke. Enable Group 1 here.
+	 * (ICC_SRE=0xf, ICC_PMR=0xf8 > priority 0x80, INTID 30 is Group1-NS - all
+	 * already fine per the dump, so this one bit is the whole fix.)
+	 */
+	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
+	isb();
+
+	/*
+	 * Arm with IMASK=0 so the timer actually ASSERTS its interrupt (ENABLE=1 &&
+	 * ISTATUS=1 && IMASK=0). Keep PSTATE.I MASKED (DAIF.I=1) so the fired IRQ
+	 * WAKES wfi but is not TAKEN as an exception (U-Boot's do_irq panics); we
+	 * disable the timer + clear pending on wake before unmasking.
 	 */
 	asm volatile("msr daifset, #2");    /* mask IRQ (PSTATE.I = 1) */
 	isb();
