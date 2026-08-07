@@ -33,6 +33,10 @@ void tw_backlight_restore(void){}
 void schedule(void){}
 int getchar(void){ return 0; }
 int tstc(void){ return 1; }
+/* timer stubs (cmd_tw.c: battery poll, idle nap self-test) */
+unsigned long get_timer(unsigned long base){ static unsigned long t; return (t+=1000)-base; }
+unsigned long get_tbclk(void){ return 24000000; }
+void udelay(unsigned long u){ (void)u; }
 
 /* Pull in the editor logic; we need its static functions, so #include the .c.
  * Redefine do_typewriter's registration away by neutralizing U_BOOT_CMD. */

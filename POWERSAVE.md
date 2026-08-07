@@ -9,30 +9,30 @@ they are U-Boot config.
 
 ## TL;DR
 
-Five levers. Two are U-Boot **config**, one is a feature **plus** config, two are
-in `cmd_tw.c` (loop tuning + an idle power-saving mode):
+Six levers. The idle-power ones are Fix 6 (real WFI sleep) and Fix 5 (dim +
+lengthen the sleep when idle); the rest are supporting.
 
-1. **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`** — makes U-Boot's `udelay()` (which
-   the editor's key-wait loop naps in while idle) **sleep the CPU with `WFE`**
-   via the ARM event stream instead of busy-spinning. Safe (see "Why WFE, not
-   WFI"). Needs **EL2+** — **confirmed EL2 on gru/kevin** (coreboot bl31 → EL2;
-   the startup line shows `EL2`).
-2. **CPU frequency 600 MHz → 408 MHz** — U-Boot clocks the RK3399 at a fixed
-   600 MHz; dropping to 408 MHz (Linux's lowest OPP) cuts active power and heat.
-3. **Dim the backlight** (`^-` / `^]`, default 40 %). The backlight is a big
-   share of idle draw — see Fix 3. Requires the backlight PWM config chain
-   (`DM_PWM` + `PWM_CROS_EC` + …).
-4. **Throttle the idle loop** (Fix 4) — longer WFE nap (25 ms) and the EC
-   button/lid poll cut from 100 Hz to 5 Hz, so the core and EC/SPI bus are quiet
-   between keystrokes.
-5. **Idle power-saving mode** (Fix 5) — after 60 s idle, dim the backlight, show
-   `[power saving]`, and go fully lazy (500 ms poll). Any key wakes (first key is
-   swallowed). The biggest single idle lever.
+1. **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`** — makes plain `udelay()` sleep with
+   `WFE` (event stream) instead of busy-spinning. **Confirmed EL2 on gru/kevin.**
+   NB: this is a self-waking ~5 µs spin, good for short delays but *not* real
+   idle for the key-wait loop — that's what Fix 6 replaced it with.
+2. **CPU frequency 600 MHz → 408 MHz** — fixed lower OPP; less active power/heat.
+3. **Dim the backlight** (`^-` / `^]`, default 40 %) — a big share of idle draw.
+   Needs the backlight PWM config chain (`DM_PWM` + `PWM_CROS_EC` + …).
+4. **Throttle the idle loop** (Fix 4) — EC button/lid poll cut from 100 Hz to
+   5 Hz; less EC/SPI traffic between keystrokes.
+5. **Idle power-saving mode** (Fix 5) — after 60 s idle, dim + `[power saving]` +
+   stretch the sleep to 500 ms. Any key wakes (first key swallowed).
+6. **Real WFI idle** (Fix 6) — **the key fix.** Each nap is now a true `WFI`
+   sleep woken by an armed CNTP timer (or a keypress IRQ), so the core actually
+   clock-gates. The earlier "lazy poll" was a WFE busy-spin that never slept.
+   Modelled on Linux, which idles this board the same way (WFI + arch_timer).
 
 Measured before any change: **~20 %/hr battery, warm CPU** (vs Linux ~6 %/hr,
-9 h life). Reference: Linux idles at ~6 %/hr; a suspected extra draw there and in
-U-Boot is the **WiFi module left powered but unmanaged** (no driver puts it in
-PSM) — not yet addressed here (would need regulator/PMIC gating).
+9 h life). The WFE "throttle" (Fixes 4–5) alone did *not* help (35 min → 9 %,
+~15 %/hr) because the CPU never actually slept — Fix 6 is what addresses that.
+Reference: a suspected further draw (Linux and U-Boot) is the **WiFi module left
+powered but unmanaged** — not yet addressed (would need regulator/PMIC gating).
 
 ---
 
@@ -302,6 +302,52 @@ returns synthetic `KEY_PWRSAVE` / `KEY_PWRSAVE_WAKE`; the handler flips
 
 ---
 
+## Fix 6 — REAL WFI idle (the nap actually sleeps now)
+
+**Correcting an earlier mistake.** Fixes 4–5 made the idle loop *nap* in
+`udelay()`, believing that was low-power because of the event stream (Fix 1).
+It is not, for the loop's purpose: the event-stream `udelay` is a **WFE spin that
+self-wakes every ~5 µs** (EVNTI=7 → 128 ticks at 24 MHz). So a "500 ms nap" was
+really a 500 ms *busy spin* — the core never slept, it just did the EC/keyboard
+work less often. Measured: 35 min → 9 % (~15 %/hr), i.e. **no CPU idle benefit**.
+(Thanks to the ARM review that caught this.)
+
+**The real fix: WFI woken by an armed timer.** Linux on this board proves it —
+cpuidle state 0 is *"ARM WFI"*, woken by `arch_timer` (GICv3 **INTID 30**, the
+non-secure physical timer `CNTP`), CPUs at **EL2**. So the editor now naps with:
+
+```
+arm CNTP to fire in `ms`  (cntp_tval_el0 = ms·rate, cntp_ctl_el0 = ENABLE|IMASK)
+wfi()                     ; core clock-gates until timer expiry OR a keypress IRQ
+disable CNTP
+```
+
+Why this is safe where the *bare* WFI froze (see "root cause" above): a WFI wake
+event is now **always armed** (the timer). The timer wakes WFI when it expires
+*regardless of IMASK*, so we keep the interrupt **masked** — WFI wakes, but no
+exception is taken and **no GIC init / no handler** is needed (bl31 already
+brought the GICv3 up). A cros_ec keypress IRQ is also a WFI wake event, so a key
+can wake us early; if it doesn't, the timer tick does within `ms`.
+
+**Fail-safe.** `tw_idle_nap()` self-tests WFI *once*: it times a nap across the
+counter and, if WFI returned nearly instantly (didn't sleep on this board),
+permanently falls back to the old WFE `udelay` for the session — so a board where
+WFI-wake misbehaves degrades to today's behaviour instead of stalling. (A true
+hang can't be caught from inside WFI, but the armed-timer guarantee plus the
+Linux evidence make that path effectively impossible here.)
+
+Host-build note: the real `mrs`/`msr`/`wfi` is compiled only under
+`CONFIG_ARM64 && __aarch64__`; the `.cc` functest (and any non-arm64 build) uses
+a `udelay` stub — important on Apple-Silicon hosts where `__aarch64__` is true
+but EL0 can't run these.
+
+Net effect: awake, 25 ms naps become real WFI sleeps (same latency ceiling);
+power-saving 500 ms naps become **real 500 ms sleeps** — the core wakes twice a
+second, checks, sleeps again. This is the change that should move idle drain
+toward Linux's ~6 %/hr.
+
+---
+
 ## Cycle-time reference
 
 All periods are set in `cmd_tw.h`. The idle loop (`tw_read_key`) wakes every
@@ -309,11 +355,15 @@ All periods are set in `cmd_tw.h`. The idle loop (`tw_read_key`) wakes every
 
 | What                          | Constant           | Awake    | Power-saving |
 |-------------------------------|--------------------|----------|--------------|
-| Keystroke latency (WFE nap)   | `TW_KEY_NAP_MS`    | 25 ms    | 500 ms¹      |
+| WFI nap = keystroke latency   | `TW_KEY_NAP_MS`    | 25 ms    | 500 ms¹      |
 | Power button / lid poll       | `TW_EC_POLL_MS`    | 200 ms   | 500 ms¹      |
 | Battery re-read (title `BAT:`)| `TW_BATT_POLL_MS` / `TW_BATT_SAVE_MS` | 30 s | 60 s² |
 | Idle before power-saving      | `TW_IDLE_SAVE_MS`  | 60 s     | —            |
 | Lazy nap/poll while saving    | `TW_SAVE_NAP_MS`   | —        | 500 ms       |
+
+Each "nap" is a real WFI sleep (Fix 6), woken by the armed CNTP timer at the nap
+period or early by a keypress IRQ — the core is genuinely asleep in between, not
+spinning.
 
 ¹ In power-saving mode the nap and the EC (button/lid) poll both run at
   `TW_SAVE_NAP_MS` (500 ms). So a keypress, power button, or lid close is noticed

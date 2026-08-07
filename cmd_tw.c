@@ -46,6 +46,100 @@ void tw_backlight_restore(void);  /* power-save wake: restore user level */
 
 static struct tw_state g_tw;
 
+/* ------------------------------------------------------------ WFI idle --- */
+/*
+ * Low-power idle nap using the ARM generic timer + WFI.
+ *
+ * The editor's key-wait loop used to spin in a WFE `udelay`, which - via the
+ * event stream - self-wakes every ~5 us and so NEVER actually sleeps the core
+ * (the "500 ms lazy poll" was really a 500 ms busy spin). Linux on this board
+ * idles with real WFI (cpuidle state 0 = "ARM WFI"), woken by the non-secure
+ * physical timer (arch_timer = GICv3 INTID 30), CPUs at EL2. We do the same:
+ *
+ *   arm CNTP to fire in `ms`, WFI, disable CNTP.
+ *
+ * The timer wakes WFI when ENABLE=1 and the count expires, REGARDLESS of IMASK -
+ * so we keep the interrupt MASKED (IMASK=1) and never touch DAIF or the GIC:
+ * WFI still wakes, but no exception is taken and no handler is needed (bl31
+ * already initialised the GICv3). A pending cros_ec keyboard IRQ is also a WFI
+ * wake event, so a keypress can wake us early; if it doesn't, the timer tick
+ * does within `ms` - same latency ceiling as the old poll, but the core is
+ * genuinely asleep in between. Because a timer is ALWAYS armed before WFI, it
+ * can never hang the way a bare WFI did (nothing was armed then).
+ */
+/* Real timer+WFI only in the actual arm64 U-Boot build. The host functest
+ * (.cc/) defines neither CONFIG_ARM64 nor the U-Boot build context, so it takes
+ * the udelay stub below - important on an Apple-Silicon host, where __aarch64__
+ * alone is true but EL0 userspace must not run wfi / access these sysregs. */
+#if defined(CONFIG_ARM64) && defined(__aarch64__)
+#define CNTP_CTL_ENABLE  (1U << 0)
+#define CNTP_CTL_IMASK   (1U << 1)
+
+static void tw_wfi_nap(unsigned int ms)
+{
+	unsigned long rate = get_tbclk();          /* 24 MHz on RK3399 */
+	unsigned long ticks = (rate / 1000) * ms;
+
+	/* Arm the physical timer: down-count `ticks`, enabled but IRQ masked. */
+	asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
+	asm volatile("msr cntp_ctl_el0, %0" : :
+		     "r" ((unsigned long)(CNTP_CTL_ENABLE | CNTP_CTL_IMASK)));
+	isb();
+
+	wfi();                                     /* sleep until timer or IRQ */
+
+	/* Disable the timer so its (masked) condition doesn't stay asserted. */
+	asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
+	isb();
+}
+
+/* Read the raw counter (for the one-time WFI self-test). */
+static unsigned long tw_cntpct(void)
+{
+	unsigned long v;
+
+	isb();
+	asm volatile("mrs %0, cntpct_el0" : "=r" (v));
+	return v;
+}
+#else   /* host build / non-arm64: just delay */
+static void tw_wfi_nap(unsigned int ms) { udelay(ms * 1000); }
+static unsigned long tw_cntpct(void) { return 0; }
+#endif
+
+/*
+ * Nap `ms` milliseconds as low-power as we safely can. Prefers real WFI sleep;
+ * self-tests it ONCE and permanently falls back to the WFE `udelay` if WFI turns
+ * out not to sleep on this board (returns far too quickly). The architectural
+ * guarantee (armed timer -> WFI must wake) means it can't hang; the self-test
+ * only guards the soft failure "WFI returns immediately, saving nothing".
+ */
+static void tw_idle_nap(unsigned int ms)
+{
+	static int wfi_ok = -1;    /* -1 = untested, 1 = use WFI, 0 = use WFE */
+
+	if (wfi_ok == 0) {
+		udelay(ms * 1000);
+		return;
+	}
+	if (wfi_ok < 0) {
+		/* First nap: time a short WFI and check it actually slept. */
+		unsigned long rate = get_tbclk();
+		unsigned long t0 = tw_cntpct();
+		unsigned long slept;
+
+		tw_wfi_nap(ms);
+		slept = tw_cntpct() - t0;
+		/* Expect ~ms of ticks; accept >= half. If WFI returned nearly
+		 * instantly, it isn't sleeping here - fall back to WFE. */
+		wfi_ok = (slept >= (rate / 1000) * ms / 2) ? 1 : 0;
+		if (!wfi_ok)
+			udelay(ms * 1000);   /* make this nap the full length */
+		return;
+	}
+	tw_wfi_nap(ms);
+}
+
 /* ----------------------------------------------------------- key input --- */
 /* Read one logical keypress: cooked ASCII (0x00-0xFF) or an extended KEY_*
  * constant (> 0xFF) parsed from an ANSI arrow/nav escape sequence. Mirrors the
@@ -93,16 +187,19 @@ static int tw_read_key(void)
 	/*
 	 * Wait for a key. U-Boot's console is polled (no "sleep until key").
 	 *
-	 * Power: we can't use a bare WFI (froze the board - no wake IRQ is armed).
-	 * But at EL2 (where coreboot's bl31 hands us off) U-Boot's udelay() sleeps
-	 * the core with WFE via the ARMv8 event stream instead of busy-spinning
-	 * (CONFIG_ARMV8_UDELAY_EVENT_STREAM). So the nap below is genuinely
-	 * low-power. TW_KEY_NAP_MS (25 ms) is the worst-case keystroke latency.
+	 * Power: each nap is a real WFI sleep (tw_idle_nap -> tw_wfi_nap) - the core
+	 * clock-gates until an armed CNTP timer expiry (our tick) or a keypress IRQ
+	 * wakes it. A bare WFI froze the board before ONLY because nothing was armed;
+	 * arming the timer first makes it always wake. (If WFI turns out not to sleep
+	 * on this board, tw_idle_nap self-tests once and falls back to WFE udelay.)
+	 * TW_KEY_NAP_MS (25 ms) is the worst-case keystroke latency.
 	 *
 	 * Power-saving mode: after TW_IDLE_SAVE_MS with no key, we return KEY_PWRSAVE
 	 * (the handler dims the backlight + shows [power saving]) and switch to lazy
-	 * TW_SAVE_NAP_MS (500 ms) naps + polling - the core and EC are nearly idle.
-	 * The next real key wakes us: we swallow it (return KEY_PWRSAVE_WAKE) so it
+	 * TW_SAVE_NAP_MS (500 ms) naps - now REAL 500 ms WFI sleeps, so the core is
+	 * genuinely idle (not the old self-waking WFE spin). The core and EC are
+	 * nearly idle. The next real key wakes us: we swallow it (return
+	 * KEY_PWRSAVE_WAKE) so it
 	 * only restores brightness/speed rather than typing a stray char.
 	 *
 	 * The EC host-event poll (power button / lid) is a SPI transaction, so we
@@ -136,7 +233,7 @@ static int tw_read_key(void)
 			return KEY_PWRSAVE;   /* enter power-saving */
 
 		schedule();               /* keep the watchdog fed */
-		udelay(nap * 1000);       /* WFE nap at EL2 (event stream) */
+		tw_idle_nap(nap);         /* real WFI sleep (timer-woken), or WFE */
 	}
 
 	last_input = get_timer(0);
