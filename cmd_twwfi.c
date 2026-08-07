@@ -126,6 +126,85 @@ static void dump_state(void)
 	printf("ICC_CTLR     = 0x%lx\n", rd_icc_ctlr());
 }
 
+/*
+ * SAFE probe (no WFI): arm the timer + enable everything, then POLL the counter
+ * until it expires, and read back how far the interrupt propagated. Never
+ * sleeps, so it can't freeze - it tells us which link is broken.
+ */
+static int do_probe(int hyp, unsigned int ms)
+{
+	unsigned long rate = rd_cntfrq();
+	unsigned long ticks = (rate / 1000) * ms;
+	unsigned int intid = hyp ? 26 : 30;
+	unsigned long ctl, target, hppir;
+	unsigned int ispend;
+
+	printf("PROBE %s (INTID %u), %u ms, NO WFI - safe.\n",
+	       hyp ? "CNTHP_EL2" : "CNTP_EL0", intid, ms);
+
+	/* Enable everything the same way the WFI path would. */
+	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
+	isb();
+	writel(1U << intid, (void *)GICR_ISENABLER0);
+	dsb();
+
+	target = rd_cntpct() + ticks;
+	if (hyp) {
+		asm volatile("msr cnthp_tval_el2, %0" : : "r" (ticks));
+		asm volatile("msr cnthp_ctl_el2, %0" : : "r" ((unsigned long)CTL_ENABLE));
+	} else {
+		asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
+		asm volatile("msr cntp_ctl_el0, %0" : : "r" ((unsigned long)CTL_ENABLE));
+	}
+	isb();
+
+	/* Spin on the counter until the timer must have expired (+ margin). */
+	while (rd_cntpct() < target + ticks)
+		;
+
+	/* Read back the state at each layer. */
+	if (hyp)
+		asm volatile("mrs %0, cnthp_ctl_el2" : "=r" (ctl));
+	else
+		asm volatile("mrs %0, cntp_ctl_el0" : "=r" (ctl));
+	ispend = readl((void *)GICR_ISPENDR0);
+	asm volatile("mrs %0, " STR(ICC_HPPIR1_EL1) : "=r" (hppir));
+
+	printf("  timer CTL      = 0x%lx (bit2 ISTATUS=%lu -> fired?)\n",
+	       ctl, (ctl >> 2) & 1);
+	printf("  GICR_ISPENDR0  = 0x%08x (bit%u=%u -> pending at redist?)\n",
+	       ispend, intid, (ispend >> intid) & 1);
+	printf("  ICC_HPPIR1     = %lu (==%u: PE sees it; ==1023: nothing"
+	       " deliverable)\n", hppir, intid);
+
+	/* Clean up: disable timer, clear pending. Leave IGRPEN1 as we found it? -
+	 * we turned it on; turn it back off to restore prior state. */
+	if (hyp)
+		asm volatile("msr cnthp_ctl_el2, %0" : : "r" (0UL));
+	else
+		asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
+	writel(1U << intid, (void *)GICR_ICPENDR0);
+	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (0UL));
+	isb();
+	dsb();
+
+	printf("Done (no WFI). Diagnosis:\n");
+	if (!((ctl >> 2) & 1))
+		printf("  -> timer did NOT fire (ISTATUS=0): tval/enable wrong.\n");
+	else if (!((ispend >> intid) & 1))
+		printf("  -> fired but NOT pending at redist: GIC not latching it.\n");
+	else if (hppir == 1023)
+		printf("  -> pending but PE sees 1023 (spurious): group/PMR/route"
+		       " blocks delivery.\n");
+	else if (hppir == intid)
+		printf("  -> PE CAN see INTID %u: WFI *should* wake; if it doesn't,"
+		       " IRQ is routed to EL3 (SCR_EL3.IRQ) or WFI is trapped.\n",
+		       intid);
+	else
+		printf("  -> HPPIR unexpected (%lu).\n", hppir);
+	return 0;
+}
+
 /* One armed WFI. `hyp` selects CNTHP_EL2 (INTID 26) vs CNTP_EL0 (INTID 30). */
 static int do_wfi_test(int hyp, unsigned int ms)
 {
@@ -205,27 +284,36 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	if (argc < 2) {
 		dump_state();
-		printf("\nRun `twwfi hp` (EL2 timer) or `twwfi p` (EL1 timer) to"
-		       " test a single WFI.\n");
+		printf("\nRun `twwfi probe [p|hp]` FIRST (safe, no WFI) to trace the"
+		       " interrupt, then `twwfi p`/`hp` to try a real WFI.\n");
 		return 0;
 	}
-	if (argc >= 3)
+	if (argc >= 4)
+		ms = simple_strtoul(argv[3], NULL, 10);
+	else if (argc >= 3 && strcmp(argv[1], "probe"))
 		ms = simple_strtoul(argv[2], NULL, 10);
 
+	if (!strcmp(argv[1], "probe")) {
+		int hyp = (argc >= 3 && !strcmp(argv[2], "hp"));
+
+		return do_probe(hyp, ms);
+	}
 	if (!strcmp(argv[1], "hp"))
 		return do_wfi_test(1, ms);
 	if (!strcmp(argv[1], "p"))
 		return do_wfi_test(0, ms);
 
-	printf("usage: twwfi [hp|p] [ms]\n");
+	printf("usage: twwfi [probe [p|hp]] [p|hp] [ms]\n");
 	return CMD_RET_USAGE;
 }
 
 U_BOOT_CMD(
-	twwfi, 3, 0, do_twwfi,
+	twwfi, 4, 0, do_twwfi,
 	"WFI-wake test (timer idle debug)",
-	"            - dump EL/timer/GIC state (safe, no WFI)\n"
-	"twwfi hp [ms] - arm CNTHP (EL2 timer, INTID 26) + one WFI\n"
-	"twwfi p  [ms] - arm CNTP  (EL1 timer, INTID 30) + one WFI\n"
-	"  If the prompt returns, that timer wakes WFI. If it hangs, power-cycle."
+	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
+	"twwfi probe [p|hp] - SAFE: arm timer, poll (no WFI), report how far the\n"
+	"                     interrupt propagated (timer->redist->PE). Run FIRST.\n"
+	"twwfi hp [ms]    - arm CNTHP (EL2 timer, INTID 26) + one WFI\n"
+	"twwfi p  [ms]    - arm CNTP  (EL1 timer, INTID 30) + one WFI\n"
+	"  If a WFI test hangs, power-cycle. `probe` never hangs."
 );
