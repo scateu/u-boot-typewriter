@@ -197,10 +197,9 @@ static int tw_read_key(void)
 	 * Power-saving mode: after TW_IDLE_SAVE_MS with no key, we return KEY_PWRSAVE
 	 * (the handler dims the backlight + shows [power saving]) and switch to lazy
 	 * TW_SAVE_NAP_MS (500 ms) naps - now REAL 500 ms WFI sleeps, so the core is
-	 * genuinely idle (not the old self-waking WFE spin). The core and EC are
-	 * nearly idle. The next real key wakes us: we swallow it (return
-	 * KEY_PWRSAVE_WAKE) so it
-	 * only restores brightness/speed rather than typing a stray char.
+	 * genuinely idle (not the old self-waking WFE spin). The next real key ends
+	 * the wait normally; the handler notices power-saving, wakes (restores
+	 * brightness/speed), then types that key - so no keystroke is lost.
 	 *
 	 * The EC host-event poll (power button / lid) is a SPI transaction, so we
 	 * throttle it to TW_EC_POLL_MS (200 ms) awake / TW_SAVE_NAP_MS while saving.
@@ -237,11 +236,11 @@ static int tw_read_key(void)
 	}
 
 	last_input = get_timer(0);
-	if (tw_saving) {
-		(void)getchar();         /* consume + discard the waking key */
-		return KEY_PWRSAVE_WAKE; /* only wakes; doesn't type */
-	}
 
+	/* A key ended the wait. If we were in power-saving, the key handler will
+	 * notice (s->power_saving) and wake first, THEN process this key - so the
+	 * waking key types normally rather than being swallowed. tw_read_key just
+	 * returns the real key either way. */
 	c = getchar();
 
 	if (c != KEY_ESC)
@@ -1358,17 +1357,16 @@ static void tw_handle_key(struct tw_state *s, int key)
 		return;
 	}
 
-	/* Wake from power-saving (the waking key was already swallowed): restore
-	 * brightness + normal polling, full repaint so the bars go back to gray.
-	 * Does NOT type. */
-	if (key == KEY_PWRSAVE_WAKE) {
-		if (s->power_saving) {
-			s->power_saving = 0;
-			tw_backlight_restore();
-			tw_set_saving(0);
-			s->first_paint = 1;
-		}
-		return;
+	/* A real key arrived while power-saving: wake first (restore brightness +
+	 * normal polling, full repaint so the bars go back to gray), then FALL
+	 * THROUGH so this same key is processed normally - the waking key types
+	 * rather than being lost. (Reached only for genuine keys; the synthetic
+	 * maintenance keys above already returned.) */
+	if (s->power_saving) {
+		s->power_saving = 0;
+		tw_backlight_restore();
+		tw_set_saving(0);
+		s->first_paint = 1;
 	}
 
 	if (s->prompt != TW_PROMPT_NONE) {

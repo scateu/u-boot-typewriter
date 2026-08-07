@@ -21,8 +21,8 @@ lengthen the sleep when idle); the rest are supporting.
    Needs the backlight PWM config chain (`DM_PWM` + `PWM_CROS_EC` + …).
 4. **Throttle the idle loop** (Fix 4) — EC button/lid poll cut from 100 Hz to
    5 Hz; less EC/SPI traffic between keystrokes.
-5. **Idle power-saving mode** (Fix 5) — after 60 s idle, dim + `[power saving]` +
-   stretch the sleep to 500 ms. Any key wakes (first key swallowed).
+5. **Idle power-saving mode** (Fix 5) — after 20 s idle, dim + `[power saving]` +
+   stretch the sleep to 500 ms. Any key wakes and that key still types.
 6. **Real WFI idle** (Fix 6) — **the key fix.** Each nap is now a true `WFI`
    sleep woken by an armed CNTP timer (or a keypress IRQ), so the core actually
    clock-gates. The earlier "lazy poll" was a WFE busy-spin that never slept.
@@ -275,22 +275,22 @@ unaffected (battery already polls at 30 s).
 
 ## Fix 5 — idle power-saving mode (dim + go lazy)
 
-The biggest idle lever, modelled on an e-reader / AlphaSmart: after
-`TW_IDLE_SAVE_MS` (60 s) with no keystroke the editor enters **power-saving
+The biggest idle lever, modelled on how terminals go idle: after
+`TW_IDLE_SAVE_MS` (20 s) with no keystroke the editor enters **power-saving
 mode** and stays there until you press a key.
 
 While saving:
 - the **backlight dims to the minimum** (`tw_backlight_dim()` — remembers your
   chosen level, doesn't clobber it);
-- the title bar shows **`[power saving]`**;
-- the idle loop goes **lazy**: WFE nap and EC poll both stretch to
-  `TW_SAVE_NAP_MS` (500 ms) instead of 25/200 ms, so the core and the EC/SPI bus
-  are almost entirely quiet.
+- the title bar shows **`[power saving]`** and all chrome bars go black;
+- the idle loop goes **lazy**: WFI nap and EC poll both stretch to
+  `TW_SAVE_NAP_MS` (500 ms) instead of 25/200 ms, so the core (real WFI sleep,
+  Fix 6) and the EC/SPI bus are almost entirely quiet.
 
-Waking: **any key** wakes it. The waking key is **swallowed** (consumed but not
-typed) — it only restores your brightness and the normal poll cadence, so a key
-pressed "just to see the screen" doesn't insert a stray character. You sacrifice
-just that first keystroke's latency.
+Waking: **any key** wakes it, and **that key still types** — the wait ends
+normally, the key handler notices power-saving is on, wakes (restores brightness
++ normal cadence, repaints), then processes the key. So no keystroke is lost; you
+only pay the ≤500 ms wake latency on that first key.
 
 Power button / lid still work while saving (checked on the 500 ms lazy poll, so
 up to ~0.5 s latency there — fine for poweroff).
@@ -358,7 +358,7 @@ All periods are set in `cmd_tw.h`. The idle loop (`tw_read_key`) wakes every
 | WFI nap = keystroke latency   | `TW_KEY_NAP_MS`    | 25 ms    | 500 ms¹      |
 | Power button / lid poll       | `TW_EC_POLL_MS`    | 200 ms   | 500 ms¹      |
 | Battery re-read (title `BAT:`)| `TW_BATT_POLL_MS` / `TW_BATT_SAVE_MS` | 30 s | 60 s² |
-| Idle before power-saving      | `TW_IDLE_SAVE_MS`  | 60 s     | —            |
+| Idle before power-saving      | `TW_IDLE_SAVE_MS`  | 20 s     | —            |
 | Lazy nap/poll while saving    | `TW_SAVE_NAP_MS`   | —        | 500 ms       |
 
 Each "nap" is a real WFI sleep (Fix 6), woken by the armed CNTP timer at the nap
@@ -367,24 +367,25 @@ spinning.
 
 ¹ In power-saving mode the nap and the EC (button/lid) poll both run at
   `TW_SAVE_NAP_MS` (500 ms). So a keypress, power button, or lid close is noticed
-  within ~0.5 s — that press also *wakes* the editor (its first keystroke is
-  swallowed) and restores the 25 ms / 200 ms awake cadence.
+  within ~0.5 s — and a keypress *wakes* the editor (restoring the 25 ms / 200 ms
+  awake cadence) and **still types**, so no keystroke is lost.
 
 ² Battery keeps refreshing while saving (the dimmed screen is still readable),
   just at 60 s instead of 30 s. The `KEY_REFRESH` handler only updates the title
-  — it does not leave power-saving. The 60 s idle timer only runs while awake and
+  — it does not leave power-saving. The 20 s idle timer only runs while awake and
   resets on every keystroke.
 
 Notes on the choices:
 - **25 ms keystroke nap** — worst-case latency from key press to it being read;
-  well below perception, and one WFE sleep per nap (low power at EL2).
+  well below perception, and one real WFI sleep per nap.
 - **200 ms button/lid poll** — each is an EC SPI transaction, so it's decoupled
   from the fast keyboard check; 200 ms is under human reaction time.
 - **30 s / 60 s battery** — battery moves ~1 %/several-min; the title only
   repaints when the integer % changes, so this is near-free either way. Slower
   (60 s) while saving since a dim, idle screen doesn't need a snappy gauge.
-- **60 s → power-saving** — long enough not to trip mid-thought, short enough to
-  save power during real idle.
+- **20 s → power-saving** — terminals go idle around this mark (the reference
+  point: most stop blinking the cursor ~15 s). Short enough to save power during
+  a real pause, and since the waking key still types, an early trip is harmless.
 
 ---
 

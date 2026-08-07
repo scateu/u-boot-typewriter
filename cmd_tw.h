@@ -109,11 +109,10 @@
 #define KEY_REFRESH     0x221
 #define TW_BATT_POLL_MS 30000    /* battery re-read interval (ms) */
 
-/* Synthetic keys for power-saving mode (see cmd_tw.c). KEY_PWRSAVE fires when
- * the idle timer trips (dim + go lazy); KEY_PWRSAVE_WAKE is the swallowed key
- * that woke us (restore brightness + speed, but don't type it). */
+/* Synthetic key for power-saving mode (see cmd_tw.c): KEY_PWRSAVE fires when the
+ * idle timer trips (dim + go lazy). Waking is NOT a synthetic key - a real key
+ * ends the wait, the handler exits power-saving, then types that key. */
 #define KEY_PWRSAVE      0x222
-#define KEY_PWRSAVE_WAKE 0x223
 
 /* Idle-loop tuning (power). TW_KEY_NAP_MS is one WFE nap = worst-case keystroke
  * latency (imperceptible). TW_EC_POLL_MS throttles the EC host-event SPI poll
@@ -126,7 +125,7 @@
  * show [power saving] in the title, and switch to lazy polling (TW_SAVE_NAP_MS)
  * so the core/EC are nearly idle. Any key wakes (the wake key is swallowed).
  * Sacrifices only the first keystroke's latency for a big idle-power drop. */
-#define TW_IDLE_SAVE_MS 60000    /* idle time before entering power-save (ms) */
+#define TW_IDLE_SAVE_MS 20000    /* idle time before entering power-save (ms) */
 #define TW_SAVE_NAP_MS  500      /* WFE nap / poll cadence while saving (ms) */
 #define TW_BATT_SAVE_MS 60000    /* battery re-read while saving (still visible) */
 
