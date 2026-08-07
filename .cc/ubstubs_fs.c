@@ -57,6 +57,7 @@ int fs_write(const char *f, unsigned long a, long long o, long long l, long long
 }
 
 void udelay(unsigned long u) { (void)u; }
+unsigned long get_timer(unsigned long base){ static unsigned long t; return (t += 1000) - base; }
 struct fs_dir_stream *fs_opendir(const char *f){ (void)f; return 0; }
 struct fs_dirent *fs_readdir(struct fs_dir_stream *d){ (void)d; return 0; }
 void fs_closedir(struct fs_dir_stream *d){ (void)d; }

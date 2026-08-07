@@ -23,6 +23,12 @@ int tw_video_init(struct tw_state *s){
     s->fb_w=640; s->fb_h=480; s->text_x0=8; s->text_y0=16;
     s->text_cols=78; s->text_rows=26; s->bar_y=432; s->hint_y=448; return 0;
 }
+/* Backlight side lives in cmd_tw_video.c; stub it for the harness. */
+static int tw_bl = TW_BACKLIGHT_DEFAULT;
+int tw_backlight_set(int pct){ tw_bl = pct; return tw_bl; }
+int tw_backlight_step(int d){ tw_bl += d; return tw_bl; }
+void tw_backlight_dim(void){}
+void tw_backlight_restore(void){}
 /* U-Boot externs */
 void schedule(void){}
 int getchar(void){ return 0; }

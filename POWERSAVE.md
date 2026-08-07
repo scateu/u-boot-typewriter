@@ -9,17 +9,30 @@ they are U-Boot config.
 
 ## TL;DR
 
-Two levers, both U-Boot **config** (no `cmd_tw.c` change):
+Five levers. Two are U-Boot **config**, one is a feature **plus** config, two are
+in `cmd_tw.c` (loop tuning + an idle power-saving mode):
 
 1. **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`** — makes U-Boot's `udelay()` (which
-   the editor's key-wait loop spins in while idle) **sleep the CPU with `WFE`**
-   via the ARM event stream instead of busy-spinning. This is the big idle-power
-   win, and it is **safe** (see "Why WFE, not WFI" below).
+   the editor's key-wait loop naps in while idle) **sleep the CPU with `WFE`**
+   via the ARM event stream instead of busy-spinning. Safe (see "Why WFE, not
+   WFI"). Needs **EL2+** — **confirmed EL2 on gru/kevin** (coreboot bl31 → EL2;
+   the startup line shows `EL2`).
 2. **CPU frequency 600 MHz → 408 MHz** — U-Boot clocks the RK3399 at a fixed
    600 MHz; dropping to 408 MHz (Linux's lowest OPP) cuts active power and heat.
+3. **Dim the backlight** (`^-` / `^]`, default 40 %). The backlight is a big
+   share of idle draw — see Fix 3. Requires the backlight PWM config chain
+   (`DM_PWM` + `PWM_CROS_EC` + …).
+4. **Throttle the idle loop** (Fix 4) — longer WFE nap (25 ms) and the EC
+   button/lid poll cut from 100 Hz to 5 Hz, so the core and EC/SPI bus are quiet
+   between keystrokes.
+5. **Idle power-saving mode** (Fix 5) — after 60 s idle, dim the backlight, show
+   `[power saving]`, and go fully lazy (500 ms poll). Any key wakes (first key is
+   swallowed). The biggest single idle lever.
 
 Measured before any change: **~20 %/hr battery, warm CPU** (vs Linux ~6 %/hr,
-9 h life). The busy-spin was the dominant cause.
+9 h life). Reference: Linux idles at ~6 %/hr; a suspected extra draw there and in
+U-Boot is the **WiFi module left powered but unmanaged** (no driver puts it in
+PSM) — not yet addressed here (would need regulator/PMIC gating).
 
 ---
 
@@ -65,26 +78,65 @@ So the editor's existing `udelay(10000)` now **sleeps the core in `WFE`** for
 almost the whole 10 ms instead of spinning. **No typewriter code changes** — the
 same loop, but the delay no longer burns the CPU.
 
-### Why WFE, not WFI (this is the crucial part)
+### Why WFE, not WFI — root cause of the WFI freeze
 
-We first tried `WFI` directly in the key loop. **It froze the board.** On this
-platform U-Boot has no periodic timer *interrupt* and the console is polled, so
-`WFI` halted the core and *nothing ever woke it* → dead typewriter.
+We first tried `WFI` directly in the key loop. **It froze the board.** Here is
+exactly why, confirmed against the U-Boot source and the ARMv8 architecture.
 
-`WFE` is different: it wakes on the ARM **event stream**, a signal the
-architectural timer generates **unconditionally** on a fixed period once
-`CNTHCTL_EL2.EVNT_EN` is set (the event-stream code sets it). No interrupt, no
-GIC, no handler — the wake is guaranteed by the timer hardware. So `WFE` can
-**never hang** the way `WFI` did. This is why the fix is "enable the event
-stream," not "put WFI in the loop."
+**What wakes a WFI.** Per the ARM ARM, `WFI` completes on a *WFI wake-up event*:
+a pending physical **IRQ / FIQ / SError / debug** event — and notably this
+happens **even if that interrupt is masked** in `PSTATE.DAIF`. Masking only stops
+the exception from being *taken*; it does not stop the pending interrupt from
+*waking* WFI. So "interrupts are masked" is **not** why WFI hung.
 
-### Requirement: EL2 or above
+**The actual cause: nothing ever generates an interrupt.** In U-Boot proper on
+this board there is *no interrupt source at all*:
+- The console/keyboard is **polled** (`tstc()`), never IRQ-driven.
+- The generic timer is used **only by polling `CNTPCT_EL0`** (`get_ticks()` in
+  `arch/arm/cpu/armv8/generic_timer.c`); U-Boot never programs `CNTP_CTL_EL0` /
+  `CNTP_TVAL_EL0` to *fire* a timer interrupt.
+- No GIC driver is compiled for rk3399 in U-Boot proper (the GICv3 exists in the
+  DT and hardware, but nothing initialises it), and `arch/arm/lib/interrupts_64.c`
+  has `enable_interrupts()` / `disable_interrupts()` as **no-ops** with `do_irq()`
+  set to `panic()`.
+
+So `WFI` puts the core to sleep waiting for an event that is **never produced** →
+permanent halt. The lesson: WFI on bare-metal U-Boot needs an interrupt you have
+explicitly armed; there is none here.
+
+**Why WFE works instead.** `WFE` wakes on all the WFI events **plus** an *event*,
+and the ARMv8 **event stream** makes the architectural timer emit a periodic
+event automatically once `CNTHCTL_EL2.EVNT_EN` is set (which the event-stream
+`udelay` path does). Period is `2^EVNTI` counter ticks — the code uses
+`EVNTI = 7` → every 128 ticks; at RK3399's 24 MHz timer that is **~5.3 µs**. So
+the core naps in a low-power state and self-wakes every ~5 µs with **no
+interrupt, no GIC, no handler** — it can never hang the way WFI did.
+
+**Could we make WFI work (deeper sleep)?** In principle yes: arm the generic
+timer to raise a periodic **CNTP interrupt**, route the timer PPI through the GIC
+to the CPU (`GICD` group-enable + `ICC_*` CPU interface), and replace the
+panicking `do_irq` with a handler that just acknowledges the timer. WFI is deeper
+than WFE (the core can gate its clock fully until the IRQ). But it is a lot of
+fragile new plumbing — and the i.MX8 report in `ref/power_consumption/` shows how
+it goes wrong (their timer PPI never reached the CPU because `GICD_CTLR.
+EnableGrp1NS` wouldn't set, so *their* WFI hung too). The WFE event stream gets
+most of the benefit for one config bit and zero interrupt code, so we stay with
+it. Arming a timer IRQ is a possible future optimisation, not a fix that's needed.
+
+### Requirement: EL2 or above  — CONFIRMED EL2 on gru/kevin
 
 The event-stream path only runs when `current_el() >= 2` (see the `if` above).
-On gru/kevin, U-Boot runs at EL2/EL3 (consistent with PSCI SMC working), so it
-applies. If a build somehow ran U-Boot at EL1, `__udelay()` would silently fall
-back to the busy-poll (no harm, but no saving) — if power doesn't improve after
-enabling the option, check the exception level first.
+**We confirmed gru/kevin runs U-Boot at EL2**, two ways:
+- Config: coreboot uses ARM Trusted Firmware (`ARM64_USE_ARM_TRUSTED_FIRMWARE=y`),
+  bl31 runs at EL3 and hands the payload (U-Boot) to EL2 non-secure; and U-Boot's
+  `CONFIG_ARMV8_SWITCH_TO_EL1` is **off**, so it stays at EL2.
+- Runtime: the typewriter prints the level in its startup status line
+  (`[ Read N lines - EL2 ]`) via `current_el()`, and `^Q` prints it on any
+  poweroff failure. Look for **EL2**.
+
+So the event-stream WFE idle *is* active. If a build ever showed **EL1** there,
+`__udelay()` would silently fall back to busy-poll (no saving) — that's the first
+thing to check if idle power regresses.
 
 ### Enabling it
 
@@ -138,6 +190,154 @@ core *is* awake.
 
 ---
 
+## Fix 3 — dim the panel backlight (`^-` / `^=`)
+
+If Fix 1 + Fix 2 did **not** move the needle (event stream confirmed set, drain
+still ~18 %/hr), the dominant draw is almost certainly the **LCD backlight**, not
+the CPU. U-Boot brings the panel up at **full brightness** and never lowers it,
+so it burns the same power whether you're typing or idle.
+
+The typewriter now controls it:
+
+- Starts at **`TW_BACKLIGHT_DEFAULT` = 60 %** (see `cmd_tw.h`).
+- **`^-`** (Ctrl-minus) dims 20 %, **`^=`** (Ctrl-equal) brightens 20 %.
+- **0 %** fully powers the backlight PWM down (`BACKLIGHT_OFF`); the next `^=`
+  brings it back. A status line shows the current percent.
+
+Implementation is confined to the typewriter: `tw_backlight_set()` /
+`tw_backlight_step()` in `cmd_tw_video.c`, keys handled in `cmd_tw.c`.
+
+### THE CATCH — the backlight config chain must be built in
+
+This does **nothing** unless U-Boot actually binds a controllable backlight
+device. On gru/kevin the control path is a **chain**, and *every* link needs its
+Kconfig or the whole thing silently no-ops:
+
+```
+rk_edp (eDP) --rockchip,panel--> UCLASS_PANEL (simple-panel)
+            --backlight phandle--> pwm-backlight --pwms--> cros-ec PWM
+```
+
+| Link            | Config symbol         | Notes                                  |
+|-----------------|-----------------------|----------------------------------------|
+| simple panel    | `CONFIG_SIMPLE_PANEL` | `default y` w/ PANEL+BACKLIGHT+DM_GPIO |
+| pwm backlight   | `CONFIG_BACKLIGHT_PWM`| `default y` w/ BACKLIGHT+DM_PWM        |
+| PWM core        | `CONFIG_DM_PWM`       | **often dropped — the usual culprit**  |
+| cros-ec PWM     | `CONFIG_PWM_CROS_EC`  | gru backlight PWM lives on the EC      |
+
+The stock `chromebook_kevin_defconfig` sets `PWM_CROS_EC`, `PWM_ROCKCHIP`, and
+`REGULATOR_PWM`. **A libreboot config that omits `DM_PWM`/`PWM_CROS_EC` cannot
+control the backlight at all** — the code above finds no device and does nothing.
+Add to your libreboot U-Boot config:
+
+```
+# $LB/config/u-boot/gru_kevin/config/default
+CONFIG_DM_PWM=y
+CONFIG_PWM_CROS_EC=y
+CONFIG_BACKLIGHT_PWM=y
+CONFIG_SIMPLE_PANEL=y
+```
+
+Verify in the U-Boot shell after boot: `dm tree | grep -i "panel\|backlight\|pwm"`
+should list a panel + backlight + pwm device. If they're absent, the config
+didn't take and `^-`/`^=` will appear to do nothing.
+
+> Note on the keys: Ctrl chording punctuation is keymap-dependent. `^-` is bound
+> to `0x1F` and `^=` to `0x1D` (the bytes most US layouts emit). If a keypress
+> shows no brightness change on the real EC keyboard, tell me the raw byte and
+> I'll rebind — the values live in `cmd_tw.h` (`KEY_CTRL_MINUS`/`KEY_CTRL_EQUAL`).
+
+---
+
+## Fix 4 — throttle the idle key-wait loop
+
+Fix 1 makes each `udelay()` a WFE sleep, but the *loop around it* still does work
+every iteration. Two things ran too often in the editor's key-wait loop
+(`tw_read_key`, `cmd_tw.c`):
+
+- **The EC host-event poll** (power button / lid) was a **SPI transaction to the
+  EC every ~10 ms (100 Hz)** — clocking the bus and waking the EC MCU constantly.
+- The nap itself was only **10 ms**, so the core woke 100×/s even when idle.
+
+Changes (constants in `cmd_tw.h`):
+- `TW_KEY_NAP_MS` **10 → 25 ms** — the per-iteration WFE nap. This is the
+  worst-case keystroke latency (still imperceptible), and the core now wakes
+  ~40×/s instead of 100×/s.
+- `TW_EC_POLL_MS` **= 200 ms** — the EC button/lid poll is now throttled to once
+  per 200 ms (~8× fewer EC/SPI transactions). Human reaction time is ~150 ms, so
+  a button press or lid close is still caught effectively instantly.
+
+The keyboard is still checked (`tstc()`) every nap, so typing latency is bounded
+by `TW_KEY_NAP_MS` (25 ms), not the EC interval. Battery %/backlight are
+unaffected (battery already polls at 30 s).
+
+---
+
+## Fix 5 — idle power-saving mode (dim + go lazy)
+
+The biggest idle lever, modelled on an e-reader / AlphaSmart: after
+`TW_IDLE_SAVE_MS` (60 s) with no keystroke the editor enters **power-saving
+mode** and stays there until you press a key.
+
+While saving:
+- the **backlight dims to the minimum** (`tw_backlight_dim()` — remembers your
+  chosen level, doesn't clobber it);
+- the title bar shows **`[power saving]`**;
+- the idle loop goes **lazy**: WFE nap and EC poll both stretch to
+  `TW_SAVE_NAP_MS` (500 ms) instead of 25/200 ms, so the core and the EC/SPI bus
+  are almost entirely quiet.
+
+Waking: **any key** wakes it. The waking key is **swallowed** (consumed but not
+typed) — it only restores your brightness and the normal poll cadence, so a key
+pressed "just to see the screen" doesn't insert a stray character. You sacrifice
+just that first keystroke's latency.
+
+Power button / lid still work while saving (checked on the 500 ms lazy poll, so
+up to ~0.5 s latency there — fine for poweroff).
+
+Tunables in `cmd_tw.h`: `TW_IDLE_SAVE_MS` (idle timeout), `TW_SAVE_NAP_MS` (lazy
+cadence). Implementation: the wait loop (`tw_read_key`) tracks `last_input` and
+returns synthetic `KEY_PWRSAVE` / `KEY_PWRSAVE_WAKE`; the handler flips
+`s->power_saving`, dims/restores, and toggles the loop's lazy flag.
+
+---
+
+## Cycle-time reference
+
+All periods are set in `cmd_tw.h`. The idle loop (`tw_read_key`) wakes every
+"nap", checks the keyboard, and services the other polls on their own deadlines.
+
+| What                          | Constant           | Awake    | Power-saving |
+|-------------------------------|--------------------|----------|--------------|
+| Keystroke latency (WFE nap)   | `TW_KEY_NAP_MS`    | 25 ms    | 500 ms¹      |
+| Power button / lid poll       | `TW_EC_POLL_MS`    | 200 ms   | 500 ms¹      |
+| Battery re-read (title `BAT:`)| `TW_BATT_POLL_MS` / `TW_BATT_SAVE_MS` | 30 s | 60 s² |
+| Idle before power-saving      | `TW_IDLE_SAVE_MS`  | 60 s     | —            |
+| Lazy nap/poll while saving    | `TW_SAVE_NAP_MS`   | —        | 500 ms       |
+
+¹ In power-saving mode the nap and the EC (button/lid) poll both run at
+  `TW_SAVE_NAP_MS` (500 ms). So a keypress, power button, or lid close is noticed
+  within ~0.5 s — that press also *wakes* the editor (its first keystroke is
+  swallowed) and restores the 25 ms / 200 ms awake cadence.
+
+² Battery keeps refreshing while saving (the dimmed screen is still readable),
+  just at 60 s instead of 30 s. The `KEY_REFRESH` handler only updates the title
+  — it does not leave power-saving. The 60 s idle timer only runs while awake and
+  resets on every keystroke.
+
+Notes on the choices:
+- **25 ms keystroke nap** — worst-case latency from key press to it being read;
+  well below perception, and one WFE sleep per nap (low power at EL2).
+- **200 ms button/lid poll** — each is an EC SPI transaction, so it's decoupled
+  from the fast keyboard check; 200 ms is under human reaction time.
+- **30 s / 60 s battery** — battery moves ~1 %/several-min; the title only
+  repaints when the integer % changes, so this is near-free either way. Slower
+  (60 s) while saving since a dim, idle screen doesn't need a snappy gauge.
+- **60 s → power-saving** — long enough not to trip mid-thought, short enough to
+  save power during real idle.
+
+---
+
 ## What did NOT matter
 
 - **The device tree / `.dtb`.** The DT describes hardware; it does not set the
@@ -166,12 +366,15 @@ There's no `cpu`/cpufreq readout in U-Boot here, so measure indirectly:
 
 ## History / dead ends
 
-- **WFI in the key loop → froze the board.** No wake source (polled console, no
-  timer IRQ in U-Boot proper). Reverted. The lesson: use **WFE + event stream**,
-  which self-wakes, not WFI.
-- A full **timer-interrupt + GIC** setup would also let WFI sleep, but it is
-  much more involved and risky; the event stream achieves the same idle with a
-  single config option and no interrupt plumbing.
+- **WFI in the key loop → froze the board.** Root cause: U-Boot proper has *no*
+  interrupt source (polled console, timer only polled via `CNTPCT`, no GIC init),
+  so the WFI wake event is never produced — masking is a red herring. Full
+  analysis in "Why WFE, not WFI — root cause of the WFI freeze" above. Fix: use
+  **WFE + event stream**, which self-wakes from the timer with no interrupt.
+- A full **timer-interrupt + GIC** setup would let WFI sleep deeper, but it is
+  much more involved and risky (see the i.MX8 case in `ref/power_consumption/`
+  where the same attempt hung); the event stream achieves near-equivalent idle
+  with one config option and no interrupt plumbing.
 
 ---
 
@@ -181,4 +384,10 @@ There's no `cpu`/cpufreq readout in U-Boot here, so measure indirectly:
 - `arch/arm/cpu/armv8/Kconfig` — `CONFIG_ARMV8_UDELAY_EVENT_STREAM`.
 - `arch/arm/include/asm/system.h` — `wfe()` / `wfi()`.
 - `drivers/clk/rockchip/clk_rk3399.c` — `rkclk_init()` CPU frequency presets.
-- `cmd_tw.c` — `tw_read_key()` key-wait loop (unchanged; benefits from Fix 1).
+- `cmd_tw.c` — `tw_read_key()` key-wait loop (unchanged; benefits from Fix 1);
+  `^-`/`^=` brightness keys in `tw_handle_key()`.
+- `cmd_tw_video.c` — `tw_backlight_set()` / `tw_backlight_step()` (Fix 3).
+- `drivers/video/panel-uclass.c` — `panel_set_backlight()` (panel → backlight).
+- `drivers/video/simple_panel.c` — resolves the panel's `backlight` phandle.
+- `drivers/video/rockchip/rk_edp.c` — `panel_enable_backlight()` on eDP enable.
+- `include/backlight.h` — `BACKLIGHT_OFF` (-1), `backlight_set_brightness()`.

@@ -6,7 +6,7 @@
  * This file owns the U_BOOT_CMD entry point, the key reader (cooked ASCII plus
  * arrow/nav escape sequences), the editing primitives over the codepoint line
  * model, the Ctrl-key command dispatch, the Wubi composition state machine, and
- * the bottom-line prompts (^O write-out, ^W where-is, ^X exit-if-modified).
+ * the bottom-line prompts (^S save, ^W where-is, ^X exit-if-modified).
  *
  * Rendering, framebuffer setup, and the embedded glyph/table data live in the
  * sibling files (cmd_tw_video.c, cmd_tw_fs.c, ime_table.c, font_data.c,
@@ -21,6 +21,9 @@
 #include <linux/psci.h>
 #include <irq_func.h>
 #include <dm.h>
+#include <cros_ec.h>
+#include <asm/system.h>
+#include <time.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 
@@ -36,6 +39,10 @@ int  tw_video_init(struct tw_state *s);
 void tw_render(struct tw_state *s);
 int  tw_cp_cols(u32 cp);
 int  tw_line_rows(struct tw_state *s, int fr);
+int  tw_backlight_set(int pct);   /* set brightness 0..100, returns applied */
+int  tw_backlight_step(int delta);/* step by delta (+/-), returns applied */
+void tw_backlight_dim(void);      /* power-save: dim to min (keeps user level) */
+void tw_backlight_restore(void);  /* power-save wake: restore user level */
 
 static struct tw_state g_tw;
 
@@ -62,23 +69,82 @@ static int tw_getch_timeout(void)
 	return getchar();
 }
 
+static int tw_poweroff_event_pending(void);   /* defined below (EC section) */
+
+/* Set by the key handler so the wait loop knows whether we're in power-saving
+ * mode (lazy polling, no battery refresh). tw_read_key has no tw_state pointer,
+ * so this file-static bridges the two. */
+static int tw_saving;
+static void tw_set_saving(int on) { tw_saving = on; }
+
 static int tw_read_key(void)
 {
+	static unsigned long batt_next;    /* ms deadline: next battery refresh */
+	static unsigned long ec_next;      /* ms deadline: next EC event poll */
+	static unsigned long last_input;   /* ms of last real keystroke */
+	static int seeded;
 	int c;
+
+	if (!seeded) {                     /* first call: start the idle clock now */
+		seeded = 1;
+		last_input = get_timer(0);
+	}
 
 	/*
 	 * Wait for a key. U-Boot's console is polled (no "sleep until key").
-	 * NOTE: a bare WFI here FROZE the board - on this platform WFI genuinely
-	 * halts the core and nothing (no timer IRQ, polled console) ever wakes
-	 * it. So we poll with a udelay throttle. This is a BUSY-SPIN (higher
-	 * power than Linux's WFI idle), the cost of not having a wake interrupt;
-	 * lowering it needs a periodic timer IRQ set up first (TODO). The delay
-	 * is far below human typing latency, so input still feels instant.
+	 *
+	 * Power: we can't use a bare WFI (froze the board - no wake IRQ is armed).
+	 * But at EL2 (where coreboot's bl31 hands us off) U-Boot's udelay() sleeps
+	 * the core with WFE via the ARMv8 event stream instead of busy-spinning
+	 * (CONFIG_ARMV8_UDELAY_EVENT_STREAM). So the nap below is genuinely
+	 * low-power. TW_KEY_NAP_MS (25 ms) is the worst-case keystroke latency.
+	 *
+	 * Power-saving mode: after TW_IDLE_SAVE_MS with no key, we return KEY_PWRSAVE
+	 * (the handler dims the backlight + shows [power saving]) and switch to lazy
+	 * TW_SAVE_NAP_MS (500 ms) naps + polling - the core and EC are nearly idle.
+	 * The next real key wakes us: we swallow it (return KEY_PWRSAVE_WAKE) so it
+	 * only restores brightness/speed rather than typing a stray char.
+	 *
+	 * The EC host-event poll (power button / lid) is a SPI transaction, so we
+	 * throttle it to TW_EC_POLL_MS (200 ms) awake / TW_SAVE_NAP_MS while saving.
+	 * We use the HOST EVENT channel, not the MKBP FIFO (shared with the cros_ec
+	 * keyboard - draining it would steal keys).
+	 *
+	 * Every TW_BATT_POLL_MS (when awake) we return KEY_REFRESH so the caller
+	 * re-reads the battery gauge and repaints the title only if the % changed.
 	 */
 	while (!tstc()) {
-		schedule();          /* keep the watchdog fed */
-		udelay(10000);       /* 10 ms throttle (busy - see note above) */
+		unsigned long now = get_timer(0);
+		unsigned long nap  = tw_saving ? TW_SAVE_NAP_MS  : TW_KEY_NAP_MS;
+		unsigned long ecp  = tw_saving ? TW_SAVE_NAP_MS  : TW_EC_POLL_MS;
+		unsigned long batp = tw_saving ? TW_BATT_SAVE_MS : TW_BATT_POLL_MS;
+
+		if (now >= ec_next) {
+			ec_next = now + ecp;
+			if (tw_poweroff_event_pending())
+				return KEY_POWER_BTN;
+		}
+		/* Battery keeps refreshing even while saving (the user may be
+		 * reading the dimmed screen), just at a slower cadence. The
+		 * KEY_REFRESH handler only updates batt_pct/title - it does NOT
+		 * leave power-saving mode. */
+		if (now >= batt_next) {
+			batt_next = now + batp;
+			return KEY_REFRESH;
+		}
+		if (!tw_saving && now - last_input >= TW_IDLE_SAVE_MS)
+			return KEY_PWRSAVE;   /* enter power-saving */
+
+		schedule();               /* keep the watchdog fed */
+		udelay(nap * 1000);       /* WFE nap at EL2 (event stream) */
 	}
+
+	last_input = get_timer(0);
+	if (tw_saving) {
+		(void)getchar();         /* consume + discard the waking key */
+		return KEY_PWRSAVE_WAKE; /* only wakes; doesn't type */
+	}
+
 	c = getchar();
 
 	if (c != KEY_ESC)
@@ -620,7 +686,193 @@ static void tw_do_save(struct tw_state *s)
 		tw_status(s, "[ Error writing %s ]", s->filename);
 }
 
-/* Save (if writable & dirty) - abort on failure. Returns 0 to proceed. */
+/* --------------------------------------------------------- ChromeOS EC --- */
+/*
+ * Grab the ChromeOS EC device (cached). NULL if this board has no EC or the
+ * driver isn't built in. The EC is how we reach the battery gauge on gru/kevin.
+ */
+#if CONFIG_IS_ENABLED(CROS_EC)
+static struct udevice *tw_ec(void)
+{
+	static struct udevice *ec;
+	static int tried;
+
+	if (!tried) {
+		tried = 1;
+		if (uclass_first_device_err(UCLASS_CROS_EC, &ec))
+			ec = NULL;
+	}
+	return ec;
+}
+
+/*
+ * Issue one EC host command and return the response payload, WITHOUT going
+ * through U-Boot's public cros_ec_* wrappers.
+ *
+ * Why we reimplement this: U-Boot's cros_ec_read_batt_charge() has a bug
+ * (`if (ret)` treats ec_command's positive byte-count as an error), and the
+ * correct internal path (send_command_proto3 + create/handle_proto3) is all
+ * static in drivers/misc/cros_ec.c - there's no public raw-command API. Rather
+ * than patch U-Boot core, we replicate the protocol framing here, on top of the
+ * PUBLIC pieces: struct cros_ec_dev (with its din/dout buffers) via
+ * dev_get_uclass_priv(), the transport ops (dm_cros_ec_get_ops), and
+ * cros_ec_calc_checksum(). gru/kevin's EC negotiates protocol v3, so that's the
+ * path we implement; we fall back to the v2 ->command op otherwise.
+ *
+ * Mirrors send_command_proto3(): build an ec_host_request header + data in
+ * cdev->dout, call ops->packet(), then validate the ec_host_response header +
+ * checksum in cdev->din. Returns payload length (>=0) and sets *dinp to the
+ * payload, or a negative EC_RES_* / errno on failure.
+ */
+static int tw_ec_command(struct udevice *ec, int cmd, int cmd_version,
+			 const void *dout, int dout_len,
+			 uint8_t **dinp, int din_len)
+{
+	struct cros_ec_dev *cdev = dev_get_uclass_priv(ec);
+	struct dm_cros_ec_ops *ops = dm_cros_ec_get_ops(ec);
+	struct ec_host_request *rq;
+	struct ec_host_response *rs;
+	int out_bytes, in_bytes, rv;
+
+	if (!cdev || !ops)
+		return -EC_RES_ERROR;
+
+	/* Protocol v2 fallback: the ->command op does its own framing. */
+	if (cdev->protocol_version != 3) {
+		if (!ops->command)
+			return -EC_RES_INVALID_VERSION;
+		return ops->command(ec, cmd, cmd_version, dout, dout_len,
+				    dinp, din_len);
+	}
+
+	/* --- protocol v3 --- */
+	if (!ops->packet)
+		return -ENOSYS;
+
+	out_bytes = dout_len + sizeof(*rq);
+	in_bytes  = din_len + sizeof(*rs);
+	if (out_bytes > (int)sizeof(cdev->dout))
+		return -EC_RES_REQUEST_TRUNCATED;
+	if (in_bytes > (int)sizeof(cdev->din))
+		return -EC_RES_RESPONSE_TOO_BIG;
+
+	/* Build request header + data, then set checksum so all bytes sum 0. */
+	rq = (struct ec_host_request *)cdev->dout;
+	rq->struct_version  = EC_HOST_REQUEST_VERSION;
+	rq->checksum        = 0;
+	rq->command         = cmd;
+	rq->command_version = cmd_version;
+	rq->reserved        = 0;
+	rq->data_len        = dout_len;
+	if (dout_len)
+		memcpy(rq + 1, dout, dout_len);
+	rq->checksum = (uint8_t)(-cros_ec_calc_checksum(cdev->dout, out_bytes));
+
+	rv = ops->packet(ec, out_bytes, in_bytes);
+	if (rv < 0)
+		return rv;
+
+	/* Validate response header + checksum. */
+	rs = (struct ec_host_response *)cdev->din;
+	if (rs->struct_version != EC_HOST_RESPONSE_VERSION || rs->reserved)
+		return -EC_RES_INVALID_RESPONSE;
+	if (rs->data_len > din_len)
+		return -EC_RES_RESPONSE_TOO_BIG;
+	if (cros_ec_calc_checksum(cdev->din, sizeof(*rs) + rs->data_len))
+		return -EC_RES_INVALID_CHECKSUM;
+	if (rs->result)
+		return -(int)rs->result;
+
+	*dinp = (uint8_t *)(rs + 1);
+	return rs->data_len;
+}
+
+/*
+ * Read the battery charge as a percentage (0..100) on success, or a negative
+ * value on failure (TW_BATT_NO_EC = no EC, else a negative EC result code) -
+ * the title bar hides any negative. Called from the periodic KEY_REFRESH poll
+ * (every TW_BATT_POLL_MS), one EC transaction per refresh.
+ */
+static int tw_read_battery(void)
+{
+	struct udevice *ec = tw_ec();
+	struct ec_response_charge_state resp;
+	uint8_t reqcmd = CHARGE_STATE_CMD_GET_STATE;
+	uint8_t *din = NULL;
+	int len;
+
+	if (!ec)
+		return TW_BATT_NO_EC;
+
+	len = tw_ec_command(ec, EC_CMD_CHARGE_STATE, 0,
+			    &reqcmd, sizeof(reqcmd),
+			    &din, sizeof(resp));
+	if (len < 0)
+		return len;                    /* -EC_RES_* : show the code */
+	if (!din || len < (int)sizeof(resp.get_state))
+		return -EC_RES_INVALID_RESPONSE;
+
+	memcpy(&resp, din, sizeof(resp.get_state));
+	return resp.get_state.batt_state_of_charge;
+}
+
+/*
+ * Power-off triggers: the physical power button AND closing the lid. Detection
+ * done RIGHT.
+ *
+ * The obvious approach - poll cros_ec_get_next_event() - is WRONG here: the
+ * keyboard is also a cros_ec (CROS_EC_KEYB), and its read path
+ * (cros_ec_kbc_check) pulls from the SAME MKBP event FIFO, discarding every
+ * event that isn't a key-matrix scan. So (a) polling the FIFO ourselves steals
+ * keystrokes, and (b) the keyboard driver silently eats button events anyway.
+ *
+ * Instead we use the EC HOST EVENT flags - a separate, latched bitmask channel
+ * that the keyboard driver never touches. Both the power button and a lid-close
+ * latch bits there (EC_HOST_EVENT_POWER_BUTTON / EC_HOST_EVENT_LID_CLOSED). We
+ * read the B copy (cros_ec_get_host_events uses EC_CMD_HOST_EVENT_GET_B, distinct
+ * from the ACPI/SMI main copy) and clear the bits after seeing them, so they
+ * behave edge-triggered. Reading host events is a plain host command - it does
+ * NOT drain the key FIFO, so typing is safe.
+ */
+#define TW_POWEROFF_EVENTS  (EC_HOST_EVENT_MASK(EC_HOST_EVENT_POWER_BUTTON) | \
+			     EC_HOST_EVENT_MASK(EC_HOST_EVENT_LID_CLOSED))
+
+/* Clear the latched power-off host events (power button + lid closed). Called
+ * at editor start (so the press/lid-state that launched us doesn't fire an
+ * immediate poweroff) AND right before we attempt poweroff (so a stuck/latched
+ * event can't re-fire in a loop if the poweroff itself doesn't take, e.g. EL3). */
+static void tw_poweroff_events_clear(void)
+{
+	struct udevice *ec = tw_ec();
+
+	if (ec)
+		cros_ec_clear_host_events(ec, TW_POWEROFF_EVENTS);
+}
+
+/* Return 1 if a power-off trigger (power button pressed OR lid closed) fired
+ * since the last check (latched host event), else 0. Clears the latch so it's
+ * edge-triggered. Never touches the keyboard's MKBP FIFO, so it's safe to call
+ * in the key-wait loop. */
+static int tw_poweroff_event_pending(void)
+{
+	struct udevice *ec = tw_ec();
+	uint32_t events = 0;
+
+	if (!ec)
+		return 0;
+	if (cros_ec_get_host_events(ec, &events))
+		return 0;
+	if (!(events & TW_POWEROFF_EVENTS))
+		return 0;
+	cros_ec_clear_host_events(ec, TW_POWEROFF_EVENTS);  /* consume latch */
+	return 1;
+}
+#else
+static int tw_read_battery(void) { return TW_BATT_NO_EC; }
+static void tw_poweroff_events_clear(void) { }
+static int tw_poweroff_event_pending(void) { return 0; }
+#endif
+
 static int tw_save_before_exit(struct tw_state *s)
 {
 	if (s->writable && s->dirty && s->filename[0]) {
@@ -661,6 +913,13 @@ static void tw_boot(struct tw_state *s)
  */
 static void tw_poweroff(struct tw_state *s)
 {
+	/* 0. Consume the latched power-button / lid-closed host events NOW, before
+	 * we try to power off. If the poweroff doesn't actually take (e.g. PSCI is
+	 * unavailable at EL3), a still-latched event would otherwise re-fire
+	 * KEY_POWER_BTN on the next key-wait tick and loop. Clearing here makes it
+	 * a single attempt; the user can press again. */
+	tw_poweroff_events_clear();
+
 	/* 1. flush the document to disk if there's anything to save. */
 	if (tw_save_before_exit(s) != 0)
 		return;
@@ -690,9 +949,23 @@ static void tw_poweroff(struct tw_state *s)
 	 */
 	tw_render(s);         /* show the status before we go dark */
 	{
-		struct udevice *psci;
+		struct udevice *psci = NULL;
+		int probe, el;
 
-		uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci);
+		/* Probe the PSCI firmware driver: this reads the DT `method`
+		 * ("smc") and sets the conduit. It FAILS (returns -EINVAL) if we
+		 * run at EL3 - PSCI is a call UP to firmware, so from EL3 there's
+		 * nothing above to call. If poweroff does nothing, the EL shown
+		 * here is the first thing to check (need EL < 3, i.e. EL2/EL1). */
+		probe = uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci);
+		el = current_el();
+
+		if (probe || el == 3) {
+			tw_status(s, "[ Poweroff unavailable: EL%d probe=%d - "
+				     "need SYSRESET_PSCI + EL<3 ]", el, probe);
+			return;
+		}
+
 		disable_interrupts();
 		invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
 		enable_interrupts();
@@ -953,6 +1226,54 @@ static void tw_handle_key(struct tw_state *s, int key)
 
 	tw_snapshot(s, &snap);
 
+	/* Power-off trigger (power button pressed or lid closed): save + power
+	 * off (like ^Q -> Y), from any mode or prompt. Handled before all else. */
+	if (key == KEY_POWER_BTN) {
+		s->prompt = TW_PROMPT_NONE;
+		tw_poweroff(s);
+		return;
+	}
+
+	/* Periodic battery refresh: re-read the gauge, repaint the title bar only
+	 * if the displayed % changed. Doesn't touch mode/prompt/status - works in
+	 * any state, no flicker between updates. */
+	if (key == KEY_REFRESH) {
+		int b = tw_read_battery();
+
+		if (b != s->batt_pct) {
+			s->batt_pct = b;
+			s->dirty_title = 1;
+		}
+		return;
+	}
+
+	/* Enter power-saving: dim the backlight, flag it (title shows the mode),
+	 * and tell the wait loop to poll lazily. first_paint forces a full repaint
+	 * so ALL chrome bars pick up the black power-save background (not just the
+	 * title). */
+	if (key == KEY_PWRSAVE) {
+		if (!s->power_saving) {
+			s->power_saving = 1;
+			tw_backlight_dim();
+			tw_set_saving(1);
+			s->first_paint = 1;
+		}
+		return;
+	}
+
+	/* Wake from power-saving (the waking key was already swallowed): restore
+	 * brightness + normal polling, full repaint so the bars go back to gray.
+	 * Does NOT type. */
+	if (key == KEY_PWRSAVE_WAKE) {
+		if (s->power_saving) {
+			s->power_saving = 0;
+			tw_backlight_restore();
+			tw_set_saving(0);
+			s->first_paint = 1;
+		}
+		return;
+	}
+
 	if (s->prompt != TW_PROMPT_NONE) {
 		tw_prompt_key(s, key);
 		tw_mark_dirty(s, &snap);
@@ -971,6 +1292,16 @@ static void tw_handle_key(struct tw_state *s, int key)
 		return;
 	}
 
+	/* Brightness step works in any mode (before the composer, like ^Space).
+	 * ^- dims, ^= brightens, by TW_BACKLIGHT_STEP percent. */
+	if (key == KEY_CTRL_MINUS || key == KEY_CTRL_EQUAL) {
+		int v = tw_backlight_step(key == KEY_CTRL_EQUAL
+					  ? TW_BACKLIGHT_STEP : -TW_BACKLIGHT_STEP);
+		tw_status(s, "brightness %d%%", v);
+		tw_mark_dirty(s, &snap);
+		return;
+	}
+
 	/* Let the Wubi composer consume the key first (a-z, digits, space,
 	 * paging, backspace-while-composing, ...). */
 	if (tw_ime_key(s, key)) {
@@ -979,7 +1310,7 @@ static void tw_handle_key(struct tw_state *s, int key)
 	}
 
 	switch (key) {
-	case KEY_CTRL_O:
+	case KEY_CTRL_S:            /* save (one-handed) */
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;
 	case KEY_CTRL_R:            /* open a file: arrow-select picker */
@@ -1167,6 +1498,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	memset(s, 0, sizeof(*s));
+	s->batt_pct = -1;   /* unknown until the first poll (hides "0%" flash) */
 
 	/*
 	 * Writable unless the user forced `ro`, EXCEPT the eMMC (mmc 0:*) is
@@ -1201,9 +1533,13 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	tw_bind_ime(s);
-	tw_status(s, "[ Read %d line%s%s ]", s->num_lines,
+	tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
+	/* Show the exception level in the startup line: the event-stream WFE idle
+	 * (low power) only engages at EL>=2. EL2 = good; EL1 would mean the idle
+	 * loop is busy-spinning and power-saving isn't active. See POWERSAVE.md. */
+	tw_status(s, "[ Read %d line%s%s - EL%d ]", s->num_lines,
 		  s->num_lines == 1 ? "" : "s",
-		  s->writable ? "" : " - read-only");
+		  s->writable ? "" : " - read-only", current_el());
 
 	while (!s->quit) {
 		tw_render(s);
@@ -1227,9 +1563,10 @@ U_BOOT_CMD(
 	"  NOTE: mmc 0 (eMMC) is ALWAYS read-only - its FAT writes\n"
 	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
-	"  ^O write  ^R open (pick)  ^X exit  ^Q power off / boot OS  ^G help\n"
+	"  ^S save  ^R open (pick)  ^X exit  ^Q power off / boot OS  ^G help\n"
 	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  arrows/PgUp/PgDn move\n"
 	"  ^D del  ^W del-word-back  ^K kill-eol  ^Y yank\n"
+	"  ^- dim / ^] brighten backlight (20% steps)\n"
 	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"
 	"  1-9/Space commit, =/- page, Esc cancel"
 );

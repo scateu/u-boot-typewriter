@@ -16,20 +16,53 @@
  */
 #include <video.h>
 #include <video_console.h>
+#include <backlight.h>
+#include <panel.h>
 #include <dm.h>
 #include <stdio.h>
 #include <linux/string.h>
 #include "cmd_tw.h"
 #include "font_data.h"
 
-/* Black & white only: two packed native pixels. */
-static u32 C_FG, C_BG;
+/* Precomputed native-pixel colors. Text area is B/W (max contrast for reading);
+ * the chrome bars (title + bottom hints) use a muted gray so they don't grab
+ * attention. All packed once at init - drawing a colored bar costs the same as
+ * a white one.
+ *
+ * C_BAR/C_BARTX are the ACTIVE bar colors, selected each frame in tw_render:
+ * gray normally, or plain black in power-saving mode (a clear visual indicator
+ * that the screen is dimmed/idle). The two variants are precomputed. */
+static u32 C_FG, C_BG;              /* text area: white on black */
+static u32 C_BAR, C_BARTX;          /* active title/candidate bar colors */
+static u32 C_BAR_GRAY, C_BAR_SAVE;  /* bar bg: gray (normal) / black (saving) */
+static u32 C_HINT, C_HINT_GRAY;     /* bottom hint bar bg (a touch darker) */
 
 static struct udevice    *g_vdev;
 static struct video_priv *g_vp;
 static u8                *g_fb;
 static int                g_bpp;      /* bytes per pixel */
 static int                g_stride;   /* bytes per line */
+
+/*
+ * Panel backlight. On gru/kevin the backlight is driven by the ChromeOS EC PWM
+ * (CONFIG_PWM_CROS_EC); it comes up at full brightness, which is a big chunk of
+ * this board's idle draw. We default it lower and let ^- / ^= step it.
+ *
+ * There are two ways the brightness control is reachable, and which one exists
+ * depends on the DT/driver wiring:
+ *   - a standalone UCLASS_PANEL_BACKLIGHT device (backlight_set_brightness), or
+ *   - via the UCLASS_PANEL device that OWNS the backlight (panel_set_backlight),
+ *     which is how the rockchip eDP simple-panel exposes it on gru.
+ * We prefer the direct backlight device and fall back to the panel. Both are
+ * NULL if neither exists, in which case the setter is a silent no-op.
+ */
+static struct udevice    *g_backlight;   /* UCLASS_PANEL_BACKLIGHT, or NULL */
+static struct udevice    *g_panel;       /* UCLASS_PANEL owning it, or NULL */
+static int                g_brightness = TW_BACKLIGHT_DEFAULT;
+
+/* Defined later in this file; used by tw_video_init() to set the startup
+ * brightness before the definition appears. */
+int tw_backlight_set(int pct);
 
 /* Damaged-rectangle accumulator for this frame (in pixels). Reset each render;
  * reported to video_damage()/video_sync() so only changed area is flushed. */
@@ -50,20 +83,30 @@ static void damage(int x, int y, int w, int h)
 }
 
 /* Pack black/white into the framebuffer's native pixel (bpp/format correct). */
-static u32 tw_pack_bw(int white)
+/* Pack an 8-bit-per-channel RGB triple into the framebuffer's native pixel.
+ * Handles RGB565 (BPP16) and the two BPP32 orders; falls back to luma for odd
+ * formats. Precomputed once into the C_* colors, so this never runs in the hot
+ * path - a gray bar costs exactly the same as a white one. */
+static u32 tw_pack_rgb(u8 r, u8 g, u8 b)
 {
-	u8 v = white ? 0xff : 0x00;
-
 	switch (g_vp->bpix) {
-	case VIDEO_BPP16:
-		return white ? 0xffff : 0x0000;
+	case VIDEO_BPP16:   /* RGB565 */
+		return ((u32)(r & 0xf8) << 8) |
+		       ((u32)(g & 0xfc) << 3) |
+		       ((u32)(b) >> 3);
 	case VIDEO_BPP32:
 		if (g_vp->format == VIDEO_RGBA8888)
-			return white ? 0xffffffffu : 0x000000ffu;
-		return white ? 0x00ffffffu : 0x00000000u;
+			return ((u32)r << 24) | ((u32)g << 16) |
+			       ((u32)b << 8) | 0xff;
+		return ((u32)r << 16) | ((u32)g << 8) | (u32)b;   /* xRGB8888 */
 	default:
-		return (u32)v;
+		return (r + g + b) / 3;   /* luma-ish fallback */
 	}
+}
+
+static u32 tw_pack_bw(int white)
+{
+	return white ? tw_pack_rgb(0xff, 0xff, 0xff) : tw_pack_rgb(0, 0, 0);
 }
 
 /* Fill a pixel rectangle with a native color. Clips once to the screen, then
@@ -192,32 +235,47 @@ static void tw_wrap_pos(struct tw_state *s, int fr, int cc, int *out_row,
 /*
  * Draw one glyph at pixel (px,py), scaled by TW_SCALE, fg on bg. Returns the
  * cell width in *unscaled* px (8 or 16) so callers can advance columns. The
- * background is painted first (one fill_rect), then set foreground pixels are
- * written as TW_SCALE x TW_SCALE blocks. Returns the unscaled advance.
+ * background is painted first (one fill_rect), then the set foreground pixels.
+ *
+ * Speed: rather than one fill_rect per pixel (up to 256 tiny calls for a 16x16
+ * hanzi - the source of candidate-bar lag), we coalesce consecutive set bits in
+ * each row into a single wide fill_rect. A solid N-pixel stroke becomes one call
+ * instead of N. The whole row's bits (8 or 16 wide) go into one mask so runs
+ * that cross the left/right byte boundary of a wide glyph merge too.
  */
 static int draw_glyph(int px, int py, u32 cp, u32 fg, u32 bg)
 {
 	const struct tw_glyph *g = find_glyph(cp);
 	int w = g ? g->width : TW_CELL_W;         /* unscaled cell width */
-	int row, bit;
+	int row, col;
 
 	fill_rect(px, py, w * TW_SCALE, TW_GLYPH_H * TW_SCALE, bg);
 	if (!g)
 		return w;
 
 	for (row = 0; row < TW_GLYPH_H; row++) {
-		u8 left  = g->rows[row * 2 + 0];
-		u8 right = g->rows[row * 2 + 1];
+		/* Row bits, bit 15 (0x8000) = leftmost pixel. Wide glyphs use
+		 * both bytes (cols 0..15); narrow only the left byte (cols 0..7,
+		 * and the loop stops at w=8 so the low byte is never examined). */
+		unsigned int bits = (unsigned int)g->rows[row * 2 + 0] << 8;
 
-		for (bit = 0; bit < 8; bit++) {
-			if (left & (0x80 >> bit))
-				fill_rect(px + bit * TW_SCALE,
-					  py + row * TW_SCALE,
-					  TW_SCALE, TW_SCALE, fg);
-			if (w == 16 && (right & (0x80 >> bit)))
-				fill_rect(px + (8 + bit) * TW_SCALE,
-					  py + row * TW_SCALE,
-					  TW_SCALE, TW_SCALE, fg);
+		if (w == 16)
+			bits |= g->rows[row * 2 + 1];
+
+		/* Emit one fill_rect per horizontal run of set bits. */
+		col = 0;
+		while (col < w) {
+			int start;
+
+			if (!(bits & (0x8000 >> col))) {   /* pixel clear */
+				col++;
+				continue;
+			}
+			start = col;
+			while (col < w && (bits & (0x8000 >> col)))
+				col++;                     /* extend the run */
+			fill_rect(px + start * TW_SCALE, py + row * TW_SCALE,
+				  (col - start) * TW_SCALE, TW_SCALE, fg);
 		}
 	}
 	return w;
@@ -285,6 +343,12 @@ int tw_video_init(struct tw_state *s)
 
 	C_FG = tw_pack_bw(1);   /* white text */
 	C_BG = tw_pack_bw(0);   /* black background */
+	C_BAR_GRAY  = tw_pack_rgb(0x60, 0x60, 0x60); /* normal: muted gray bars */
+	C_BAR_SAVE  = tw_pack_bw(0);                 /* power-save: black bars */
+	C_HINT_GRAY = tw_pack_rgb(0x48, 0x48, 0x48); /* hint bar: a touch darker */
+	C_BARTX     = tw_pack_rgb(0xd0, 0xd0, 0xd0); /* light-gray text on bars */
+	C_BAR       = C_BAR_GRAY;                     /* active bg (set per frame) */
+	C_HINT      = C_HINT_GRAY;
 
 	/* Geometry (all in scaled px): title (1 row) + text area + candidate
 	 * bar (1) + hints (2). Text area fills the screen edge to edge. */
@@ -305,24 +369,99 @@ int tw_video_init(struct tw_state *s)
 	s->dirty_all = 1;
 	s->dirty_bar = 1;
 	s->dirty_title = 1;
+
+	/* Bring the backlight to our (dimmer) default. Best-effort: prefer a
+	 * standalone backlight device, else the panel that owns it. A board with
+	 * neither just keeps whatever brightness it booted with. */
+	if (uclass_first_device_err(UCLASS_PANEL_BACKLIGHT, &g_backlight))
+		g_backlight = NULL;
+	if (!g_backlight &&
+	    uclass_first_device_err(UCLASS_PANEL, &g_panel))
+		g_panel = NULL;
+	tw_backlight_set(TW_BACKLIGHT_DEFAULT);
 	return 0;
 }
 
+/*
+ * Set panel brightness to a percentage and return the value actually applied.
+ *
+ * IMPORTANT: we clamp to a NONZERO minimum (TW_BACKLIGHT_MIN) and NEVER use
+ * BACKLIGHT_OFF. On this board, driving the backlight to 0 / OFF powers the PWM
+ * (and its regulator) fully down, which froze the board hard - the display went
+ * black and even ^Q was dead. So dimming bottoms out at a dim-but-alive level
+ * and always keeps the panel enabled. No-op if there's no controllable
+ * backlight device.
+ */
+/* Write the panel brightness (clamped) WITHOUT changing the remembered user
+ * level g_brightness. Used both by the normal setter and by power-save dimming
+ * (which must not clobber the level to restore). */
+static void tw_backlight_apply(int pct)
+{
+	if (pct < TW_BACKLIGHT_MIN)
+		pct = TW_BACKLIGHT_MIN;
+	if (pct > 100)
+		pct = 100;
+	if (g_backlight)
+		backlight_set_brightness(g_backlight, pct);
+	else if (g_panel)
+		panel_set_backlight(g_panel, pct);
+}
+
+int tw_backlight_set(int pct)
+{
+	if (pct < TW_BACKLIGHT_MIN)
+		pct = TW_BACKLIGHT_MIN;
+	if (pct > 100)
+		pct = 100;
+	g_brightness = pct;
+	tw_backlight_apply(pct);
+	return g_brightness;
+}
+
+/* Step brightness by delta (typically +/-20) and return the applied value. */
+int tw_backlight_step(int delta)
+{
+	return tw_backlight_set(g_brightness + delta);
+}
+
+/* Power-save: dim to the minimum without forgetting the user's level. */
+void tw_backlight_dim(void)
+{
+	tw_backlight_apply(TW_BACKLIGHT_MIN);
+}
+
+/* Power-save wake: restore the user's remembered brightness level. */
+void tw_backlight_restore(void)
+{
+	tw_backlight_apply(g_brightness);
+}
+
 /* --------------------------------------------------------------- chrome -- */
-/* Reverse video (white bar, black text) for title/bar/hints. */
+/* Muted-gray chrome bars (title/candidate/hints): light text on dark gray, so
+ * they recede vs. the black-on-white text area. */
 static void draw_title(struct tw_state *s)
 {
 	char line[128];
 	int x;
 
-	fill_rect(0, 0, s->fb_w, TW_ROW_PX, C_FG);   /* white bar */
-	snprintf(line, sizeof(line), " typewriter    %s%s",
+	fill_rect(0, 0, s->fb_w, TW_ROW_PX, C_BAR);   /* gray bar */
+	snprintf(line, sizeof(line), " typewriter    %s%s%s",
 		 s->filename[0] ? s->filename : "[ New Buffer ]",
-		 s->dirty ? "    Modified" : "");
-	draw_str(TW_CELL_PX, 0, line, C_BG, C_FG);
+		 s->dirty ? "    Modified" : "",
+		 s->power_saving ? "    [power saving]" : "");
+	draw_str(TW_CELL_PX, 0, line, C_BARTX, C_BAR);
+
+	/* Right side: battery % (if known) then the IME chip. Battery is polled
+	 * on a timer (see cmd_tw.c) into s->batt_pct; >= 0 is a percentage,
+	 * negative means unavailable (hidden). */
 	x = s->fb_w - 7 * TW_CELL_PX;
 	draw_str(x, 0, s->ime.mode == TW_IME_WUBI ? "[Wubi]" : "[ En ]",
-		 C_BG, C_FG);
+		 C_BARTX, C_BAR);
+	if (s->batt_pct >= 0) {
+		snprintf(line, sizeof(line), "BAT: %d%%", s->batt_pct);
+		draw_str(x - (int)(strlen(line) + 1) * TW_CELL_PX, 0,
+			 line, C_BARTX, C_BAR);
+	}
 }
 
 /* Clear one screen row's band to background. */
@@ -441,7 +580,7 @@ static void draw_bar(struct tw_state *s)
 	struct tw_ime *im = &s->ime;
 	int x, shown, i;
 
-	fill_rect(0, s->bar_y, s->fb_w, TW_ROW_PX, C_FG);   /* white bar */
+	fill_rect(0, s->bar_y, s->fb_w, TW_ROW_PX, C_BAR);   /* gray bar */
 
 	if (s->prompt == TW_PROMPT_PICK) {
 		char hint[80];
@@ -449,14 +588,14 @@ static void draw_bar(struct tw_state *s)
 		snprintf(hint, sizeof(hint),
 			 " Open file  [%d/%d]  Up/Dn select  Enter open  Esc cancel ",
 			 s->pick_count ? s->pick_sel + 1 : 0, s->pick_count);
-		draw_str(0, s->bar_y, hint, C_BG, C_FG);
+		draw_str(0, s->bar_y, hint, C_BARTX, C_BAR);
 		return;
 	}
 
 	if (s->prompt == TW_PROMPT_POWEROFF) {
 		draw_str(0, s->bar_y,
 			 " Save &...  Y) power off   B) boot OS   N) cancel ",
-			 C_BG, C_FG);
+			 C_BARTX, C_BAR);
 		return;
 	}
 
@@ -466,36 +605,36 @@ static void draw_bar(struct tw_state *s)
 			s->prompt == TW_PROMPT_OPEN   ? " File to open: " :
 			s->prompt == TW_PROMPT_SEARCH ? " Search: " :
 			" Save modified buffer?  Y)es  N)o  C)ancel ";
-		x = draw_str(0, s->bar_y, label, C_BG, C_FG);
-		x = draw_str(x, s->bar_y, s->prompt_ans, C_BG, C_FG);
+		x = draw_str(0, s->bar_y, label, C_BARTX, C_BAR);
+		x = draw_str(x, s->bar_y, s->prompt_ans, C_BARTX, C_BAR);
 		if (s->prompt != TW_PROMPT_EXIT)
-			fill_rect(x, s->bar_y, 2 * TW_SCALE, TW_ROW_PX, C_BG);
+			fill_rect(x, s->bar_y, 2 * TW_SCALE, TW_ROW_PX, C_BARTX);
 		return;
 	}
 
 	if (s->status_msg[0]) {
-		draw_str(TW_CELL_PX, s->bar_y, s->status_msg, C_BG, C_FG);
+		draw_str(TW_CELL_PX, s->bar_y, s->status_msg, C_BARTX, C_BAR);
 		return;
 	}
 
 	/* Mode chip. The Wubi tag contains the hanzi 五 (U+4E94, UTF-8
 	 * e4 ba 94), which is multibyte - draw it with draw_word (UTF-8 aware),
 	 * NOT draw_str (byte-per-glyph), or the hanzi renders as blank cells and
-	 * vanishes into the white bar. [En] is ASCII so either works. */
+	 * vanishes into the bar. [En] is ASCII so either works. */
 	if (im->mode == TW_IME_WUBI) {
 		const char tag[] = "[\344\272\224]";   /* [五] */
 
 		x = draw_word(TW_CELL_PX, s->bar_y, tag, sizeof(tag) - 1,
-			      C_BG, C_FG);
+			      C_BARTX, C_BAR);
 	} else {
-		x = draw_str(TW_CELL_PX, s->bar_y, "[En]", C_BG, C_FG);
+		x = draw_str(TW_CELL_PX, s->bar_y, "[En]", C_BARTX, C_BAR);
 	}
 	x += TW_CELL_PX;
 
 	if (im->mode != TW_IME_WUBI || im->code_len == 0)
 		return;
 
-	x = draw_str(x, s->bar_y, im->code, C_BG, C_FG);
+	x = draw_str(x, s->bar_y, im->code, C_BARTX, C_BAR);
 	x += TW_CELL_PX;
 
 	for (shown = 0, i = im->page; i < im->ncand && shown < TW_PAGE;
@@ -505,9 +644,9 @@ static void draw_bar(struct tw_state *s)
 		num[0] = '1' + shown;
 		num[1] = '.';
 		num[2] = '\0';
-		x = draw_str(x, s->bar_y, num, C_BG, C_FG);
+		x = draw_str(x, s->bar_y, num, C_BARTX, C_BAR);
 		x = draw_word(x, s->bar_y, im->cand[i].word,
-			      im->cand[i].word_len, C_BG, C_FG);
+			      im->cand[i].word_len, C_BARTX, C_BAR);
 		x += TW_CELL_PX;
 		if (x > s->fb_w - 4 * TW_CELL_PX)
 			break;
@@ -519,20 +658,51 @@ static void draw_bar(struct tw_state *s)
 
 		snprintf(ind, sizeof(ind), "(%d/%d)",
 			 im->page / TW_PAGE + 1, pages);
-		draw_str(s->fb_w - 8 * TW_CELL_PX, s->bar_y, ind, C_BG, C_FG);
+		draw_str(s->fb_w - 8 * TW_CELL_PX, s->bar_y, ind, C_BARTX, C_BAR);
 	}
 }
 
+/*
+ * Two-row shortcut hint bar, Nano-style and grid-aligned. Each cell is a
+ * {key, desc} pair drawn at a fixed column x, so keys line up in one sub-column
+ * and descriptions in another, across both rows. Only the KEY carries a colored
+ * (inverse-video) block; the description sits on the plain hint-bar background.
+ * The hint bar bg (C_HINT) is a touch darker than the title/candidate bar.
+ */
+#define TW_HINT_COLS   6
+#define TW_HINT_COL    16    /* full cell width, in character cells */
+#define TW_HINT_KEYW   6     /* key sub-column width (chars) before the desc */
 static void draw_hints(struct tw_state *s)
 {
-	static const char *row1 =
-		" ^O Write  ^R Open  ^K Kill  ^Y Yank  ^W DelWord  ^Spc Wubi ";
-	static const char *row2 =
-		" ^X Exit  ^Q PowerOff  ^A/^E BOL/EOL  ^B/^F ^P/^N  ^D Del ";
+	struct hint { const char *key, *desc; };
+	static const struct hint row1[TW_HINT_COLS] = {
+		{"^S", "Save"},  {"^A/^E", "BOL/EOL"}, {"^B/^F", "back/fwd"},
+		{"^K", "Kill"},  {"^W", "DelWord"},    {"^Spc", "Wubi"},
+	};
+	static const struct hint row2[TW_HINT_COLS] = {
+		{"^X", "Exit"},  {"^R", "Open"},       {"^P/^N", "prev/next"},
+		{"^D", "Del"},   {"^-/^]", "Bright"},  {"^Q", "PowerOff"},
+	};
+	const struct hint *rows[2] = { row1, row2 };
+	int r, c;
 
-	fill_rect(0, s->hint_y, s->fb_w, 2 * TW_ROW_PX, C_FG);  /* white */
-	draw_str(TW_CELL_PX, s->hint_y, row1, C_BG, C_FG);
-	draw_str(TW_CELL_PX, s->hint_y + TW_ROW_PX, row2, C_BG, C_FG);
+	fill_rect(0, s->hint_y, s->fb_w, 2 * TW_ROW_PX, C_HINT);
+	for (r = 0; r < 2; r++) {
+		int py = s->hint_y + r * TW_ROW_PX;
+
+		for (c = 0; c < TW_HINT_COLS; c++) {
+			const struct hint *h = &rows[r][c];
+			int kx = TW_CELL_PX + c * TW_HINT_COL * TW_CELL_PX;
+			int dx = kx + TW_HINT_KEYW * TW_CELL_PX;
+
+			if (kx > s->fb_w - TW_CELL_PX)
+				break;                 /* off the right edge */
+			/* Key: inverse video (light block, dark text) so it pops. */
+			draw_str(kx, py, h->key, C_HINT, C_BARTX);
+			/* Description: normal text on the plain bar bg. */
+			draw_str(dx, py, h->desc, C_BARTX, C_HINT);
+		}
+	}
 }
 
 /*
@@ -588,6 +758,12 @@ void tw_render(struct tw_state *s)
 
 	d_any = 0;   /* reset per-frame damage */
 
+	/* Chrome bar backgrounds: black in power-saving mode (a clear "dimmed/idle"
+	 * indicator), otherwise gray - with the bottom hint bar a shade darker than
+	 * the title/candidate bar. Set before any chrome is drawn this frame. */
+	C_BAR  = s->power_saving ? C_BAR_SAVE : C_BAR_GRAY;
+	C_HINT = s->power_saving ? C_BAR_SAVE : C_HINT_GRAY;
+
 	if (s->first_paint) {
 		fill_rect(0, 0, s->fb_w, s->fb_h, C_BG);
 		draw_hints(s);
@@ -614,18 +790,30 @@ void tw_render(struct tw_state *s)
 			draw_text(s);
 		} else if (s->dirty_all) {
 			/*
-			 * An edit. Repaint ONLY from the cursor's logical line
-			 * downward - this covers a reflow of the lines below it
-			 * (wrap) while leaving every row ABOVE the cursor line
-			 * untouched. No area-wide clear => no per-keystroke
-			 * flash. In the common case (typing within a line that
-			 * doesn't re-wrap) this repaints a single row.
+			 * An edit. Repaint from the FIRST logical line the edit
+			 * could have touched, downward - covering a reflow of the
+			 * lines below (wrap) while leaving rows ABOVE untouched.
+			 * No area-wide clear => no per-keystroke flash.
+			 *
+			 * The start line is min(last_cur_row, cur_row): a plain
+			 * in-line edit keeps cur_row == last_cur_row (one row);
+			 * but a newline SPLIT moves cur_row DOWN to the new line
+			 * while the line that was split (last_cur_row, above) also
+			 * changed - starting at cur_row would leave that split
+			 * line showing stale text (e.g. "abc" duplicated onto both
+			 * halves). A backspace-JOIN moves cur_row UP, so cur_row is
+			 * already the earlier one. Take the min to cover both.
 			 */
-			int sr = tw_line_screen_row(s, s->cur_row);
+			int fr0 = s->cur_row < s->last_cur_row
+				  ? s->cur_row : s->last_cur_row;
+			int sr;
 
+			if (fr0 < s->scroll_top)
+				fr0 = s->scroll_top;   /* clamp above the viewport */
+			sr = tw_line_screen_row(s, fr0);
 			if (sr < 0)
 				sr = 0;
-			draw_text_from(s, sr, s->cur_row);
+			draw_text_from(s, sr, fr0);
 		} else if (s->last_cur_row != s->cur_row ||
 			   s->last_cur_col != s->cur_col) {
 			/* pure cursor move: erase old caret, no clear */

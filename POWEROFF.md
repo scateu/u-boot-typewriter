@@ -107,6 +107,113 @@ belt-and-braces).
   If nothing bootable is found it returns to the editor.
 - **N** / Esc — cancel.
 
+The **physical power button** does the same as **Y** (save + power off), from any
+mode or prompt — see below.
+
+---
+
+## Power button & lid-close in the editor  ✅ CONFIRMED WORKING
+
+Goal: pressing the laptop's power button **or closing the lid** while in the
+typewriter saves and powers off, instead of doing nothing (or a hard EC cutoff).
+**Verified on gru/kevin: a short press of the physical power button saves the
+buffer and powers the board off, and typing is unaffected.** Lid-close uses the
+same mechanism (`EC_HOST_EVENT_LID_CLOSED`).
+
+### The wrong way (don't): polling the MKBP event queue
+
+The obvious approach is `cros_ec_get_next_event()` in the key-wait loop, checking
+for `EC_MKBP_EVENT_BUTTON`. **This breaks the keyboard.** On gru/kevin the
+keyboard is *also* a cros_ec (`CROS_EC_KEYB`); its read path
+(`cros_ec_kbc_check` → `check_for_keys`) pulls from the **same MKBP event FIFO**
+and discards everything that isn't a key-matrix scan. So:
+
+- polling the FIFO ourselves races the keyboard and **steals/reorders keystrokes**
+  (observed: backspace repeats and deletes many chars, keys go missing); and
+- the keyboard driver **silently eats button events** anyway, so we'd rarely see
+  one even if we won the race.
+
+### The right way: EC host-event flags
+
+The EC also exposes a **latched host-event bitmask** — a separate channel the
+keyboard driver never touches. The power button latches
+`EC_HOST_EVENT_POWER_BUTTON` and closing the lid latches
+`EC_HOST_EVENT_LID_CLOSED`. We poll both (`TW_POWEROFF_EVENTS`) with
+`cros_ec_get_host_events()` (which reads the **B copy**, `EC_CMD_HOST_EVENT_GET_B`,
+distinct from the ACPI/SMI main copy) and clear the bits after seeing them, so
+they're edge-triggered. Reading host events is a normal host command — it does
+**not** drain the key FIFO, so typing is unaffected.
+
+Implementation (all in `cmd_tw.c`, under `#if CONFIG_IS_ENABLED(CROS_EC)`):
+`tw_poweroff_events_clear()` clears the latches at editor start (so the
+press/keystroke that launched us — or the lid already being where it is — doesn't
+fire an instant power-off); `tw_poweroff_event_pending()` polls + clears them each
+key-wait tick; a hit returns a synthetic `KEY_POWER_BTN` handled exactly like
+`^Q` → Y.
+
+`tw_poweroff()` **also** calls `tw_poweroff_events_clear()` first thing, before it
+even saves. Why: these are *latched* flags, and if the poweroff doesn't actually
+happen (PSCI unavailable at EL3, or the save fails and we return), a still-set
+latch would re-fire `KEY_POWER_BTN` on the very next key-wait tick and spin.
+Clearing up front makes each trigger a single attempt — press (or close the lid)
+again to retry.
+
+---
+
+## Battery % (title bar) — and why it needed a private EC command path
+
+The **title bar** shows the battery percentage (near the `[En]`/`[Wubi]` chip).
+It's polled from the EC on a timer — every `TW_BATT_POLL_MS` (30 s), the key-wait
+loop returns a synthetic `KEY_REFRESH`; the handler re-reads the gauge and
+repaints the title **only if the % changed** (no flicker between updates). One EC
+SPI command per 30 s is immeasurable drain. Getting the read working hit two EC
+quirks worth recording:
+
+1. **U-Boot's `cros_ec_read_batt_charge()` is buggy.** It does `if (ret) return
+   ret`, but `ret` is `ec_command()`'s **byte count** (positive on success), not
+   an error — so a good read is reported as e.g. `-20`. Every *other* caller in
+   `cros_ec.c` checks `if (ret != sizeof(resp))` / `if (ret < 0)`; this one got
+   it wrong.
+
+2. **The EC speaks protocol v3.** The obvious workaround — call the transport op
+   `dm_cros_ec_get_ops(ec)->command` directly — only implements **v2** and returns
+   `-1` on a v3 EC. The correct v3 framing (`send_command_proto3`,
+   `create_proto3_request`, `handle_proto3_response`) is all **static** in
+   `cros_ec.c`; there is no public raw-command entry point.
+
+Rather than patch U-Boot core, the typewriter reimplements the v3 transaction in
+`tw_ec_command()` (`cmd_tw.c`), built only on **public** pieces: `struct
+cros_ec_dev` (its `din`/`dout` buffers) via `dev_get_uclass_priv()`, the transport
+`->packet` op, `cros_ec_calc_checksum()`, and the `ec_host_request`/
+`ec_host_response` structs. It builds the 8-byte request header + checksum, calls
+`->packet`, validates the response header/checksum, and returns the payload. Falls
+back to the v2 `->command` op if the EC isn't v3. This keeps all Chromebook-EC
+specifics inside the typewriter — U-Boot is untouched.
+
+---
+
+## A config trap: `SYSRESET_PSCI` breaks the SPL/TPL link
+
+The shell `poweroff` command needs a `UCLASS_SYSRESET` provider, which comes from
+`CONFIG_SYSRESET_PSCI=y`. **But enabling it broke the libreboot build:**
+
+```
+sysreset_psci.c: undefined reference to `psci_sys_reset' / `psci_sys_poweroff'
+make: *** [tpl/u-boot-tpl] Error
+```
+
+Why: `psci.o` (which defines those symbols) is built per-phase, gated by
+`CONFIG_$(PHASE_)ARM_PSCI_FW`. `SYSRESET_PSCI` `select`s `SPL_ARM_PSCI_FW` for SPL
+but there is **no `TPL_ARM_PSCI_FW` symbol at all** — yet this config has
+`TPL_SYSRESET=y`, so `sysreset_psci.o` gets compiled into TPL with no backend →
+undefined reference. TPL/SPL never power off, so this is pure collateral damage.
+
+**We don't use shell `poweroff` here** (the editor's `^Q`/power-button path calls
+`invoke_psci_fn` directly, no sysreset uclass needed), so the fix is simply to
+**leave `CONFIG_SYSRESET_PSCI` off**. If you ever do want the shell command, also
+turn off `SPL_SYSRESET`/`TPL_SYSRESET` so `SYSRESET_PSCI` only lands in main
+U-Boot.
+
 ---
 
 ## Debugging
@@ -128,16 +235,27 @@ If `^Q` (or `poweroff`) doesn't power off:
    => dm tree
    ```
    `firmware 0 [ ] psci` (empty brackets) = bound-but-unprobed → the conduit
-   was never set. The explicit probe in `^Q` handles this. U-Boot's builtin
-   `poweroff` would instead need `CONFIG_SYSRESET_PSCI=y` to get it probed.
+   was never set. The explicit probe in `^Q` handles this.
 
-3. **Does the builtin `poweroff` work?** With the node present and
-   `CONFIG_SYSRESET_PSCI=y`, `=> poweroff` should power the board off — a quick
-   way to confirm the PSCI path independent of the editor.
+3. **What exception level are we at?** PSCI is a call *up* to firmware, so it
+   only works from **EL2 or EL1** — from **EL3** `psci_probe()` bails with
+   `-EINVAL` (nothing above EL3 to SMC into) and every call is a no-op. `^Q` now
+   prints this on failure:
+   ```
+   [ Poweroff unavailable: EL3 probe=-22 - need SYSRESET_PSCI + EL<3 ]
+   ```
+   If you see `EL3`, that's the problem — U-Boot must be entered below EL3 (it
+   normally is on this board via coreboot's bl31; a change there can regress it).
+   `probe=` is the return of the driver probe (0 = ok).
 
 4. **Wake behaviour.** PSCI `SYSTEM_OFF` is a normal system-off — the **power
    button turns the board back on**. (This is unlike an EC "ship mode" battery
    cutoff, which would wake only on AC.)
+
+> Note: the builtin shell `poweroff` is **not** used here and `CONFIG_SYSRESET_PSCI`
+> is intentionally left **off** (it breaks the SPL/TPL link on this config — see
+> "A config trap" above). The editor's `^Q`/power-button path calls
+> `invoke_psci_fn` directly and needs no sysreset provider.
 
 ---
 

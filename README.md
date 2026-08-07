@@ -13,16 +13,16 @@ renders correctly on the device's own screen.
 Target tree: **U-Boot 2026.07**.
 
 ```
-+--------------------------------------------------------------+
-| typewriter    /notes.txt    Modified                  [Wubi] |  title bar
-|                                                              |
-|  你好，世界                                                  |  text area
-|  boot config: setenv bootargs ...                            |  (hanzi = 2 cols)
-|                                                              |
-| [五] wq  1.你 2.低 3.父荫 4.仰卧 …                    (1/2)  |  candidate bar
-| ^O Write  ^R Open  ^K Kill  ^Y Yank  ^W DelWord  ^Spc Wubi   |  shortcut hints
-| ^X Exit  ^A/^E BOL/EOL  ^B/^F ^P/^N move  ^D Del  arrows     |
-+--------------------------------------------------------------+
++------------------------------------------------------------------------+
+| typewriter    /notes.txt    Modified                    BAT: 68% [En]  |  title bar (gray)
+|                                                                        |
+|  你好，世界                                                            |  text area (B/W)
+|  boot config: setenv bootargs ...                                      |  (hanzi = 2 cols)
+|                                                                        |
+| [五] wq  1.你 2.低 3.父荫 4.仰卧 …                              (1/2)  |  candidate bar (gray)
+| ^S Save         ^A/^E BOL/EOL   ^B/^F ^P/^N mv  ^K Kill  ^W DelWord  … |  hints, aligned
+| ^X Exit         ^R Open         ^Y Yank         ^D Del  ^-/^] Bright  … |  columns (gray)
++------------------------------------------------------------------------+
 ```
 
 ## Why a framebuffer (and not the serial console)
@@ -194,7 +194,7 @@ hidden.
 => typewriter usb 0:1 /boot/uEnv.txt fat
 ```
 
-Opens an empty buffer if the file does not exist; `^O` creates it.
+Opens an empty buffer if the file does not exist; `^S` creates it.
 
 ## Keys
 
@@ -216,7 +216,7 @@ Modeless, readline-style — typing inserts text; Ctrl/Meta chords are commands.
 | `^W` | delete word backward |
 | `^K` | kill from cursor to end of line |
 | `^Y` | yank (paste the kill buffer) |
-| `^O` | write out (save) — prompts for filename |
+| `^S` | save — prompts for filename |
 | `^R` | open a file — **picker**: lists files (`fatls`-style), `↑`/`↓` select, `Enter` open, `Esc` cancel (auto-saves current) |
 | `^X` | exit — if modified & writable, asks Y/N/C |
 | `^Q` | save + sync, then **Y)** power off (PSCI), **B)** boot the OS, **N)** cancel — see [POWEROFF.md](POWEROFF.md) |

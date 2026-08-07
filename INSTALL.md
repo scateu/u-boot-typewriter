@@ -37,7 +37,7 @@ rm -f elf/u-boot/default/gru_kevin/default/*   # force coreboot to re-pull u-boo
 ```
 
 Then on the device: it boots into `typewriter`, editing `a.txt` on the
-**microSD** (`mmc 1:1`). Type, `^O` to save. Save to the **microSD, not the
+**microSD** (`mmc 1:1`). Type, `^S` to save. Save to the **microSD, not the
 eMMC** (see section 6).
 
 ---
@@ -124,7 +124,7 @@ CONFIG_BOOTCOMMAND="typewriter mmc 1:1 a.txt"
 - `mmc 1:1` = the **microSD**, first partition — the writable card.
 - Bare `typewriter` (no args) already defaults to `mmc 1:1 a.txt`, so
   `CONFIG_BOOTCOMMAND="typewriter"` is equivalent.
-- typewriter opens **writable** on the microSD; type and `^O` to save. On the
+- typewriter opens **writable** on the microSD; type and `^S` to save. On the
   eMMC it would open read-only (section 6).
 
 For reference, libreboot's stock boot commands look like one of:
@@ -266,7 +266,7 @@ On boot you get a full-screen editor. Default input is **English `[En]`**; press
 candidate with `1`–`9`/Space.
 
 File keys:
-- `^O` — write out (save) to the current file.
+- `^S` — save to the current file (prompts for filename).
 - `^R` — open a file: shows a list of files on the current device; `↑`/`↓` to
   select, `Enter` to open, `Esc` to cancel. Auto-saves the current buffer first.
 - `^X` — exit.

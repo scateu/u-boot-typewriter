@@ -35,6 +35,12 @@
 #define TW_CELL_PX       (TW_CELL_W * TW_SCALE)   /* narrow cell width, px */
 #define TW_ROW_PX        (TW_GLYPH_H * TW_SCALE)  /* cell height, px */
 
+/* Panel backlight (see cmd_tw_video.c). It comes up full-bright on gru/kevin,
+ * which dominates idle power; default lower and step it with ^- / ^=. */
+#define TW_BACKLIGHT_DEFAULT 40      /* percent set on startup */
+#define TW_BACKLIGHT_STEP    20      /* percent per ^- / ^= press */
+#define TW_BACKLIGHT_MIN     20      /* never dim below this - 0/OFF freezes it */
+
 /* File I/O scratch is malloc()'d at runtime (see cmd_tw_fs.c) - NOT staged at
  * a fixed CONFIG_SYS_LOAD_ADDR, which on this board overlaps U-Boot's own DRAM
  * image + heap and corrupted the FAT partition.
@@ -64,14 +70,21 @@
 #define KEY_CTRL_G    0x07       /* help */
 #define KEY_CTRL_K    0x0B       /* kill to end of line */
 #define KEY_CTRL_N    0x0E       /* next line */
-#define KEY_CTRL_O    0x0F       /* write out (save) */
 #define KEY_CTRL_P    0x10       /* previous line */
 #define KEY_CTRL_Q    0x11       /* power off (save+sync+EC hibernate), confirmed */
+#define KEY_CTRL_S    0x13       /* save (one-handed; replaced ^O write-out) */
 #define KEY_CTRL_R    0x12       /* open file (read into buffer) */
 #define KEY_CTRL_W    0x17       /* delete word backward */
 #define KEY_CTRL_X    0x18       /* exit */
 #define KEY_CTRL_Y    0x19       /* yank (paste kill buffer) */
 #define KEY_CTRL_SPACE 0x00      /* Ctrl-Space (a.k.a. Ctrl-@): toggle Wubi/En */
+
+/* Brightness. Ctrl chording punctuation is keymap-dependent. On this board's
+ * cros_ec keyboard, VERIFIED: Ctrl-'-' emits 0x1F (= Ctrl-'_') and Ctrl-']'
+ * emits 0x1D. Ctrl-'=' does NOT emit a control byte (it types a literal '='),
+ * so the "brighten" key is Ctrl-']', not Ctrl-'='. */
+#define KEY_CTRL_MINUS 0x1F      /* Ctrl-'-' : brightness DOWN one step */
+#define KEY_CTRL_EQUAL 0x1D      /* Ctrl-']' : brightness UP one step */
 
 /* Extended keys (> 0xFF), parsed from ANSI arrow/nav escape sequences and from
  * Meta (Alt) chords, which arrive as ESC followed by the key. */
@@ -86,6 +99,37 @@
 #define KEY_DELETE      0x202
 /* Meta (Alt) chords. NOTE: Meta keys do not work on the target hardware; these
  * are kept wired but dormant. File switching is via the ^R picker instead. */
+/* Synthetic key: an EC power-off trigger fired - the power button was pressed
+ * OR the lid was closed (detected via host-event flags in the key-wait loop,
+ * not a real console byte). Dispatched like ^Q -> Y: save + power off. */
+#define KEY_POWER_BTN   0x220
+
+/* Synthetic key: the periodic battery-poll timer elapsed. Not a real byte;
+ * the handler re-reads the gauge and repaints the title bar if the % changed. */
+#define KEY_REFRESH     0x221
+#define TW_BATT_POLL_MS 30000    /* battery re-read interval (ms) */
+
+/* Synthetic keys for power-saving mode (see cmd_tw.c). KEY_PWRSAVE fires when
+ * the idle timer trips (dim + go lazy); KEY_PWRSAVE_WAKE is the swallowed key
+ * that woke us (restore brightness + speed, but don't type it). */
+#define KEY_PWRSAVE      0x222
+#define KEY_PWRSAVE_WAKE 0x223
+
+/* Idle-loop tuning (power). TW_KEY_NAP_MS is one WFE nap = worst-case keystroke
+ * latency (imperceptible). TW_EC_POLL_MS throttles the EC host-event SPI poll
+ * (power button / lid) - human reaction time is ~150 ms, so 200 ms is plenty
+ * and cuts EC bus traffic vs. polling every nap. See POWERSAVE.md. */
+#define TW_KEY_NAP_MS   25       /* WFE nap length per idle iteration (ms) */
+#define TW_EC_POLL_MS   200      /* EC power-button/lid poll interval (ms) */
+
+/* Power-saving mode: after TW_IDLE_SAVE_MS of no keystroke, dim the backlight,
+ * show [power saving] in the title, and switch to lazy polling (TW_SAVE_NAP_MS)
+ * so the core/EC are nearly idle. Any key wakes (the wake key is swallowed).
+ * Sacrifices only the first keystroke's latency for a big idle-power drop. */
+#define TW_IDLE_SAVE_MS 60000    /* idle time before entering power-save (ms) */
+#define TW_SAVE_NAP_MS  500      /* WFE nap / poll cadence while saving (ms) */
+#define TW_BATT_SAVE_MS 60000    /* battery re-read while saving (still visible) */
+
 #define KEY_META_F      0x210    /* M-f: forward one word */
 #define KEY_META_B      0x211    /* M-b: backward one word */
 #define KEY_META_D      0x212    /* M-d: kill word forward */
@@ -125,6 +169,10 @@ struct tw_fs {
 #define TW_PROMPT_OPEN   4       /* "File to open: " (^R) - text entry */
 #define TW_PROMPT_PICK   5       /* ^R file picker: arrow-select from fatls */
 #define TW_PROMPT_POWEROFF 6     /* ^Q: "Save & power off? (Y/N)" */
+
+/* Sentinel for tw_read_battery(): distinct from a real negative errno so the
+ * popup can say "no EC" vs. "EC command failed with code N". */
+#define TW_BATT_NO_EC    (-1000)
 
 /* File picker (^R): a scrollable list of the files on the current device. */
 #define TW_PICK_MAX      128     /* max files listed */
@@ -166,6 +214,14 @@ struct tw_state {
 	int   pick_count;       /* number of files listed */
 	int   pick_sel;         /* selected index */
 	int   pick_top;         /* first visible row (scroll) */
+
+	/* Battery %, shown in the title bar. Refreshed by the periodic poll
+	 * (KEY_REFRESH, every TW_BATT_POLL_MS). >= 0 is a percentage (drawn);
+	 * negative means unavailable (no EC / read failed) and is hidden. */
+	int   batt_pct;
+
+	/* Power-saving mode: 1 while dimmed/idle (title shows [power saving]). */
+	int   power_saving;
 
 	/* framebuffer-derived geometry (pixels + derived cols/rows) */
 	int   fb_w, fb_h;       /* screen pixels */
