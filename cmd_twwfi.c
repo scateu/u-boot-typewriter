@@ -177,6 +177,24 @@ static int do_probe(int hyp, unsigned int ms)
 	printf("  ICC_HPPIR1     = %lu (==%u: PE sees it; ==1023: nothing"
 	       " deliverable)\n", hppir, intid);
 
+	/* Why 1023 despite pending+Group1NS? Check the two prime suspects: */
+	{
+		unsigned long igrpen1, rpr;
+		unsigned int gicd_ctlr = readl((void *)0xfee00000UL); /* GICD_CTLR */
+
+		asm volatile("mrs %0, " STR(ICC_IGRPEN1_EL1) : "=r" (igrpen1));
+		asm volatile("mrs %0, " STR(ICC_RPR_EL1) : "=r" (rpr));
+		printf("  GICD_CTLR      = 0x%08x (bit6 DS=%u: 1=single sec state,"
+		       " 0=two)\n", gicd_ctlr, (gicd_ctlr >> 6) & 1);
+		printf("  ICC_IGRPEN1(rb)= 0x%lx (did our enable stick?)\n", igrpen1);
+		printf("  ICC_RPR        = 0x%lx (running priority; 0xff=idle)\n", rpr);
+		if (!((gicd_ctlr >> 6) & 1))
+			printf("  NOTE: DS=0 (two security states). A priority of 0x80"
+			       " is in the SECURE half; NonSecure Group1 (where we run"
+			       " at EL2) cannot see it -> HPPIR1=1023. The timer PPI is"
+			       " effectively a SECURE interrupt owned by bl31.\n");
+	}
+
 	/* Clean up: disable timer, clear pending. Leave IGRPEN1 as we found it? -
 	 * we turned it on; turn it back off to restore prior state. */
 	if (hyp)
