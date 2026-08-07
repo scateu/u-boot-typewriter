@@ -24,14 +24,18 @@
 #include <vsprintf.h>
 #include <asm/system.h>
 #include <asm/io.h>
+#include <asm/gic.h>
 #include <linux/delay.h>
 #include <linux/string.h>
 
 /* CPU0 GICv3 redistributor SGI_base = 0xfef10000 on rk3399 (verified via
  * md/mw). Standard GICv3 SGI-frame register offsets from SGI_base. */
+#define GICR_IGROUPR0     0xfef10080UL   /* +0x080: interrupt group  */
 #define GICR_ISENABLER0   0xfef10100UL   /* +0x100: set-enable   */
 #define GICR_ISPENDR0     0xfef10200UL   /* +0x200: set-pending  */
 #define GICR_ICPENDR0     0xfef10280UL   /* +0x280: clear-pending */
+#define GICR_IPRIORITYR   0xfef10400UL   /* +0x400: priority (byte/INTID) */
+#define GICR_IGRPMODR0    0xfef10d00UL   /* +0xD00: group modifier */
 
 #define CTL_ENABLE  (1U << 0)
 #define CTL_IMASK   (1U << 1)
@@ -59,6 +63,38 @@ static unsigned long rd_cnthctl(void)
 	return v;
 }
 
+/* GIC CPU-interface system registers (the layer between the redistributor and
+ * the PE - the one link we haven't inspected). All reads, safe. */
+#define _STR(x) #x
+#define STR(x)  _STR(x)
+static unsigned long rd_icc_sre(void)
+{
+	unsigned long v = 0;
+	if (current_el() >= 2)
+		asm volatile("mrs %0, " STR(ICC_SRE_EL2) : "=r" (v));
+	else
+		asm volatile("mrs %0, " STR(ICC_SRE_EL1) : "=r" (v));
+	return v;
+}
+static unsigned long rd_icc_igrpen1(void)
+{
+	unsigned long v;
+	asm volatile("mrs %0, " STR(ICC_IGRPEN1_EL1) : "=r" (v));
+	return v;
+}
+static unsigned long rd_icc_pmr(void)
+{
+	unsigned long v;
+	asm volatile("mrs %0, " STR(ICC_PMR_EL1) : "=r" (v));
+	return v;
+}
+static unsigned long rd_icc_ctlr(void)
+{
+	unsigned long v;
+	asm volatile("mrs %0, " STR(ICC_CTLR_EL1) : "=r" (v));
+	return v;
+}
+
 static void dump_state(void)
 {
 	printf("EL           = %u\n", current_el());
@@ -72,6 +108,22 @@ static void dump_state(void)
 	printf("GICR_ISENABLER0 = 0x%08x (bit26 CNTHP, bit30 CNTP)\n",
 	       readl((void *)GICR_ISENABLER0));
 	printf("GICR_ISPENDR0   = 0x%08x\n", readl((void *)GICR_ISPENDR0));
+	printf("GICR_IGROUPR0   = 0x%08x (1=Group1/NS, 0=Group0/secure)\n",
+	       readl((void *)GICR_IGROUPR0));
+	printf("GICR_IGRPMODR0  = 0x%08x\n", readl((void *)GICR_IGRPMODR0));
+	printf("GICR_IPRIORITYR(30) byte = 0x%02x\n",
+	       readl((void *)(GICR_IPRIORITYR + (30 & ~3))) >> ((30 & 3) * 8)
+	       & 0xff);
+	printf("GICR_IPRIORITYR(26) byte = 0x%02x\n",
+	       readl((void *)(GICR_IPRIORITYR + (26 & ~3))) >> ((26 & 3) * 8)
+	       & 0xff);
+
+	/* CPU interface (the link to the PE). */
+	printf("ICC_SRE      = 0x%lx (bit0 SRE=sysreg iface on)\n", rd_icc_sre());
+	printf("ICC_IGRPEN1  = 0x%lx (bit0 EnableGrp1)\n", rd_icc_igrpen1());
+	printf("ICC_PMR      = 0x%lx (priority mask; 0=block all, 0xff=allow)\n",
+	       rd_icc_pmr());
+	printf("ICC_CTLR     = 0x%lx\n", rd_icc_ctlr());
 }
 
 /* One armed WFI. `hyp` selects CNTHP_EL2 (INTID 26) vs CNTP_EL0 (INTID 30). */
