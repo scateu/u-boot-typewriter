@@ -137,6 +137,8 @@ Append this one line:
 ```makefile
 obj-$(CONFIG_CMD_TYPEWRITER) += cmd_tw.o cmd_tw_fs.o cmd_tw_video.o \
 				ime_table.o wubi_embed.o font_data.o
+# optional WFI-idle debug command (temporary; see POWERSAVE.md):
+obj-$(CONFIG_CMD_TYPEWRITER) += cmd_twwfi.o
 ```
 
 ### 3. Add the option *definition* to `cmd/Kconfig`

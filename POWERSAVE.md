@@ -345,17 +345,38 @@ slept forever. Linux avoids this because its `arch_timer` driver enables the PPI
    0xfef10100: 60004000         # bit 30 now set; board stayed alive (no storm)
 ```
 
-So `tw_wfi_nap()` writes `GICR_ISENABLER0 |= (1<<30)` once (`tw_timer_ppi_enable`)
-before its first WFI. We keep the timer IRQ **masked** (`CNTP_CTL.IMASK=1`) and
-leave DAIF masked: a *pending enabled* interrupt still wakes WFI regardless of the
-PSTATE mask, but is never **taken**, so U-Boot's panicking `do_irq` never runs and
-no handler is needed (bl31 already brought the GICv3 up). A cros_ec keypress IRQ
-is likewise a wake event (early wake); if not, the timer tick wakes us within
-`ms`. No self-test / fallback is needed now that the freeze cause is fixed at the
-source.
+### ...but enabling the PPI was NOT sufficient — WFI still froze
+
+With `GICR_ISENABLER0 |= (1<<30)` added, arm-CNTP + WFI **still hung**. So the
+wake model is still wrong. Leading theory: we run at **EL2**, but `CNTP_*_EL0` is
+the **EL1** physical timer (INTID 30 — what Linux fires *from EL1*). While
+executing at EL2 the EL1 timer's interrupt output can be gated by `CNTHCTL_EL2`,
+so it may never assert as a wake event for us. The **EL2-native** timer is
+`CNTHP_*_EL2` (INTID 26) — that is likely the one to arm when running at EL2.
+
+**Current state: WFI idle is DISABLED** (`TW_USE_WFI = 0` in `cmd_tw.c`); the live
+idle path is the proven WFE `udelay`. The WFI code is kept for debugging.
+
+### Debugging safely: the `twwfi` command
+
+To stop freezing the *editor* while testing, `cmd_twwfi.c` adds a standalone
+shell command that does a SINGLE armed WFI — a freeze there costs only a
+power-cycle, not an editing session:
+
+```
+=> twwfi            # dump EL, CNTFRQ, CNTPCT (x2), CNTHCTL_EL2, GICR_ISENABLER0
+=> twwfi hp         # enable INTID 26, arm CNTHP_EL2, one WFI (EL2-timer theory)
+=> twwfi p          # enable INTID 30, arm CNTP_EL0,  one WFI (the frozen case)
+```
+
+If the prompt returns, that timer wakes WFI (it prints the elapsed ms) — wire
+that timer into `tw_wfi_nap` and set `TW_USE_WFI = 1`. If it hangs, power-cycle
+and try the other. Expectation: `twwfi hp` (CNTHP/INTID 26) wakes; `twwfi p`
+(CNTP/INTID 30) hangs, matching the theory.
 
 The redistributor address (`GICR_ISENABLER0 = 0xfef10100` for CPU0 on rk3399) was
-verified by the `md`/`mw` session above; it is a `#define` in `cmd_tw.c`.
+verified by the `md`/`mw` session above; it is a `#define` in `cmd_tw.c` /
+`cmd_twwfi.c`.
 
 Host-build note: the real `mrs`/`msr`/`wfi` + `writel` are compiled only under
 `CONFIG_ARM64 && __aarch64__`; the `.cc` functest (and any non-arm64 build) uses
