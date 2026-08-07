@@ -27,9 +27,11 @@
 #include <linux/delay.h>
 #include <linux/string.h>
 
-/* CPU0 GICv3 redistributor SGI_base on rk3399 (verified via md/mw earlier). */
-#define GICR_ISENABLER0   0xfef10100UL
-#define GICR_ISPENDR0     0xfef10200UL   /* SGI_base + 0x200: pending state */
+/* CPU0 GICv3 redistributor SGI_base = 0xfef10000 on rk3399 (verified via
+ * md/mw). Standard GICv3 SGI-frame register offsets from SGI_base. */
+#define GICR_ISENABLER0   0xfef10100UL   /* +0x100: set-enable   */
+#define GICR_ISPENDR0     0xfef10200UL   /* +0x200: set-pending  */
+#define GICR_ICPENDR0     0xfef10280UL   /* +0x280: clear-pending */
 
 #define CTL_ENABLE  (1U << 0)
 #define CTL_IMASK   (1U << 1)
@@ -80,7 +82,7 @@ static int do_wfi_test(int hyp, unsigned int ms)
 	unsigned long t0, t1;
 	unsigned int intid = hyp ? 26 : 30;
 
-	printf("Enabling INTID %u, arming %s for %u ms (%lu ticks)...\n",
+	printf("Enabling INTID %u, arming %s for %u ms (%lu ticks), IMASK=0...\n",
 	       intid, hyp ? "CNTHP_EL2" : "CNTP_EL0", ms, ticks);
 	printf("If the prompt does NOT return, this timer does not wake WFI here"
 	       " - power-cycle.\n");
@@ -89,16 +91,27 @@ static int do_wfi_test(int hyp, unsigned int ms)
 	writel(1U << intid, (void *)GICR_ISENABLER0);
 	dsb();
 
+	/*
+	 * CRITICAL: arm with IMASK=0. The timer only ASSERTS its interrupt when
+	 * ENABLE=1 && ISTATUS=1 && IMASK=0. With IMASK=1 (our earlier bug) the
+	 * output is masked at the source, so nothing ever becomes pending and WFI
+	 * never wakes. We keep PSTATE.I MASKED (DAIF.I=1) so the fired interrupt
+	 * WAKES wfi but is not TAKEN as an exception (U-Boot's do_irq panics), then
+	 * we disable the timer to drop the assertion.
+	 */
+	asm volatile("msr daifset, #2");    /* mask IRQ (PSTATE.I = 1) */
+	isb();
+
 	t0 = rd_cntpct();
 
 	if (hyp) {
 		asm volatile("msr cnthp_tval_el2, %0" : : "r" (ticks));
 		asm volatile("msr cnthp_ctl_el2, %0" : :
-			     "r" ((unsigned long)(CTL_ENABLE | CTL_IMASK)));
+			     "r" ((unsigned long)CTL_ENABLE));
 	} else {
 		asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
 		asm volatile("msr cntp_ctl_el0, %0" : :
-			     "r" ((unsigned long)(CTL_ENABLE | CTL_IMASK)));
+			     "r" ((unsigned long)CTL_ENABLE));
 	}
 	isb();
 
@@ -106,11 +119,16 @@ static int do_wfi_test(int hyp, unsigned int ms)
 
 	t1 = rd_cntpct();
 
-	/* Disable the timer again. */
+	/* Disable the timer again (drops its now-asserted interrupt). */
 	if (hyp)
 		asm volatile("msr cnthp_ctl_el2, %0" : : "r" (0UL));
 	else
 		asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
+	isb();
+	/* Clear any pending state at the redistributor, then re-unmask IRQs. */
+	writel(1U << intid, (void *)GICR_ICPENDR0);
+	dsb();
+	asm volatile("msr daifclr, #2");    /* unmask IRQ (PSTATE.I = 0) */
 	isb();
 
 	printf("WFI RETURNED. elapsed = %lu ticks (~%lu ms)\n",
