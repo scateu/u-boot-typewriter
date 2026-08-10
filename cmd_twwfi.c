@@ -547,16 +547,25 @@ asm(
 	/* --- Current EL SPx: sync (0x200) --- */
 "	.align 7					\n" "	eret\n"
 	/* --- Current EL SPx: IRQ (0x280) -- our handler ---
-	 * Save/restore x0/x1 (the interrupted context may hold live values across
-	 * the WFI we return to). */
+	 * Handles BOTH wake sources: the CNTP timer (INTID 30) and the EC GPIO
+	 * (INTID 46). Ack, silence both sources (disable CNTP; mask GPIO0 PA1 IRQ at
+	 * GPIO_INTMASK so a level-triggered EC line stops asserting), then EOI. Both
+	 * silence steps are harmless when the other source fired. Save/restore
+	 * x0-x2 (the interrupted context may hold live values across the WFI). */
 "	.align 7					\n"
-"	stp	x0, x1, [sp, #-16]!			\n"
+"	stp	x0, x1, [sp, #-32]!			\n"
+"	str	x2, [sp, #16]				\n"
 "	mrs	x0, S3_0_C12_C12_0			\n"   /* ICC_IAR1_EL1 (ack) */
 "	msr	cntp_ctl_el0, xzr			\n"   /* disable CNTP -> deassert */
+"	movz	x1, #0xff72, lsl #16			\n"   /* GPIO0 base 0xff720000 */
+"	ldr	w2, [x1, #0x34]				\n"   /* GPIO_INTMASK */
+"	orr	w2, w2, #0x2				\n"   /* mask PA1 (bit1) */
+"	str	w2, [x1, #0x34]				\n"
 "	dsb	sy					\n"
 "	msr	S3_0_C12_C12_1, x0			\n"   /* ICC_EOIR1_EL1 (EOI) */
 "	isb						\n"
-"	ldp	x0, x1, [sp], #16			\n"
+"	ldr	x2, [sp, #16]				\n"
+"	ldp	x0, x1, [sp], #32			\n"
 "	eret						\n"
 	/* --- Current EL SPx: fiq (0x300), err (0x380) --- */
 "	.align 7					\n" "	eret\n"
@@ -623,6 +632,65 @@ static int do_irq_wfi(unsigned int ms)
 	return 0;
 }
 
+/*
+ * Prove the EC GPIO (INTID 46) can wake WFI as an INTERRUPT - so we can sleep
+ * for 30 s and wake only on a key / power button / lid, with NO timer tick and
+ * NO 200 ms EC poll. Same take-the-IRQ recipe as `irq`, but the wake source is
+ * the cros_ec line (gpio0 PA1 -> INTID 46), and NO timer is armed. Press a key,
+ * the power button, or open/close the lid to wake it. If it returns, the poll
+ * loop can drop to a single long WFI. (No timeout here - if nothing is pressed
+ * it waits forever; power-cycle. In the editor we'd still arm a long backstop
+ * timer, but this isolates the EC-as-IRQ proof.)
+ */
+static int do_ecwake(void)
+{
+	unsigned int word = EC_GPIO_INTID / 32, bit = EC_GPIO_INTID % 32;
+	unsigned long vbar_save, hcr_save;
+
+	printf("EC-as-IRQ wake test: no timer. Press a KEY / POWER BUTTON / LID.\n");
+	printf("If the prompt returns, INTID 46 wakes WFI - we can sleep 30 s.\n");
+
+	/* GPIO0 PA1: level, active-low, unmasked, enabled. */
+	clrbits_le32((void *)GPIO_INTTYPE, EC_PA1_BIT);
+	clrbits_le32((void *)GPIO_INT_POL, EC_PA1_BIT);
+	clrbits_le32((void *)GPIO_INTMASK, EC_PA1_BIT);
+	setbits_le32((void *)GPIO_INTEN,  EC_PA1_BIT);
+	dsb();
+
+	/* GIC: forward NS Group1, enable INTID 46, open PMR + CPU-interface grp. */
+	setbits_le32((void *)GICD_CTLR, (1U << 1));
+	dsb();
+	writel(1U << bit, (void *)(GICD_ISENABLER + word * 4));
+	asm volatile("msr " STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));
+	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
+	dsb();
+
+	/* Install our EL2 vector + route phys IRQ to EL2. */
+	asm volatile("mrs %0, vbar_el2" : "=r" (vbar_save));
+	asm volatile("mrs %0, hcr_el2"  : "=r" (hcr_save));
+	asm volatile("msr vbar_el2, %0" : : "r" ((unsigned long)tw_irq_vectors));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save | (1UL << 4)));
+	isb();
+
+	/* No timer. Take IRQs, WFI - only the EC GPIO can wake us. */
+	asm volatile("msr daifclr, #2");
+	wfi();
+	asm volatile("msr daifset, #2");
+
+	/* Restore. The handler masked GPIO PA1; ack the GPIO source + re-enable. */
+	asm volatile("msr vbar_el2, %0" : : "r" (vbar_save));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save));
+	isb();
+	writel(EC_PA1_BIT, (void *)GPIO_PORTA_EOI);   /* clear GPIO latch */
+	setbits_le32((void *)GPIO_INTMASK, EC_PA1_BIT); /* leave it masked (restore) */
+	dsb();
+
+	printf("WFI RETURNED - an EC event (key/button/lid) woke it.\n");
+	printf("=> INTID 46 works as a WFI wake IRQ. The idle loop can sleep long\n"
+	       "   (e.g. 30 s backstop) and wake on activity - no 200 ms EC poll.\n");
+	return 0;
+}
+
 static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		    char *const argv[])
 {
@@ -643,6 +711,8 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		return do_suspend(ms);
 	if (!strcmp(argv[1], "irq"))
 		return do_irq_wfi(ms);
+	if (!strcmp(argv[1], "ecwake"))
+		return do_ecwake();
 	if (!strcmp(argv[1], "gpio"))
 		return do_gpio_probe();
 	if (!strcmp(argv[1], "spi")) {
@@ -660,7 +730,7 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (!strcmp(argv[1], "p"))
 		return do_wfi_test(0, ms);
 
-	printf("usage: twwfi [probe [p|hp]] [suspend [ms]] [gpio] [spi [n]] [p|hp]\n");
+	printf("usage: twwfi [irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms]\n");
 	return CMD_RET_USAGE;
 }
 
@@ -668,12 +738,14 @@ U_BOOT_CMD(
 	twwfi, 4, 0, do_twwfi,
 	"WFI/idle test (power idle debug)",
 	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
+	"twwfi irq [ms]     - TAKE timer IRQ (HCR_EL2.IMO + handler) + WFI. Works;\n"
+	"                     this is what the editor's idle nap does.\n"
+	"twwfi ecwake       - EC GPIO (INTID 46) as WFI wake IRQ, NO timer. Press a\n"
+	"                     key/power button/lid; returns => can sleep 30 s.\n"
 	"twwfi suspend [ms] - PSCI CPU_SUSPEND (STANDBY) via bl31 (HANGS - evidence)\n"
-	"twwfi irq [ms]     - TAKE the IRQ: HCR_EL2.IMO=1 + real EL2 handler + WFI.\n"
-	"                     THE WORKING PATH (returns ~ms). Now used by the editor.\n"
 	"twwfi probe [p|hp] - SAFE: arm timer, poll (no WFI), report propagation\n"
 	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
 	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"
-	"twwfi p|hp [ms]    - arm CNTP/CNTHP + one raw WFI (hangs here - EL3 routing)\n"
+	"twwfi p|hp [ms]    - arm CNTP/CNTHP + one raw WFI (hangs - no IMO/handler)\n"
 	"  probe/spi/gpio/dump never hang. suspend/p/hp may - power-cycle if so."
 );
