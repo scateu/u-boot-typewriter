@@ -25,6 +25,8 @@
 #include <asm/system.h>
 #include <asm/io.h>
 #include <asm/gic.h>
+#include <time.h>
+#include <u-boot/schedule.h>
 #include <linux/delay.h>
 #include <linux/psci.h>
 #include <linux/string.h>
@@ -691,6 +693,80 @@ static int do_ecwake(void)
 	return 0;
 }
 
+/*
+ * Replicate the EDITOR's exact idle nap (tw_idle_nap in cmd_tw.c) in a loop
+ * until a key is pressed - to test the real thing, not a variant. Expected:
+ * the board goes quiet (deep WFI) and "freezes" until you press a key, then it
+ * returns. It also reports how many naps ran and the average per-nap elapsed
+ * time: if each nap really slept ~`ms`, naps ~= elapsed/ms; if WFI is NOT
+ * sleeping (returning instantly), naps will be huge and avg ~0 - proving the
+ * WFI code doesn't work.
+ *
+ * Uses `ms`-length CNTP-woken naps exactly like the editor. Keeps VBAR/HCR
+ * swapped per-nap, same as the editor.
+ */
+static int do_keystroke(unsigned int ms)
+{
+	unsigned long ticks = (rd_cntfrq() / 1000) * ms;
+	unsigned long naps = 0, t_start, t_end;
+
+	printf("keystroke test: editor-style %u ms WFI naps until a key.\n", ms);
+	printf("Should go QUIET (deep sleep) and 'freeze' until you press a key.\n");
+
+	/* One-time GIC enables (same as tw_wfi_setup): NS Group1 fwd + CNTP PPI
+	 * + PMR open + CPU-interface group. */
+	setbits_le32((void *)GICD_CTLR, (1U << 1));
+	dsb();
+	writel(1U << 30, (void *)GICR_ISENABLER0);
+	asm volatile("msr " STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));
+	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
+	isb();
+
+	t_start = rd_cntpct();
+
+	while (!tstc()) {
+		unsigned long vbar_save, hcr_save;
+
+		asm volatile("mrs %0, vbar_el2" : "=r" (vbar_save));
+		asm volatile("mrs %0, hcr_el2"  : "=r" (hcr_save));
+		asm volatile("msr vbar_el2, %0" : : "r"
+			     ((unsigned long)tw_irq_vectors));
+		asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save | (1UL << 4)));
+		isb();
+
+		asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
+		asm volatile("msr cntp_ctl_el0, %0" : : "r" (1UL));
+		isb();
+		asm volatile("msr daifclr, #2");
+		wfi();
+		asm volatile("msr daifset, #2");
+		asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
+
+		asm volatile("msr vbar_el2, %0" : : "r" (vbar_save));
+		asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save));
+		isb();
+
+		naps++;
+		schedule();
+	}
+	(void)getchar();   /* consume the key that ended the wait */
+
+	t_end = rd_cntpct();
+
+	{
+		unsigned long total_ms = (t_end - t_start) / (rd_cntfrq() / 1000);
+		unsigned long avg_us = naps ? (t_end - t_start) /
+				       (rd_cntfrq() / 1000000) / naps : 0;
+
+		printf("\nWoke on key. naps=%lu over %lu ms (avg %lu us/nap).\n",
+		       naps, total_ms, avg_us);
+		printf("=> avg ~= %u000 us/nap means WFI slept the full nap (GOOD).\n",
+		       ms);
+		printf("   avg ~0 with a huge nap count means WFI did NOT sleep (BUG).\n");
+	}
+	return 0;
+}
+
 static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		    char *const argv[])
 {
@@ -707,6 +783,9 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	else if (argc >= 3 && strcmp(argv[1], "probe"))
 		ms = simple_strtoul(argv[2], NULL, 10);
 
+	if (!strcmp(argv[1], "keystroke"))
+		return do_keystroke(argc >= 3 ? simple_strtoul(argv[2], NULL, 10)
+					      : 25);   /* editor's TW_KEY_NAP_MS */
 	if (!strcmp(argv[1], "suspend"))
 		return do_suspend(ms);
 	if (!strcmp(argv[1], "irq"))
@@ -730,7 +809,7 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (!strcmp(argv[1], "p"))
 		return do_wfi_test(0, ms);
 
-	printf("usage: twwfi [irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms]\n");
+	printf("usage: twwfi [keystroke|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms]\n");
 	return CMD_RET_USAGE;
 }
 
@@ -738,6 +817,9 @@ U_BOOT_CMD(
 	twwfi, 4, 0, do_twwfi,
 	"WFI/idle test (power idle debug)",
 	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
+	"twwfi keystroke [ms] - the EDITOR's exact idle nap in a loop until a key\n"
+	"                     (default 25 ms). Should go quiet + freeze till a key;\n"
+	"                     reports naps/avg to prove WFI actually sleeps.\n"
 	"twwfi irq [ms]     - TAKE timer IRQ (HCR_EL2.IMO + handler) + WFI. Works;\n"
 	"                     this is what the editor's idle nap does.\n"
 	"twwfi ecwake       - EC GPIO (INTID 46) as WFI wake IRQ, NO timer. Press a\n"
