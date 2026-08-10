@@ -561,9 +561,9 @@ U_BOOT_CMD(
 	twwfi, 4, 0, do_twwfi,
 	"WFI/idle test (power idle debug)",
 	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
-	"twwfi suspend [ms] - PSCI CPU_SUSPEND (STANDBY) via bl31, timer wake in ms.\n"
-	"                     THE promising path: bl31 sets SCR_EL3.IRQ + WFIs for us.\n"
-	"                     If it returns after ~ms, this is our low-power idle.\n"
+	"twwfi suspend [ms] - PSCI CPU_SUSPEND (STANDBY) via bl31 (HANGS on this\n"
+	"                     board - bl31 standby won't wake on our NS IRQ; kept\n"
+	"                     as evidence, see POWERSAVE.md).\n"
 	"twwfi probe [p|hp] - SAFE: arm timer, poll (no WFI), report propagation\n"
 	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
 	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"
