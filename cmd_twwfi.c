@@ -26,7 +26,16 @@
 #include <asm/io.h>
 #include <asm/gic.h>
 #include <linux/delay.h>
+#include <linux/psci.h>
 #include <linux/string.h>
+
+/* PSCI invoke_psci_fn is provided by drivers/firmware/psci.c (probe it first
+ * with uclass_get_device_by_name(UCLASS_FIRMWARE,"psci",...) as poweroff does).
+ * We only need CPU_SUSPEND here. */
+#include <dm.h>
+#include <dm/uclass.h>
+unsigned long invoke_psci_fn(unsigned long, unsigned long, unsigned long,
+			     unsigned long);
 
 /* CPU0 GICv3 redistributor SGI_base = 0xfef10000 on rk3399 (verified via
  * md/mw). Standard GICv3 SGI-frame register offsets from SGI_base. */
@@ -452,6 +461,63 @@ static int do_gpio_probe(void)
 	return 0;
 }
 
+/*
+ * PSCI CPU_SUSPEND (STANDBY) test - the route that should actually work.
+ *
+ * Our EL2 WFI can't wake because a physical IRQ only wakes a lower-EL WFI when
+ * SCR_EL3.IRQ=1, and only EL3 can set that. bl31's STANDBY handler
+ * (rockchip_cpu_standby) sets SCR_EL3.IRQ itself, does the WFI at EL3, and
+ * returns on a NonSecure interrupt - exactly what we need. So instead of WFI we
+ * SMC into bl31: CPU_SUSPEND(power_state=0 => STANDBY, level 0, id 0).
+ *
+ * We arm the NS CNTP timer (with the GIC enables) as the wake source first, so
+ * bl31's WFI has something to return from within `ms`. If CPU_SUSPEND returns,
+ * this is our low-power idle mechanism. (A keypress would wake it too.)
+ */
+static int do_suspend(unsigned int ms)
+{
+	struct udevice *psci;
+	unsigned long rate = rd_cntfrq();
+	unsigned long ticks = (rate / 1000) * ms;
+	unsigned long t0, t1, ret;
+
+	/* Probe the PSCI firmware driver so invoke_psci_fn has its conduit. */
+	if (uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci)) {
+		printf("PSCI driver not found - can't test CPU_SUSPEND.\n");
+		return 1;
+	}
+
+	printf("PSCI CPU_SUSPEND (STANDBY), timer wake in %u ms...\n", ms);
+
+	/* Arm the NS timer as the wake source (same GIC enables as the probe). */
+	setbits_le32((void *)GICD_CTLR, (1U << 1));    /* EnableGrp1NS */
+	dsb();
+	writel(1U << 30, (void *)GICR_ISENABLER0);     /* INTID 30 = CNTP PPI */
+	dsb();
+	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
+	isb();
+	asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
+	asm volatile("msr cntp_ctl_el0, %0" : : "r" (1UL));   /* ENABLE, IMASK=0 */
+	isb();
+
+	t0 = rd_cntpct();
+
+	/* power_state = 0: STANDBY, pwr level 0, state id 0. entry/ctx unused for
+	 * standby (CPU keeps state and resumes right here). */
+	ret = invoke_psci_fn(PSCI_0_2_FN64_CPU_SUSPEND, 0, 0, 0);
+
+	t1 = rd_cntpct();
+
+	asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));   /* disable timer */
+	isb();
+
+	printf("CPU_SUSPEND RETURNED. ret=%ld, elapsed=%lu ms\n",
+	       (long)ret, (t1 - t0) / (rate / 1000));
+	printf("=> If elapsed ~%u ms, PSCI standby idle WORKS - use it for idle.\n",
+	       ms);
+	return 0;
+}
+
 static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		    char *const argv[])
 {
@@ -468,6 +534,8 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	else if (argc >= 3 && strcmp(argv[1], "probe"))
 		ms = simple_strtoul(argv[2], NULL, 10);
 
+	if (!strcmp(argv[1], "suspend"))
+		return do_suspend(ms);
 	if (!strcmp(argv[1], "gpio"))
 		return do_gpio_probe();
 	if (!strcmp(argv[1], "spi")) {
@@ -485,20 +553,20 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (!strcmp(argv[1], "p"))
 		return do_wfi_test(0, ms);
 
-	printf("usage: twwfi [probe [p|hp]] [gpio] [spi [intid]] [p|hp] [ms]\n");
+	printf("usage: twwfi [probe [p|hp]] [suspend [ms]] [gpio] [spi [n]] [p|hp]\n");
 	return CMD_RET_USAGE;
 }
 
 U_BOOT_CMD(
 	twwfi, 4, 0, do_twwfi,
-	"WFI-wake test (timer idle debug)",
+	"WFI/idle test (power idle debug)",
 	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
+	"twwfi suspend [ms] - PSCI CPU_SUSPEND (STANDBY) via bl31, timer wake in ms.\n"
+	"                     THE promising path: bl31 sets SCR_EL3.IRQ + WFIs for us.\n"
+	"                     If it returns after ~ms, this is our low-power idle.\n"
 	"twwfi probe [p|hp] - SAFE: arm timer, poll (no WFI), report propagation\n"
-	"twwfi spi [intid]  - SAFE: read an SPI's group/prio in GICD (default 46)\n"
-	"twwfi gpio         - SAFE: set up the EC GPIO IRQ (INTID 46), poll ~5 s\n"
-	"                     while you press keys/button/lid; no WFI. Does it reach\n"
-	"                     the PE (HPPIR1==46)? If yes, keypress-WFI is viable.\n"
-	"twwfi hp [ms]    - arm CNTHP (EL2 timer, INTID 26) + one WFI\n"
-	"twwfi p  [ms]    - arm CNTP  (EL1 timer, INTID 30) + one WFI\n"
-	"  If a WFI test hangs, power-cycle. probe/spi/gpio/dump never hang."
+	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
+	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"
+	"twwfi p|hp [ms]    - arm CNTP/CNTHP + one raw WFI (hangs here - EL3 routing)\n"
+	"  probe/spi/gpio/dump never hang. suspend/p/hp may - power-cycle if so."
 );
