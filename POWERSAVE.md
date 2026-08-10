@@ -1,453 +1,223 @@
 # Power consumption on the RK3399 Chromebook (gru/kevin)
 
 The typewriter runs bare in U-Boot, which has no OS power management (no cpufreq
-governor, no cpuidle). This note explains why it drew far more power than Linux,
-and the two changes that fix it — **neither of which is typewriter C code**;
-they are U-Boot config.
+governor, no cpuidle). Out of the box it drew ~3× Linux's idle power (~20 %/hr
+vs ~6 %/hr, warm CPU). This note describes the changes that fix it.
+
+> The long list of things that **didn't** work (the WFI freeze chain, the wrong
+> conclusions, PSCI CPU_SUSPEND, an abandoned "power-saving mode") lives in
+> **POWERSAVE_FAILED_EFFORTS.md**. This file keeps only the working design.
 
 ---
 
-## TL;DR
+## TL;DR — the levers that work
 
-Five levers:
-
-1. **Real WFI deep idle** — the key one. The editor's idle nap is a true `WFI`
-   woken by the NonSecure arch-timer (CNTP), the same way Linux idles this board.
-   The missing piece was **`HCR_EL2.IMO`** (U-Boot only set AMO, so IRQs targeted
-   EL1 not our EL2) plus a real EL2 IRQ handler + the GIC NS-Group1 enables. The
-   core genuinely clock-gates between keystrokes now. See the WFI investigation.
-2. **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`** — makes plain `udelay()` (used
-   elsewhere) sleep with WFE rather than hot-spinning. **Confirmed EL2.**
-3. **CPU frequency 600 MHz → 408 MHz** — fixed lower OPP; less active power/heat.
-4. **Dim the backlight** (`^-` / `^]`, default 40 %) — a big share of idle draw.
-   Needs the backlight PWM config chain (`DM_PWM` + `PWM_CROS_EC` + …).
-5. **Throttle the idle loop** — EC button/lid poll cut from 100 Hz to 5 Hz.
-
-Measured before any change: **~20 %/hr battery, warm CPU** (vs Linux ~6 %/hr,
-9 h life). Reference: a suspected further draw (Linux and U-Boot) is the **WiFi
-module left powered but unmanaged** — not yet addressed (needs regulator/PMIC
-gating).
+1. **Real WFI deep idle** *(the big one)*. The editor's idle nap is a true `WFI`
+   that clock-gates the core until an interrupt, exactly how Linux idles this
+   board. Woken by the NonSecure arch-timer (CNTP) tick and, early, by any
+   cros_ec keypress / power button / lid. In `cmd_tw.c` (`tw_idle_nap`).
+2. **CPU frequency 600 → 408 MHz** — U-Boot's fixed clock lowered to Linux's
+   idle OPP. Less active power/heat. (U-Boot core change, `clk_rk3399.c`.)
+3. **Dim the backlight** (`^-` / `^]`, default 40 %) — the panel is a big share
+   of idle draw; U-Boot brings it up full-bright and never lowers it.
+4. **Throttle the idle loop** — the EC power-button/lid poll is a SPI
+   transaction; do it every 200 ms, not every nap.
+5. **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`** — makes plain `udelay()` (used
+   elsewhere in U-Boot) sleep with WFE instead of hot-spinning. Not the editor's
+   idle path (that's #1), but a good default. **Requires EL2** — confirmed.
 
 ---
 
-## Why it was hot / thirsty
+## Fix 1 — real WFI deep idle
 
-The editor waits for a keypress in a poll loop (`cmd_tw.c`, `tw_read_key`):
+`tw_idle_nap()` (`cmd_tw.c`) puts the core into a genuine `WFI` sleep between
+keystrokes, woken by the NonSecure physical timer (CNTP, INTID 30). This is the
+same mechanism Linux uses (cpuidle state 0 = *"ARM WFI"*).
 
-```c
-while (!tstc()) {
-    schedule();
-    udelay(10000);   /* 10 ms between polls */
-}
+The catch — and why this took real work — is that U-Boot does none of the
+interrupt setup a `WFI` needs to be woken. Four things must be in place:
+
+1. **`HCR_EL2.IMO = 1`** — route physical IRQs to **EL2** (where U-Boot runs).
+   U-Boot's `start.S` sets `HCR_EL2.AMO` (SError) but **not IMO**, so by default
+   IRQs target EL1 and an EL2 `WFI` is never the interrupt's target → never
+   wakes. This was the single missing piece behind a long chain of freezes.
+2. **The GIC forwards NonSecure Group1** — `GICD_CTLR.EnableGrp1NS` (distributor)
+   + `ICC_IGRPEN1_EL1 = 1` (CPU interface) + `ICC_PMR = 0xff` (priority mask
+   open) + enable the CNTP PPI (INTID 30) in the redistributor. bl31 leaves all
+   of these off for the normal world. (The arch timer is **not** secure — bl31
+   only claims INTID 29, the EL3 timer.)
+3. **An EL2 IRQ handler** that acks + EOIs the timer, so the taken interrupt is
+   serviced (U-Boot's default `do_irq` just panics).
+4. **`PSTATE.I` unmasked** during the `WFI` so the IRQ is actually *taken*.
+
+### How `tw_idle_nap` does it
+
+Once (`tw_wfi_setup`, first call):
+`GICD_CTLR.EnableGrp1NS` + CNTP PPI enable + `ICC_PMR = 0xff` +
+`ICC_IGRPEN1_EL1 = 1`. These are harmless to leave on.
+
+Per nap:
+```
+save VBAR_EL2, HCR_EL2
+VBAR_EL2  = tw_idle_vectors      # minimal EL2 vector table (below)
+HCR_EL2  |= IMO                  # route phys IRQ to EL2
+arm CNTP: cntp_tval_el0 = ms·rate ; cntp_ctl_el0 = ENABLE (IMASK=0)
+msr daifclr, #2                  # PSTATE.I = 0 -> take IRQs
+wfi                              # deep sleep until timer / keypress IRQ
+msr daifset, #2                  # re-mask
+cntp_ctl_el0 = 0                 # disable timer
+restore VBAR_EL2, HCR_EL2
 ```
 
-U-Boot's console is **polled** — there is no "sleep until a key" primitive — so
-the loop runs ~99 % of the time (you're not typing most of the time). The
-problem was **what `udelay()` does**: by default it is a **busy-spin** — the
-core executes the delay loop at full clock the entire 10 ms, never sleeping.
+`tw_idle_vectors` is a minimal 2 KiB-aligned EL2 vector table; only the
+Current-EL-SPx IRQ slot has a handler — `ack (ICC_IAR1) → disable CNTP → EOI
+(ICC_EOIR1) → eret` (saving/restoring x0/x1). `VBAR_EL2` and `HCR_EL2.IMO` are
+swapped **per nap** and restored after, so the rest of U-Boot keeps its own
+exception handling; only the brief WFI window takes IRQs.
 
-Linux idles the *same* core in **WFI** ~99 % of the time (near-zero power) and
-scales frequency down. So U-Boot burned ~3× the power and ran warm, even though
-"nothing was happening." **Duty cycle (spinning vs sleeping) dominated; the
-clock frequency was the smaller half.**
+Result: the core genuinely clock-gates between keystrokes. arm64-only; host and
+non-arm64 builds fall back to a plain `udelay`.
 
----
-
-## Fix 1 — event-stream `udelay` (the big one)
-
-U-Boot already contains the mechanism; it's just off by default on this board.
-With **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`**, `__udelay()`
-(`arch/arm/cpu/armv8/generic_timer.c`) becomes:
-
-```c
-if (current_el() >= 2) {
-    /* enable the architectural timer's EVENT STREAM ... */
-    while (get_ticks() + (1 << event_period) <= target)
-        wfe();          /* SLEEP until the next event-stream tick */
-}
-while (get_ticks() <= target) ;   /* fine-grained tail, polled */
-```
-
-So the editor's existing `udelay(10000)` now **sleeps the core in `WFE`** for
-almost the whole 10 ms instead of spinning. **No typewriter code changes** — the
-same loop, but the delay no longer burns the CPU.
-
-### Why WFE, not WFI — root cause of the WFI freeze
-
-We first tried `WFI` directly in the key loop. **It froze the board.** Here is
-exactly why, confirmed against the U-Boot source and the ARMv8 architecture.
-
-**What wakes a WFI.** Per the ARM ARM, `WFI` completes on a *WFI wake-up event*:
-a pending physical **IRQ / FIQ / SError / debug** event — and notably this
-happens **even if that interrupt is masked** in `PSTATE.DAIF`. Masking only stops
-the exception from being *taken*; it does not stop the pending interrupt from
-*waking* WFI. So "interrupts are masked" is **not** why WFI hung.
-
-**The actual cause: nothing ever generates an interrupt.** In U-Boot proper on
-this board there is *no interrupt source at all*:
-- The console/keyboard is **polled** (`tstc()`), never IRQ-driven.
-- The generic timer is used **only by polling `CNTPCT_EL0`** (`get_ticks()` in
-  `arch/arm/cpu/armv8/generic_timer.c`); U-Boot never programs `CNTP_CTL_EL0` /
-  `CNTP_TVAL_EL0` to *fire* a timer interrupt.
-- No GIC driver is compiled for rk3399 in U-Boot proper (the GICv3 exists in the
-  DT and hardware, but nothing initialises it), and `arch/arm/lib/interrupts_64.c`
-  has `enable_interrupts()` / `disable_interrupts()` as **no-ops** with `do_irq()`
-  set to `panic()`.
-
-So `WFI` puts the core to sleep waiting for an event that is **never produced** →
-permanent halt. The lesson: WFI on bare-metal U-Boot needs an interrupt you have
-explicitly armed; there is none here.
-
-**Why WFE works instead.** `WFE` wakes on all the WFI events **plus** an *event*,
-and the ARMv8 **event stream** makes the architectural timer emit a periodic
-event automatically once `CNTHCTL_EL2.EVNT_EN` is set (which the event-stream
-`udelay` path does). Period is `2^EVNTI` counter ticks — the code uses
-`EVNTI = 7` → every 128 ticks; at RK3399's 24 MHz timer that is **~5.3 µs**. So
-the core naps in a low-power state and self-wakes every ~5 µs with **no
-interrupt, no GIC, no handler** — it can never hang the way WFI did.
-
-**Could we make WFI work (deeper sleep)?** In principle yes: arm the generic
-timer to raise a periodic **CNTP interrupt**, route the timer PPI through the GIC
-to the CPU (`GICD` group-enable + `ICC_*` CPU interface), and replace the
-panicking `do_irq` with a handler that just acknowledges the timer. WFI is deeper
-than WFE (the core can gate its clock fully until the IRQ). But it is a lot of
-fragile new plumbing — and the i.MX8 report in `ref/power_consumption/` shows how
-it goes wrong (their timer PPI never reached the CPU because `GICD_CTLR.
-EnableGrp1NS` wouldn't set, so *their* WFI hung too). The WFE event stream gets
-most of the benefit for one config bit and zero interrupt code, so we stay with
-it. Arming a timer IRQ is a possible future optimisation, not a fix that's needed.
-
-### Requirement: EL2 or above  — CONFIRMED EL2 on gru/kevin
-
-The event-stream path only runs when `current_el() >= 2` (see the `if` above).
-**We confirmed gru/kevin runs U-Boot at EL2**, two ways:
-- Config: coreboot uses ARM Trusted Firmware (`ARM64_USE_ARM_TRUSTED_FIRMWARE=y`),
-  bl31 runs at EL3 and hands the payload (U-Boot) to EL2 non-secure; and U-Boot's
-  `CONFIG_ARMV8_SWITCH_TO_EL1` is **off**, so it stays at EL2.
-- Runtime: the typewriter prints the level in its startup status line
-  (`[ Read N lines - EL2 ]`) via `current_el()`, and `^Q` prints it on any
-  poweroff failure. Look for **EL2**.
-
-So the event-stream WFE idle *is* active. If a build ever showed **EL1** there,
-`__udelay()` would silently fall back to busy-poll (no saving) — that's the first
-thing to check if idle power regresses.
-
-### Enabling it
-
-It's a U-Boot config option, so set it in the **durable** libreboot defconfig so
-it survives config regeneration:
-
-```
-# $LB/config/u-boot/gru_kevin/config/default
-CONFIG_ARMV8_UDELAY_EVENT_STREAM=y
-```
-
-Or, for a quick test, on the live config (wiped by the next `./mk -m u-boot`):
-
-```sh
-cd $LB/src/u-boot/default
-./scripts/config -e ARMV8_UDELAY_EVENT_STREAM
-make olddefconfig
-grep ARMV8_UDELAY_EVENT_STREAM .config     # -> CONFIG_ARMV8_UDELAY_EVENT_STREAM=y
-```
-
-Then rebuild U-Boot + coreboot (clean U-Boot + clear the staged ELF so coreboot
-re-pulls it):
-
-```sh
-cd $LB
-./mk -c u-boot gru_kevin
-./mk -b u-boot gru_kevin
-rm -f elf/u-boot/default/gru_kevin/default/*
-./mk -b coreboot gru_kevin
-```
+> How it was found: a long debug session (see POWERSAVE_FAILED_EFFORTS.md and the
+> `twwfi` command). The clincher was `twwfi irq` returning after its armed
+> interval once `HCR_EL2.IMO=1` + a real handler were added — the NXP i.MX forum
+> advice ("open the I-bit, vectors, GIC, handler") was right all along.
 
 ---
 
 ## Fix 2 — CPU frequency 600 → 408 MHz
 
 U-Boot's RK3399 clock driver (`drivers/clk/rockchip/clk_rk3399.c`, `rkclk_init`)
-sets both CPU clusters to a fixed **600 MHz** at init (the lowest preset it
-defines). Linux scales between **408 MHz and 1.5 GHz** and sits at 408 when
-idle. Dropping U-Boot to **408 MHz** matches Linux's idle point and reduces
-active power and heat.
+fixes both CPU clusters at **600 MHz**. Linux scales 408 MHz–1.5 GHz and idles at
+408. Dropping U-Boot to **408 MHz** matches Linux's idle point and cuts active
+power/heat. It complements Fix 1: WFI removes the "never sleeps" cost; the lower
+clock reduces the cost of the small time the core *is* awake.
 
-This is a clock-driver change (not typewriter code, and it touches U-Boot
-core), done separately. It complements Fix 1: the event stream removes the
-"never sleeps" cost; the lower clock reduces the cost of the (small) time the
-core *is* awake.
-
-> Note: `clk dump` on this board does **not** list the ARM cluster clocks
-> (`armclkl`/`armclkb`) — it only shows `xin24m` and the RTC — so you can't read
-> the running CPU frequency from the U-Boot shell here. Verify the effect by
-> temperature / battery drain instead.
+> `clk dump` here does **not** list the ARM cluster clocks (only `xin24m` + RTC),
+> so verify by temperature / battery drain, not the shell.
 
 ---
 
-## Fix 3 — dim the panel backlight (`^-` / `^=`)
+## Fix 3 — dim the panel backlight (`^-` / `^]`)
 
-If Fix 1 + Fix 2 did **not** move the needle (event stream confirmed set, drain
-still ~18 %/hr), the dominant draw is almost certainly the **LCD backlight**, not
-the CPU. U-Boot brings the panel up at **full brightness** and never lowers it,
-so it burns the same power whether you're typing or idle.
+U-Boot brings the LCD up at full brightness and never lowers it, so it burns the
+same power idle or not. The typewriter controls it:
 
-The typewriter now controls it:
+- Starts at **`TW_BACKLIGHT_DEFAULT` = 40 %** (`cmd_tw.h`).
+- **`^-`** dims 20 %, **`^]`** brightens 20 %. Floor `TW_BACKLIGHT_MIN = 20 %`
+  (never 0 / `BACKLIGHT_OFF`, which powers the PWM down and froze the panel).
+- `tw_backlight_set()` / `tw_backlight_step()` in `cmd_tw_video.c`.
 
-- Starts at **`TW_BACKLIGHT_DEFAULT` = 60 %** (see `cmd_tw.h`).
-- **`^-`** (Ctrl-minus) dims 20 %, **`^=`** (Ctrl-equal) brightens 20 %.
-- **0 %** fully powers the backlight PWM down (`BACKLIGHT_OFF`); the next `^=`
-  brings it back. A status line shows the current percent.
+> Keys: Ctrl+punctuation is keymap-dependent. Verified on this EC keyboard,
+> `^-` = `0x1F`, `^]` = `0x1D`; `^=` types a literal `=`, so brighten is `^]`.
 
-Implementation is confined to the typewriter: `tw_backlight_set()` /
-`tw_backlight_step()` in `cmd_tw_video.c`, keys handled in `cmd_tw.c`.
+### The backlight config chain must be built in
 
-### THE CATCH — the backlight config chain must be built in
-
-This does **nothing** unless U-Boot actually binds a controllable backlight
-device. On gru/kevin the control path is a **chain**, and *every* link needs its
-Kconfig or the whole thing silently no-ops:
+The control path is a chain, and *every* link needs its Kconfig or it silently
+no-ops:
 
 ```
 rk_edp (eDP) --rockchip,panel--> UCLASS_PANEL (simple-panel)
             --backlight phandle--> pwm-backlight --pwms--> cros-ec PWM
 ```
 
-| Link            | Config symbol         | Notes                                  |
-|-----------------|-----------------------|----------------------------------------|
-| simple panel    | `CONFIG_SIMPLE_PANEL` | `default y` w/ PANEL+BACKLIGHT+DM_GPIO |
-| pwm backlight   | `CONFIG_BACKLIGHT_PWM`| `default y` w/ BACKLIGHT+DM_PWM        |
-| PWM core        | `CONFIG_DM_PWM`       | **often dropped — the usual culprit**  |
-| cros-ec PWM     | `CONFIG_PWM_CROS_EC`  | gru backlight PWM lives on the EC      |
+| Link          | Config symbol          | Notes                                  |
+|---------------|------------------------|----------------------------------------|
+| simple panel  | `CONFIG_SIMPLE_PANEL`  | `default y` w/ PANEL+BACKLIGHT+DM_GPIO |
+| pwm backlight | `CONFIG_BACKLIGHT_PWM` | `default y` w/ BACKLIGHT+DM_PWM        |
+| PWM core      | `CONFIG_DM_PWM`        | **often dropped — the usual culprit**  |
+| cros-ec PWM   | `CONFIG_PWM_CROS_EC`   | gru backlight PWM lives on the EC      |
 
-The stock `chromebook_kevin_defconfig` sets `PWM_CROS_EC`, `PWM_ROCKCHIP`, and
-`REGULATOR_PWM`. **A libreboot config that omits `DM_PWM`/`PWM_CROS_EC` cannot
-control the backlight at all** — the code above finds no device and does nothing.
-Add to your libreboot U-Boot config:
-
+Add to the durable libreboot config (`$LB/config/u-boot/gru_kevin/config/default`):
 ```
-# $LB/config/u-boot/gru_kevin/config/default
 CONFIG_DM_PWM=y
 CONFIG_PWM_CROS_EC=y
 CONFIG_BACKLIGHT_PWM=y
 CONFIG_SIMPLE_PANEL=y
 ```
-
-Verify in the U-Boot shell after boot: `dm tree | grep -i "panel\|backlight\|pwm"`
-should list a panel + backlight + pwm device. If they're absent, the config
-didn't take and `^-`/`^=` will appear to do nothing.
-
-> Note on the keys: Ctrl chording punctuation is keymap-dependent. `^-` is bound
-> to `0x1F` and `^=` to `0x1D` (the bytes most US layouts emit). If a keypress
-> shows no brightness change on the real EC keyboard, tell me the raw byte and
-> I'll rebind — the values live in `cmd_tw.h` (`KEY_CTRL_MINUS`/`KEY_CTRL_EQUAL`).
+Verify after boot: `dm tree | grep -i "panel\|backlight\|pwm"` should list a
+panel + backlight + pwm device. If absent, `^-`/`^]` will appear to do nothing.
 
 ---
 
-## Fix 4 — throttle the idle key-wait loop
+## Fix 5 — `CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`
 
-Fix 1 makes each `udelay()` a WFE sleep, but the *loop around it* still does work
-every iteration. Two things ran too often in the editor's key-wait loop
-(`tw_read_key`, `cmd_tw.c`):
+Makes U-Boot's `__udelay()` (`arch/arm/cpu/armv8/generic_timer.c`) sleep the core
+in **WFE** via the ARMv8 event stream (self-wakes every ~5 µs) instead of a full
+busy-spin, whenever `current_el() >= 2`. The editor's idle path is real WFI
+(Fix 1), so this mainly helps other `udelay()` callers — but it's a cheap, safe
+default. Set it in the durable defconfig:
 
-- **The EC host-event poll** (power button / lid) was a **SPI transaction to the
-  EC every ~10 ms (100 Hz)** — clocking the bus and waking the EC MCU constantly.
-- The nap itself was only **10 ms**, so the core woke 100×/s even when idle.
+```
+# $LB/config/u-boot/gru_kevin/config/default
+CONFIG_ARMV8_UDELAY_EVENT_STREAM=y
+```
 
-Changes (constants in `cmd_tw.h`):
-- `TW_KEY_NAP_MS` **10 → 25 ms** — the per-iteration WFE nap. This is the
-  worst-case keystroke latency (still imperceptible), and the core now wakes
-  ~40×/s instead of 100×/s.
-- `TW_EC_POLL_MS` **= 200 ms** — the EC button/lid poll is now throttled to once
-  per 200 ms (~8× fewer EC/SPI transactions). Human reaction time is ~150 ms, so
-  a button press or lid close is still caught effectively instantly.
-
-The keyboard is still checked (`tstc()`) every nap, so typing latency is bounded
-by `TW_KEY_NAP_MS` (25 ms), not the EC interval. Battery %/backlight are
-unaffected (battery already polls at 30 s).
+**EL2 requirement (confirmed).** The event-stream path (and Fix 1's IMO routing)
+only work at EL2+. gru/kevin runs U-Boot at **EL2**: coreboot's bl31 hands the
+payload to EL2 non-secure and `CONFIG_ARMV8_SWITCH_TO_EL1` is off. The startup
+line prints it (`[ Read N lines - EL2 ]`); if it ever shows EL1, idle power will
+regress — check that first.
 
 ---
 
-## Investigation: real WFI idle — and why it's impossible here
+## Cycle-time / wake reference
 
-Deep sleep would be `WFI` (the core clock-gates until an interrupt), which is
-what Linux uses to idle this board (cpuidle state 0 = *"ARM WFI"*, woken by
-`arch_timer`). We tried hard to use it and **it cannot be done from where U-Boot
-runs.** This section records the investigation so nobody repeats it.
+The editor's key-wait loop (`tw_read_key`, `cmd_tw.c`) sleeps in `WFI` and wakes
+on interrupts or on its own timed deadlines. What wakes / polls, how often, and
+by what mechanism:
 
-Also note what this kills: an earlier idea to add an **idle "power-saving mode"**
-(dim the backlight after N seconds, poll lazily at 500 ms, wake on a key) was
-built on the belief that a longer `udelay` nap sleeps the CPU. It does not — the
-event-stream `udelay` is a WFE spin that self-wakes every ~5 µs (Fix 1), so a
-"500 ms lazy nap" is a 500 ms busy spin. Measured: no idle-power benefit
-(~15 %/hr, unchanged). **That power-saving mode was removed** — it added
-complexity (dim/wake/swallow logic, a `[power saving]` state) for zero CPU-idle
-gain. WFE is the idle mechanism; the backlight is dimmed only on demand (`^-`).
+| Event                         | Rate / latency   | Constant           | Method |
+|-------------------------------|------------------|--------------------|--------|
+| **Keystroke**                 | instant (IRQ)¹   | `TW_KEY_NAP_MS` 25 ms | cros_ec keyboard IRQ (INTID 46) wakes WFI early; worst case, next 25 ms timer tick |
+| **Power button**              | ≤ 200 ms         | `TW_EC_POLL_MS` 200 ms | polled: EC **host-event** flags (`cros_ec_get_host_events`), *not* the MKBP FIFO |
+| **Lid close**                 | ≤ 200 ms         | `TW_EC_POLL_MS` 200 ms | same EC host-event poll (`EC_HOST_EVENT_LID_CLOSED`) |
+| **Battery % (title `BAT:`)**  | 30 s             | `TW_BATT_POLL_MS` 30 s | polled: one EC `CHARGE_STATE` transaction; title repaints only if the % changed |
+| **WFI wake tick**             | 25 ms            | `TW_KEY_NAP_MS` 25 ms | armed CNTP timer (INTID 30) — bounds keystroke latency, re-checks the polls |
 
-### Why WFI needs a wake source, and the freezes
+¹ A keypress asserts the cros_ec interrupt (gpio0 PA1 → GIC INTID 46, NonSecure
+  Group1), which wakes the `WFI` immediately; the 25 ms tick is only the fallback
+  ceiling. Power button and lid are **polled** (not IRQ-woken) because they share
+  the EC host-event channel we read every 200 ms — well under human reaction time.
 
-A bare `WFI` froze the board because U-Boot has no armed interrupt to wake it
-(console is polled; the timer is only read, never set to fire an IRQ; no GIC
-init). To use WFI we must arm a timer interrupt that becomes a WFI wake event.
-Getting there was a chain of freezes, each debugged live from the U-Boot shell
-with `md`/`mw` and a standalone `twwfi` test command (which does a single armed
-WFI or a *safe, no-WFI* probe — see `cmd_twwfi.c`). What we found, in order:
-
-1. **Arch-timer PPI disabled.** `GICR_ISENABLER0 = 0x20004000` — bit 30 (INTID
-   30, the timer PPI) clear. Enabled it (`|= 1<<30`). Still froze.
-2. **Timer armed with `IMASK=1`.** The timer only asserts its interrupt when
-   `ENABLE=1 && ISTATUS=1 && IMASK=0`; with IMASK=1 it never fires. Fixed to
-   `IMASK=0` and masked the IRQ at the CPU (`PSTATE.I`) instead. Still froze.
-3. **`ICC_IGRPEN1 = 0`** — Group 1 disabled at the GIC CPU interface. Enabled
-   it. Still froze.
-
-At that point every "does WFI wake?" test cost a hard power-cycle, so `twwfi`
-grew a **safe probe** (`twwfi probe`) that arms the timer, polls the counter
-(no WFI), and reads how far the interrupt propagated. It reported:
-
-```
-timer CTL    = 0x5   ISTATUS=1        -> the timer fired
-GICR_ISPENDR0= ...   bit30=1          -> it latched pending at the redistributor
-ICC_HPPIR1   = 1023  (not 30)         -> the CPU interface presents NOTHING
-```
-
-So the interrupt was pending but the CPU interface wouldn't present it
-(`HPPIR1 = 1023`). The missing piece turned out to be a **distributor** enable
-that bl31 leaves off for the normal world:
-
-```
-GICD_CTLR = 0x35 = EnableGrp0 | EnableGrp1S | ARE_S | ARE_NS
-                   -> EnableGrp1NS (bit1) is CLEAR: the distributor does not
-                      forward NonSecure Group1 interrupts at all.
-```
-
-The arch timer is **not** secure. bl31 (`plat/rockchip/rk3399/rk3399_def.h`)
-secures only INTID 29 (the EL3 physical timer) + two SGIs; INTID 30 (CNTP, the
-NS timer) is Group1-NonSecure and ours to use. (An earlier draft of this doc
-wrongly blamed a "secure priority half" — priority `0x80`/PMR `0xf8` was never
-the blocker; the group-forwarding enable was.)
-
-Setting all three NS enables — `GICD_CTLR.EnableGrp1NS`, `ICC_IGRPEN1_EL1`, and
-the CNTP PPI — the safe probe finally showed **`ICC_HPPIR1 = 30`**: the timer
-interrupt is now fully deliverable to our PE.
-
-### ...but a masked-pending WFI still doesn't wake — the real missing piece
-
-With `HPPIR1 = 30` (interrupt deliverable), a WFI that leaves `PSTATE.I` masked
-and has no handler **still hangs**. The dead ends this produced (raw WFI, and
-even PSCI `CPU_SUSPEND` where bl31 does the WFI) all shared one wrong assumption:
-that a *masked, un-taken* pending interrupt would wake WFI. On this board it does
-not.
-
-The fix is the NXP-forum advice (see `ref/power_consumption/`, Weidong to
-Mohamed): **actually TAKE the interrupt.** And the specific thing U-Boot was
-missing is **`HCR_EL2.IMO`**: U-Boot's `start.S` sets `HCR_EL2.AMO` (route
-SError to EL2) but **not IMO**, so physical IRQs target **EL1, not our EL2** —
-our EL2 WFI was never the interrupt's target. Set `HCR_EL2.IMO = 1`, give it a
-real EL2 IRQ handler, unmask `PSTATE.I`, and the taken timer IRQ wakes WFI
-cleanly. (bl31 does *not* route IRQs to EL3 in normal running — that's why
-`rockchip_cpu_standby` has to *set* `SCR_EL3.IRQ` for its own WFI; in the normal
-NS running state IRQs are ours to take.)
-
-Verified with `twwfi irq`: **`WFI RETURNED, elapsed = 300 ms`.**
-
-### Solution: real WFI idle (`tw_idle_nap`)
-
-`tw_idle_nap()` now does deep WFI. Once (`tw_wfi_setup`): `GICD_CTLR.EnableGrp1NS`
-+ enable the CNTP PPI (INTID 30) + `ICC_PMR = 0xff` + `ICC_IGRPEN1_EL1 = 1`. Per
-nap: save `VBAR_EL2`/`HCR_EL2`, point `VBAR_EL2` at a minimal EL2 vector table
-(only the SPx-IRQ slot has a handler: ack `ICC_IAR1` → disable CNTP → EOI
-`ICC_EOIR1`), set `HCR_EL2.IMO`, arm CNTP (IMASK=0), `msr daifclr,#2`, `WFI`,
-re-mask, restore `VBAR_EL2`/`HCR_EL2`. The vector + IMO are swapped *per nap* so
-the rest of U-Boot keeps its own exception handling untouched.
-
-The core now genuinely clock-gates between naps — woken by the timer tick, or
-early by a cros_ec keypress/button/lid (INTID 46, also NS Group1). This is the
-deep idle Linux uses, and the big idle-power lever we were after.
-
-(arm64-only; host/non-arm64 builds fall back to a plain `udelay`.)
-
----
-
-## Cycle-time reference
-
-All periods are set in `cmd_tw.h`. The idle loop (`tw_read_key`) wakes every
-"nap", checks the keyboard, and services the other polls on their own deadlines.
-
-| What                          | Constant          | Value  |
-|-------------------------------|-------------------|--------|
-| WFE nap = keystroke latency   | `TW_KEY_NAP_MS`   | 25 ms  |
-| Power button / lid poll       | `TW_EC_POLL_MS`   | 200 ms |
-| Battery re-read (title `BAT:`)| `TW_BATT_POLL_MS` | 30 s   |
-
-Each "nap" is a WFE sleep (event-stream `udelay`, Fix 1). The keyboard is checked
-(`tstc()`) every nap, so typing latency is bounded by `TW_KEY_NAP_MS` (25 ms).
-
-Notes on the choices:
-- **25 ms keystroke nap** — worst-case latency from key press to it being read;
-  well below perception.
-- **200 ms button/lid poll** — each is an EC SPI transaction, so it's decoupled
-  from the fast keyboard check; 200 ms is under human reaction time.
-- **30 s battery** — battery moves ~1 %/several-min; the title only repaints when
-  the integer % changes, so this is near-free.
+Rationale for the values:
+- **25 ms nap** — worst-case key-to-read latency, below perception; also the WFI
+  re-check interval.
+- **200 ms EC poll** — each is a SPI transaction to the EC; decoupled from the
+  fast keyboard path so the bus isn't clocked every nap.
+- **30 s battery** — battery moves ~1 %/several-min; near-free (repaint only on
+  change).
 
 ---
 
 ## What did NOT matter
 
-- **The device tree / `.dtb`.** The DT describes hardware; it does not set the
-  CPU's run mode or idle behaviour. Display and PSCI work, so the DTB is fine.
-  It was not the cause of the power draw.
-- **Multiple CPU cores.** U-Boot proper runs on a single core (CPU0); the
-  others are left parked by the earlier boot stage. Not a spinning-cores
-  problem. (There is no `cpu` command in this build to enumerate them; enable
-  `CONFIG_CMD_CPU` if you want `cpu list`/`cpu detail`.)
+- **The device tree / `.dtb`** — describes hardware, not CPU run-mode/idle. Not
+  the cause of the draw.
+- **Multiple CPU cores** — U-Boot proper runs on CPU0 only; the others are parked
+  by the earlier boot stage.
 
 ---
 
 ## Measuring
 
-There's no `cpu`/cpufreq readout in U-Boot here, so measure indirectly:
-
-1. **CPU temperature** — let the typewriter sit idle a few minutes; feel the
-   bottom / read the sensor. Cooler after Fix 1 = the event stream engaged.
-2. **Battery drain** — note battery % over 15–30 min of idle and extrapolate to
-   %/hr. Target: down from ~20 %/hr toward Linux's ~6 %/hr.
-3. **Responsiveness** — typing must still feel instant. `udelay(10000)` still
-   returns after 10 ms; it just sleeps instead of spinning, so latency is
-   unchanged.
-
----
-
-## History / dead ends
-
-- **WFI deep-idle → SOLVED, but only after a long chain of wrong turns.** In
-  order: (a) the arch-timer PPI was disabled in the redistributor; (b) armed with
-  `IMASK=1` so it never asserted; (c) `ICC_IGRPEN1` off at the CPU interface; (d)
-  `GICD_CTLR.EnableGrp1NS` off at the distributor — fixing these got the
-  interrupt *deliverable* (`ICC_HPPIR1 = 30`) but a **masked, un-taken** WFI still
-  didn't wake. Several intermediate conclusions ("timer is secure", "held at EL3
-  / PSCI is the only way") were **wrong**. The actual fix: **take** the IRQ —
-  set `HCR_EL2.IMO=1` (U-Boot only set AMO, so IRQs targeted EL1 not our EL2),
-  install an EL2 handler, unmask `PSTATE.I`. Then WFI wakes. Full story in
-  "Investigation: real WFI idle" above; the NXP i.MX thread in
-  `ref/power_consumption/` had the right advice all along ("open the I-bit,
-  vectors, GIC, handler").
-- **Idle "power-saving mode" (dim after 20 s + lazy 500 ms poll) → removed.** It
-  assumed a longer `udelay` sleeps the CPU; it doesn't (WFE self-wakes every
-  ~5 µs), so it saved no idle power while adding dim/wake/swallow complexity.
+No `cpu`/cpufreq readout in U-Boot here, so measure indirectly:
+1. **CPU temperature** — idle a few minutes; cooler = WFI idle engaged.
+2. **Battery drain** — battery % over 15–30 min idle → %/hr. Target: from
+   ~20 %/hr toward Linux's ~6 %/hr.
+3. **Responsiveness** — typing must still feel instant (a keypress IRQ wakes WFI
+   immediately).
 
 ---
 
 ## References
 
-- `arch/arm/cpu/armv8/generic_timer.c` — `__udelay()` event-stream path.
-- `arch/arm/cpu/armv8/Kconfig` — `CONFIG_ARMV8_UDELAY_EVENT_STREAM`.
-- `arch/arm/include/asm/system.h` — `wfe()` / `wfi()`.
-- `drivers/clk/rockchip/clk_rk3399.c` — `rkclk_init()` CPU frequency presets.
-- `cmd_tw.c` — `tw_read_key()` key-wait loop (unchanged; benefits from Fix 1);
-  `^-`/`^=` brightness keys in `tw_handle_key()`.
+- `cmd_tw.c` — `tw_idle_nap()` / `tw_wfi_setup()` / `tw_idle_vectors` (Fix 1);
+  `tw_read_key()` key-wait loop; `^-`/`^]` brightness keys.
 - `cmd_tw_video.c` — `tw_backlight_set()` / `tw_backlight_step()` (Fix 3).
-- `drivers/video/panel-uclass.c` — `panel_set_backlight()` (panel → backlight).
-- `drivers/video/simple_panel.c` — resolves the panel's `backlight` phandle.
-- `drivers/video/rockchip/rk_edp.c` — `panel_enable_backlight()` on eDP enable.
-- `include/backlight.h` — `BACKLIGHT_OFF` (-1), `backlight_set_brightness()`.
+- `cmd_twwfi.c` — the `twwfi` idle/WFI diagnostic command (evidence trail).
+- `arch/arm/cpu/armv8/start.S` — sets `HCR_EL2.AMO` (not IMO — the Fix 1 gap).
+- `arch/arm/cpu/armv8/generic_timer.c` — `__udelay()` event-stream path (Fix 5).
+- `drivers/clk/rockchip/clk_rk3399.c` — `rkclk_init()` CPU frequency (Fix 2).
+- `plat/rockchip/rk3399/rk3399_def.h` (ATF) — secures INTID 29 only, not 30.
+- **POWERSAVE_FAILED_EFFORTS.md** — the dead ends and wrong turns.

@@ -18,9 +18,14 @@ the linked docs.
 - `CMD_TYPEWRITER=y` — the command
 - `VIDEO=y`, `FS_FAT=y` — framebuffer + FAT (deps)
 - `PWM_CROS_EC`, `DM_PWM`, `BACKLIGHT_PWM`, `SIMPLE_PANEL` — backlight `^-`/`^]` (POWERSAVE.md)
-- `ARMV8_UDELAY_EVENT_STREAM=y` — WFE idle, power (POWERSAVE.md)
+- `ARMV8_UDELAY_EVENT_STREAM=y` — WFE for plain `udelay()` (POWERSAVE.md Fix 5)
 - CPU freq 600→408 MHz — power (POWERSAVE.md)
 - `SYSRESET_PSCI` — leave **OFF**: breaks SPL/TPL link, unused (POWEROFF.md)
+
+## Idle power (no config; in cmd_tw.c)
+- **Real WFI deep idle** — `tw_idle_nap` sleeps the core, woken by CNTP timer +
+  cros_ec IRQ. Needs `HCR_EL2.IMO=1` + EL2 handler + GIC NS-Group1 enables, all
+  done at runtime. The big idle lever (POWERSAVE.md Fix 1).
 
 ## Device tree
 - **No DT patch needed** — `/psci { method="smc" }` already in `rk3399-base.dtsi` (POWEROFF.md)
