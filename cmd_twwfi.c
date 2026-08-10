@@ -168,7 +168,15 @@ static int do_probe(int hyp, unsigned int ms)
 	printf("PROBE %s (INTID %u), %u ms, NO WFI - safe.\n",
 	       hyp ? "CNTHP_EL2" : "CNTP_EL0", intid, ms);
 
-	/* Enable everything the same way the WFI path would. */
+	/* Enable everything the wake path needs:
+	 *  - GICD_CTLR.EnableGrp1NS (bit1): the DISTRIBUTOR forwards NS Group1 at
+	 *    all. bl31 leaves this CLEAR (GICD_CTLR=0x35), which is why HPPIR1 was
+	 *    1023 before - the missing piece. (INTID 30 is Group1-NS, NOT secure:
+	 *    bl31 only secures INTID 29, the EL3 timer.)
+	 *  - ICC_IGRPEN1_EL1 (CPU interface Group1 enable)
+	 *  - the timer PPI in the redistributor. */
+	setbits_le32((void *)GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
+	dsb();
 	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
 	isb();
 	writel(1U << intid, (void *)GICR_ISENABLER0);
@@ -210,15 +218,16 @@ static int do_probe(int hyp, unsigned int ms)
 
 		asm volatile("mrs %0, " STR(ICC_IGRPEN1_EL1) : "=r" (igrpen1));
 		asm volatile("mrs %0, " STR(ICC_RPR_EL1) : "=r" (rpr));
-		printf("  GICD_CTLR      = 0x%08x (bit6 DS=%u: 1=single sec state,"
-		       " 0=two)\n", gicd_ctlr, (gicd_ctlr >> 6) & 1);
+		printf("  GICD_CTLR(rb)  = 0x%08x (bit1 EnableGrp1NS=%u <- the fix)\n",
+		       gicd_ctlr, (gicd_ctlr >> 1) & 1);
 		printf("  ICC_IGRPEN1(rb)= 0x%lx (did our enable stick?)\n", igrpen1);
 		printf("  ICC_RPR        = 0x%lx (running priority; 0xff=idle)\n", rpr);
-		if (!((gicd_ctlr >> 6) & 1))
-			printf("  NOTE: DS=0 (two security states). A priority of 0x80"
-			       " is in the SECURE half; NonSecure Group1 (where we run"
-			       " at EL2) cannot see it -> HPPIR1=1023. The timer PPI is"
-			       " effectively a SECURE interrupt owned by bl31.\n");
+		if (hppir == intid)
+			printf("  => HPPIR1==%u: the PE now sees it. WFI WILL wake.\n",
+			       intid);
+		else if (!((gicd_ctlr >> 1) & 1))
+			printf("  => EnableGrp1NS still 0: distributor won't forward NS"
+			       " Group1 (write blocked?).\n");
 	}
 
 	/* Clean up: disable timer, clear pending. Leave IGRPEN1 as we found it? -
