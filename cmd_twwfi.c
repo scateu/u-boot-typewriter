@@ -518,6 +518,111 @@ static int do_suspend(unsigned int ms)
 	return 0;
 }
 
+/*
+ * Weidong's approach: TAKE the interrupt (don't rely on masked-pending WFI wake).
+ * The piece we missed: U-Boot sets HCR_EL2.AMO but NOT HCR_EL2.IMO, so physical
+ * IRQs target EL1, not our EL2 - our WFI at EL2 was never the IRQ's target. Set
+ * IMO=1 so the IRQ targets EL2, install a tiny EL2 vector whose IRQ entry acks
+ * the timer + EOIs + returns, unmask PSTATE.I, arm CNTP, WFI. If the IRQ is
+ * genuinely taken, WFI wakes unambiguously.
+ *
+ * The minimal EL2 vector table (below, tw_irq_vectors) is 2 KiB-aligned; only
+ * the "Current EL SPx IRQ" slot (offset 0x280) has a real handler that:
+ *   x0 = ICC_IAR1_EL1 (ack)     -- read the interrupt id
+ *   disable CNTP (msr cntp_ctl_el0, xzr) so it de-asserts
+ *   msr ICC_EOIR1_EL1, x0 (EOI)
+ *   eret
+ * All other slots just eret (we don't expect them during the ~ms window).
+ */
+extern char tw_irq_vectors[];
+asm(
+"	.pushsection .text.tw_irq_vec, \"ax\"		\n"
+"	.align 11					\n"   /* 2 KiB aligned */
+"tw_irq_vectors:					\n"
+	/* --- Current EL SP0: sync/irq/fiq/err (offsets 0x000..0x180) --- */
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+	/* --- Current EL SPx: sync (0x200) --- */
+"	.align 7					\n" "	eret\n"
+	/* --- Current EL SPx: IRQ (0x280) -- our handler ---
+	 * Save/restore x0/x1 (the interrupted context may hold live values across
+	 * the WFI we return to). */
+"	.align 7					\n"
+"	stp	x0, x1, [sp, #-16]!			\n"
+"	mrs	x0, S3_0_C12_C12_0			\n"   /* ICC_IAR1_EL1 (ack) */
+"	msr	cntp_ctl_el0, xzr			\n"   /* disable CNTP -> deassert */
+"	dsb	sy					\n"
+"	msr	S3_0_C12_C12_1, x0			\n"   /* ICC_EOIR1_EL1 (EOI) */
+"	isb						\n"
+"	ldp	x0, x1, [sp], #16			\n"
+"	eret						\n"
+	/* --- Current EL SPx: fiq (0x300), err (0x380) --- */
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+	/* --- Lower EL aarch64 (0x400..0x580) + aarch32 (0x600..0x780) --- */
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+"	.align 7					\n" "	eret\n"
+"	.popsection					\n"
+);
+
+static int do_irq_wfi(unsigned int ms)
+{
+	unsigned long rate = rd_cntfrq();
+	unsigned long ticks = (rate / 1000) * ms;
+	unsigned long vbar_save, hcr_save, t0, t1;
+
+	printf("IRQ-taken WFI test: HCR_EL2.IMO=1 + real handler, arm %u ms.\n", ms);
+	printf("If the prompt returns, taking the IRQ at EL2 wakes WFI.\n");
+
+	/* GIC: forward NS Group1, enable PPI + CPU-interface group, open PMR. */
+	setbits_le32((void *)GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
+	dsb();
+	writel(1U << 30, (void *)GICR_ISENABLER0);    /* INTID 30 PPI */
+	dsb();
+	asm volatile("msr " STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));
+	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
+	isb();
+
+	/* Save + install our EL2 vector table; set HCR_EL2.IMO (route phys IRQ
+	 * to EL2). AMO(bit5)/IMO(bit4)/FMO(bit3) - IMO is bit4. */
+	asm volatile("mrs %0, vbar_el2" : "=r" (vbar_save));
+	asm volatile("mrs %0, hcr_el2"  : "=r" (hcr_save));
+	asm volatile("msr vbar_el2, %0" : : "r" ((unsigned long)tw_irq_vectors));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save | (1UL << 4)));
+	isb();
+
+	t0 = rd_cntpct();
+
+	/* Arm CNTP (ENABLE, IMASK=0), then TAKE irqs: clear PSTATE.I and WFI. */
+	asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
+	asm volatile("msr cntp_ctl_el0, %0" : : "r" (1UL));
+	isb();
+	asm volatile("msr daifclr, #2");   /* PSTATE.I = 0 -> IRQs taken */
+	wfi();
+	asm volatile("msr daifset, #2");   /* re-mask */
+
+	t1 = rd_cntpct();
+
+	/* Restore VBAR/HCR and disable the timer. */
+	asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
+	asm volatile("msr vbar_el2, %0" : : "r" (vbar_save));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save));
+	isb();
+
+	printf("WFI RETURNED. elapsed = %lu ms\n", (t1 - t0) / (rate / 1000));
+	printf("=> Taking the IRQ at EL2 (HCR_EL2.IMO=1 + handler) wakes WFI."
+	       " This is the path to build.\n");
+	return 0;
+}
+
 static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		    char *const argv[])
 {
@@ -536,6 +641,8 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	if (!strcmp(argv[1], "suspend"))
 		return do_suspend(ms);
+	if (!strcmp(argv[1], "irq"))
+		return do_irq_wfi(ms);
 	if (!strcmp(argv[1], "gpio"))
 		return do_gpio_probe();
 	if (!strcmp(argv[1], "spi")) {
@@ -561,9 +668,9 @@ U_BOOT_CMD(
 	twwfi, 4, 0, do_twwfi,
 	"WFI/idle test (power idle debug)",
 	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
-	"twwfi suspend [ms] - PSCI CPU_SUSPEND (STANDBY) via bl31 (HANGS on this\n"
-	"                     board - bl31 standby won't wake on our NS IRQ; kept\n"
-	"                     as evidence, see POWERSAVE.md).\n"
+	"twwfi suspend [ms] - PSCI CPU_SUSPEND (STANDBY) via bl31 (HANGS - evidence)\n"
+	"twwfi irq [ms]     - TAKE the IRQ: HCR_EL2.IMO=1 + real EL2 handler + WFI.\n"
+	"                     Weidong's approach - the untried one. Returns => wakes.\n"
 	"twwfi probe [p|hp] - SAFE: arm timer, poll (no WFI), report propagation\n"
 	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
 	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"
