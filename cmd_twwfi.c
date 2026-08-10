@@ -711,7 +711,10 @@ static int do_keystroke(unsigned int ms)
 	unsigned long naps = 0, t_start, t_end;
 
 	printf("keystroke test: editor-style %u ms WFI naps until a key.\n", ms);
-	printf("Should go QUIET (deep sleep) and 'freeze' until you press a key.\n");
+	printf("EXPECT: board goes QUIET / 'frozen' (deep WFI sleep). A keypress\n");
+	printf("wakes it (early, via the EC IRQ); otherwise it re-naps every %u ms.\n",
+	       ms);
+	printf("Press a key when ready...\n");
 
 	/* One-time GIC enables (same as tw_wfi_setup): NS Group1 fwd + CNTP PPI
 	 * + PMR open + CPU-interface group. */
@@ -785,7 +788,7 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 
 	if (!strcmp(argv[1], "keystroke"))
 		return do_keystroke(argc >= 3 ? simple_strtoul(argv[2], NULL, 10)
-					      : 25);   /* editor's TW_KEY_NAP_MS */
+					      : 5000);  /* 5 s naps: human-observable */
 	if (!strcmp(argv[1], "suspend"))
 		return do_suspend(ms);
 	if (!strcmp(argv[1], "irq"))
@@ -818,8 +821,8 @@ U_BOOT_CMD(
 	"WFI/idle test (power idle debug)",
 	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
 	"twwfi keystroke [ms] - the EDITOR's exact idle nap in a loop until a key\n"
-	"                     (default 25 ms). Should go quiet + freeze till a key;\n"
-	"                     reports naps/avg to prove WFI actually sleeps.\n"
+	"                     (default 5000 ms so it's observable). Should go quiet +\n"
+	"                     freeze till a key; reports naps/avg to prove WFI sleeps.\n"
 	"twwfi irq [ms]     - TAKE timer IRQ (HCR_EL2.IMO + handler) + WFI. Works;\n"
 	"                     this is what the editor's idle nap does.\n"
 	"twwfi ecwake       - EC GPIO (INTID 46) as WFI wake IRQ, NO timer. Press a\n"
