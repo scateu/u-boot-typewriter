@@ -24,6 +24,12 @@
 #include <cros_ec.h>
 #include <asm/system.h>
 #include <time.h>
+#if defined(CONFIG_ARM64) && defined(__aarch64__)
+#include <asm/io.h>       /* readl/writel/setbits_le32 for the WFI GIC setup */
+#include <asm/gic.h>      /* ICC_* sysreg encodings */
+#define _TW_STR(x) #x
+#define TW_STR(x)  _TW_STR(x)
+#endif
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 
@@ -46,23 +52,113 @@ static struct tw_state g_tw;
 
 /* ------------------------------------------------------------ WFE idle --- */
 /*
- * Low-power idle nap = WFE via udelay. At EL2 udelay() uses the ARMv8 event
- * stream (CONFIG_ARMV8_UDELAY_EVENT_STREAM) to WFE between counter checks rather
- * than hot-spinning. It is not deep sleep (the event stream self-wakes every
- * ~5 us) but it's what we use.
+ * Low-power idle nap = real WFI deep sleep, woken by the NonSecure physical
+ * timer (CNTP, INTID 30) - the same way Linux idles this board.
  *
- * We investigated real WFI (deep sleep, timer-woken, like Linux). The GIC side
- * is fully solvable from NonSecure EL2 - the arch-timer INTID 30 is Group1-NS
- * (bl31 only secures INTID 29), and enabling GICD_CTLR.EnableGrp1NS +
- * ICC_IGRPEN1_EL1 + the CNTP PPI makes the interrupt reach the PE (verified:
- * ICC_HPPIR1 == 30). But WFI STILL does not wake even then - the interrupt is
- * routed to EL3/bl31 (SCR_EL3.IRQ) or WFI is trapped, which we can't change from
- * U-Boot. Kept as WFE. Full story + the `twwfi` diagnostic in POWERSAVE.md.
+ * The long investigation (see POWERSAVE.md + the `twwfi` command) landed here:
+ * WFI wakes only if the timer IRQ is actually TAKEN, which needs three things
+ * U-Boot doesn't set up by default -
+ *   1. HCR_EL2.IMO = 1     - route physical IRQ to EL2 (U-Boot only sets AMO,
+ *                            so IRQs targeted EL1 and our EL2 WFI never woke);
+ *   2. the GIC enabled for NS Group1 (GICD_CTLR.EnableGrp1NS + ICC_IGRPEN1_EL1
+ *      + the CNTP PPI + ICC_PMR open);
+ *   3. an EL2 IRQ handler that acks (ICC_IAR1) + EOIs (ICC_EOIR1) the timer.
+ * Then: arm CNTP (IMASK=0), unmask PSTATE.I, WFI - the taken timer IRQ wakes it.
+ * A cros_ec keypress/button/lid (INTID 46, also NS Group1) wakes it early too.
+ * bl31 leaves IRQs un-routed to EL3 in normal running, so taking them at EL2
+ * works. (Verified: `twwfi irq` returns after the armed interval.)
  */
+#if defined(CONFIG_ARM64) && defined(__aarch64__)
+#define TW_GICD_CTLR        0xfee00000UL      /* GIC distributor control */
+#define TW_GICR_ISENABLER0  0xfef10100UL      /* CPU0 redistributor SGI frame */
+
+/*
+ * Minimal EL2 vector table. Only the Current-EL-SPx IRQ slot (offset 0x280) has
+ * a handler; it acks the pending interrupt, disables CNTP so it de-asserts, EOIs,
+ * and returns. Every other slot just eret (we only ever expect the timer IRQ
+ * while napping, with all other exceptions still impossible). 2 KiB aligned.
+ */
+extern char tw_idle_vectors[];
+asm(
+"	.pushsection .text.tw_idle_vec, \"ax\"		\n"
+"	.align 11					\n"
+"tw_idle_vectors:					\n"
+"	.align 7\n eret\n"	/* SP0 sync  */
+"	.align 7\n eret\n"	/* SP0 irq   */
+"	.align 7\n eret\n"	/* SP0 fiq   */
+"	.align 7\n eret\n"	/* SP0 err   */
+"	.align 7\n eret\n"	/* SPx sync  */
+"	.align 7					\n"	/* SPx IRQ - ours */
+"	stp	x0, x1, [sp, #-16]!			\n"
+"	mrs	x0, S3_0_C12_C12_0			\n"	/* ICC_IAR1_EL1 ack */
+"	msr	cntp_ctl_el0, xzr			\n"	/* disable CNTP     */
+"	dsb	sy					\n"
+"	msr	S3_0_C12_C12_1, x0			\n"	/* ICC_EOIR1_EL1 EOI */
+"	isb						\n"
+"	ldp	x0, x1, [sp], #16			\n"
+"	eret						\n"
+"	.align 7\n eret\n"	/* SPx fiq   */
+"	.align 7\n eret\n"	/* SPx err   */
+"	.align 7\n eret\n	.align 7\n eret\n"	/* lower a64 sync/irq */
+"	.align 7\n eret\n	.align 7\n eret\n"	/* lower a64 fiq/err  */
+"	.align 7\n eret\n	.align 7\n eret\n"	/* lower a32 sync/irq */
+"	.align 7\n eret\n	.align 7\n eret\n"	/* lower a32 fiq/err  */
+"	.popsection					\n"
+);
+
+/* One-time: enable the GIC path (persistent, harmless to leave on). VBAR_EL2 and
+ * HCR_EL2.IMO are NOT changed here - they're swapped per-nap (below) so U-Boot's
+ * normal exception handling is untouched except during the brief WFI window. */
+static void tw_wfi_setup(void)
+{
+	static int done;
+
+	if (done)
+		return;
+	done = 1;
+	setbits_le32((void *)TW_GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
+	dsb();
+	writel(1U << 30, (void *)TW_GICR_ISENABLER0);    /* INTID 30 CNTP PPI */
+	dsb();
+	asm volatile("msr " TW_STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));
+	asm volatile("msr " TW_STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
+	isb();
+}
+
 static void tw_idle_nap(unsigned int ms)
 {
-	udelay(ms * 1000);      /* WFE via the event stream at EL2 */
+	unsigned long ticks = (get_tbclk() / 1000) * ms;
+	unsigned long vbar_save, hcr_save;
+
+	tw_wfi_setup();
+
+	/* Point VBAR_EL2 at our minimal IRQ vector and route phys IRQ to EL2
+	 * (HCR_EL2.IMO=1) - only for the duration of this nap, then restore, so
+	 * the rest of U-Boot keeps its own vectors / IRQ routing. */
+	asm volatile("mrs %0, vbar_el2" : "=r" (vbar_save));
+	asm volatile("mrs %0, hcr_el2"  : "=r" (hcr_save));
+	asm volatile("msr vbar_el2, %0" : : "r" ((unsigned long)tw_idle_vectors));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save | (1UL << 4)));
+	isb();
+
+	/* Arm CNTP (ENABLE, IMASK=0 so it asserts), take IRQs, WFI. The handler
+	 * acks/disables/EOIs; a keypress IRQ can wake early too. */
+	asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
+	asm volatile("msr cntp_ctl_el0, %0" : : "r" (1UL));
+	isb();
+	asm volatile("msr daifclr, #2");     /* PSTATE.I = 0 -> IRQ taken */
+	wfi();
+	asm volatile("msr daifset, #2");     /* re-mask */
+	asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));   /* ensure off */
+
+	/* Restore U-Boot's vectors + IRQ routing. */
+	asm volatile("msr vbar_el2, %0" : : "r" (vbar_save));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save));
+	isb();
 }
+#else   /* host / non-arm64: plain delay (WFE-equivalent) */
+static void tw_idle_nap(unsigned int ms) { udelay(ms * 1000); }
+#endif
 
 /* ----------------------------------------------------------- key input --- */
 /* Read one logical keypress: cooked ASCII (0x00-0xFF) or an extended KEY_*

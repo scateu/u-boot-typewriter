@@ -670,7 +670,7 @@ U_BOOT_CMD(
 	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
 	"twwfi suspend [ms] - PSCI CPU_SUSPEND (STANDBY) via bl31 (HANGS - evidence)\n"
 	"twwfi irq [ms]     - TAKE the IRQ: HCR_EL2.IMO=1 + real EL2 handler + WFI.\n"
-	"                     Weidong's approach - the untried one. Returns => wakes.\n"
+	"                     THE WORKING PATH (returns ~ms). Now used by the editor.\n"
 	"twwfi probe [p|hp] - SAFE: arm timer, poll (no WFI), report propagation\n"
 	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
 	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"

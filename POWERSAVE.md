@@ -9,28 +9,19 @@ they are U-Boot config.
 
 ## TL;DR
 
-Four levers that helped, and one that was proven impossible:
+Five levers:
 
-1. **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`** — makes `udelay()` sleep with `WFE`
-   (event stream) instead of hot-spinning. **Confirmed EL2 on gru/kevin.** This
-   is a self-waking ~5 µs WFE, not deep sleep, but it's the idle mechanism we
-   use (see the WFI investigation for why deep WFI isn't available).
-2. **CPU frequency 600 MHz → 408 MHz** — fixed lower OPP; less active power/heat.
-3. **Dim the backlight** (`^-` / `^]`, default 40 %) — a big share of idle draw.
+1. **Real WFI deep idle** — the key one. The editor's idle nap is a true `WFI`
+   woken by the NonSecure arch-timer (CNTP), the same way Linux idles this board.
+   The missing piece was **`HCR_EL2.IMO`** (U-Boot only set AMO, so IRQs targeted
+   EL1 not our EL2) plus a real EL2 IRQ handler + the GIC NS-Group1 enables. The
+   core genuinely clock-gates between keystrokes now. See the WFI investigation.
+2. **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`** — makes plain `udelay()` (used
+   elsewhere) sleep with WFE rather than hot-spinning. **Confirmed EL2.**
+3. **CPU frequency 600 MHz → 408 MHz** — fixed lower OPP; less active power/heat.
+4. **Dim the backlight** (`^-` / `^]`, default 40 %) — a big share of idle draw.
    Needs the backlight PWM config chain (`DM_PWM` + `PWM_CROS_EC` + …).
-4. **Throttle the idle loop** (Fix 4) — EC button/lid poll cut from 100 Hz to
-   5 Hz; less EC/SPI traffic between keystrokes.
-
-**Deep WFI idle: not reachable from U-Boot here (proven).** Linux idles this
-board with WFI woken by the arch-timer. We got the GIC fully configured from
-NonSecure EL2 so the timer interrupt is deliverable (`ICC_HPPIR1 = 30`), but raw
-WFI won't wake (that needs `SCR_EL3.IRQ`, which only EL3 sets). We then tried
-the designed escape hatch — `PSCI CPU_SUSPEND`, where bl31 does the WFI at EL3 —
-and it *also* hangs, even with a NonSecure interrupt force-pending (verified from
-the shell with `md`/`mw`, no reflash). So deep idle needs bl31 changes we can't
-make. We keep WFE. (An earlier idle "power-saving mode" that assumed a longer
-`udelay` slept the CPU — it doesn't — was also removed.) See "Investigation:
-real WFI idle" below.
+5. **Throttle the idle loop** — EC button/lid poll cut from 100 Hz to 5 Hz.
 
 Measured before any change: **~20 %/hr battery, warm CPU** (vs Linux ~6 %/hr,
 9 h life). Reference: a suspected further draw (Linux and U-Boot) is the **WiFi
@@ -339,51 +330,41 @@ Setting all three NS enables — `GICD_CTLR.EnableGrp1NS`, `ICC_IGRPEN1_EL1`, an
 the CNTP PPI — the safe probe finally showed **`ICC_HPPIR1 = 30`**: the timer
 interrupt is now fully deliverable to our PE.
 
-### ...and yet WFI STILL does not wake
+### ...but a masked-pending WFI still doesn't wake — the real missing piece
 
-With `HPPIR1 = 30` (interrupt deliverable, `ICC_RPR = 0xff` idle), a real armed
-`WFI` **still hangs**. Everything the GIC can express from NonSecure is correct.
-The reason is `SCR_EL3.IRQ`: a physical IRQ only wakes a lower-EL WFI when it is
-routed to EL3, and **only EL3 can set that bit**. From NonSecure EL2, our WFI
-can't be woken by an IRQ — full stop. This is confirmed by bl31's own code
-(`plat/rockchip/common/plat_pm.c`, `rockchip_cpu_standby`), which for a STANDBY
-CPU_SUSPEND does `write_scr_el3(scr | SCR_IRQ_BIT); wfi;` — it sets that bit
-itself, precisely because a lower EL can't.
+With `HPPIR1 = 30` (interrupt deliverable), a WFI that leaves `PSTATE.I` masked
+and has no handler **still hangs**. The dead ends this produced (raw WFI, and
+even PSCI `CPU_SUSPEND` where bl31 does the WFI) all shared one wrong assumption:
+that a *masked, un-taken* pending interrupt would wake WFI. On this board it does
+not.
 
-### The PSCI CPU_SUSPEND route — also a dead end (proven via md/mw)
+The fix is the NXP-forum advice (see `ref/power_consumption/`, Weidong to
+Mohamed): **actually TAKE the interrupt.** And the specific thing U-Boot was
+missing is **`HCR_EL2.IMO`**: U-Boot's `start.S` sets `HCR_EL2.AMO` (route
+SError to EL2) but **not IMO**, so physical IRQs target **EL1, not our EL2** —
+our EL2 WFI was never the interrupt's target. Set `HCR_EL2.IMO = 1`, give it a
+real EL2 IRQ handler, unmask `PSTATE.I`, and the taken timer IRQ wakes WFI
+cleanly. (bl31 does *not* route IRQs to EL3 in normal running — that's why
+`rockchip_cpu_standby` has to *set* `SCR_EL3.IRQ` for its own WFI; in the normal
+NS running state IRQs are ours to take.)
 
-So we tried the designed escape hatch: `PSCI CPU_SUSPEND` (STANDBY, level 0),
-which makes **bl31** do the WFI at EL3 (where `SCR_EL3.IRQ` is set) and return on
-a NonSecure interrupt — the same path Linux's `cpu-sleep`/`cluster-sleep` use.
-It **also hangs.**
+Verified with `twwfi irq`: **`WFI RETURNED, elapsed = 300 ms`.**
 
-We proved this needs no reflash, entirely from the U-Boot shell with `md`/`mw`:
+### Solution: real WFI idle (`tw_idle_nap`)
 
-```
-mw.l 0xfee00000 0x37          # GICD_CTLR |= EnableGrp1NS  -> reads 0x37
-mw.l 0xfef10100 0x40000000    # enable INTID 30 PPI        -> reads 0x60004000
-mw.l 0xfef10200 0x40000000    # FORCE INTID 30 pending     -> reads 0x40000000
-twwfi suspend                 # PSCI CPU_SUSPEND(STANDBY) ... HANGS
-```
+`tw_idle_nap()` now does deep WFI. Once (`tw_wfi_setup`): `GICD_CTLR.EnableGrp1NS`
++ enable the CNTP PPI (INTID 30) + `ICC_PMR = 0xff` + `ICC_IGRPEN1_EL1 = 1`. Per
+nap: save `VBAR_EL2`/`HCR_EL2`, point `VBAR_EL2` at a minimal EL2 vector table
+(only the SPx-IRQ slot has a handler: ack `ICC_IAR1` → disable CNTP → EOI
+`ICC_EOIR1`), set `HCR_EL2.IMO`, arm CNTP (IMASK=0), `msr daifclr,#2`, `WFI`,
+re-mask, restore `VBAR_EL2`/`HCR_EL2`. The vector + IMO are swapped *per nap* so
+the rest of U-Boot keeps its own exception handling untouched.
 
-With a NonSecure Group1 interrupt **already pending and deliverable**, bl31's
-standby WFI *still* did not wake. So bl31's standby only wakes on the wake
-sources Rockchip built it for (its own PMU/GPIO wake path), not an arbitrary NS
-timer — and we can't change bl31 from U-Boot.
+The core now genuinely clock-gates between naps — woken by the timer tick, or
+early by a cros_ec keypress/button/lid (INTID 46, also NS Group1). This is the
+deep idle Linux uses, and the big idle-power lever we were after.
 
-### Conclusion: keep WFE (proven end to end)
-
-Deep idle is not reachable from U-Boot on this board. Both routes fail:
-- **raw WFI at NS-EL2** — can't wake (needs `SCR_EL3.IRQ`, EL3-only);
-- **PSCI CPU_SUSPEND** (bl31 does the WFI) — doesn't wake on our NS interrupt
-  even when it's force-pending.
-
-The GIC misconfig was real and fully solved (`HPPIR1` 1023 → 30); the remaining
-wall is EL3/bl31 firmware behaviour. `tw_idle_nap()` stays a plain event-stream
-`udelay` (WFE). The `twwfi` command remains in the tree as the diagnostic and
-the evidence trail. (The i.MX7D NXP-forum thread in `ref/power_consumption/` is
-the same shape: WFI-from-timer needs firmware/GIC
-cooperation that isn't there.)
+(arm64-only; host/non-arm64 builds fall back to a plain `udelay`.)
 
 ---
 
@@ -439,18 +420,21 @@ There's no `cpu`/cpufreq readout in U-Boot here, so measure indirectly:
 
 ## History / dead ends
 
-- **WFI deep-idle → dead end (held at EL3 by firmware).** A long chain of
-  freezes; the GIC side turned out fully solvable from NonSecure EL2 (enable
-  `GICD_CTLR.EnableGrp1NS` + `ICC_IGRPEN1_EL1` + the CNTP PPI → `ICC_HPPIR1 = 30`,
-  interrupt deliverable), but WFI *still* won't wake because IRQs are routed to
-  EL3 / WFI is trapped by bl31. Full story in "Investigation: real WFI idle"
-  above. We use **WFE + event stream** instead.
+- **WFI deep-idle → SOLVED, but only after a long chain of wrong turns.** In
+  order: (a) the arch-timer PPI was disabled in the redistributor; (b) armed with
+  `IMASK=1` so it never asserted; (c) `ICC_IGRPEN1` off at the CPU interface; (d)
+  `GICD_CTLR.EnableGrp1NS` off at the distributor — fixing these got the
+  interrupt *deliverable* (`ICC_HPPIR1 = 30`) but a **masked, un-taken** WFI still
+  didn't wake. Several intermediate conclusions ("timer is secure", "held at EL3
+  / PSCI is the only way") were **wrong**. The actual fix: **take** the IRQ —
+  set `HCR_EL2.IMO=1` (U-Boot only set AMO, so IRQs targeted EL1 not our EL2),
+  install an EL2 handler, unmask `PSTATE.I`. Then WFI wakes. Full story in
+  "Investigation: real WFI idle" above; the NXP i.MX thread in
+  `ref/power_consumption/` had the right advice all along ("open the I-bit,
+  vectors, GIC, handler").
 - **Idle "power-saving mode" (dim after 20 s + lazy 500 ms poll) → removed.** It
   assumed a longer `udelay` sleeps the CPU; it doesn't (WFE self-wakes every
   ~5 µs), so it saved no idle power while adding dim/wake/swallow complexity.
-- A full **timer-interrupt + GIC** setup can't help either, since the timer IRQ
-  itself is secure (see the i.MX8 case in `ref/power_consumption/` where a
-  similar attempt hung for a related reason).
 
 ---
 
