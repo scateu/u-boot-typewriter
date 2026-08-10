@@ -271,17 +271,20 @@ static int do_wfi_test(int hyp, unsigned int ms)
 	printf("If the prompt does NOT return, this timer does not wake WFI here"
 	       " - power-cycle.\n");
 
-	/* Enable the chosen PPI in the redistributor (write-1-to-set). */
+	/*
+	 * Enable ALL THREE NS enables the `probe` proved are needed to make the
+	 * interrupt reach the PE (ICC_HPPIR1 went 1023 -> 30 only with all three).
+	 * The earlier version of THIS function set only two of them - it never set
+	 * GICD_CTLR.EnableGrp1NS - which is why `twwfi p` still froze while `probe`
+	 * showed HPPIR1=30. Now they match.
+	 *   1. GICD_CTLR.EnableGrp1NS (bit1) - distributor forwards NS Group1
+	 *   2. the timer PPI in the redistributor
+	 *   3. ICC_IGRPEN1_EL1 - CPU interface Group1 enable
+	 */
+	setbits_le32((void *)GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
+	dsb();
 	writel(1U << intid, (void *)GICR_ISENABLER0);
 	dsb();
-
-	/*
-	 * THE FIX (found via the state dump): ICC_IGRPEN1 was 0, i.e. Group 1
-	 * interrupts were DISABLED at the GIC CPU interface, so a pending INTID 30
-	 * was never signalled to the PE and WFI never woke. Enable Group 1 here.
-	 * (ICC_SRE=0xf, ICC_PMR=0xf8 > priority 0x80, INTID 30 is Group1-NS - all
-	 * already fine per the dump, so this one bit is the whole fix.)
-	 */
 	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
 	isb();
 
