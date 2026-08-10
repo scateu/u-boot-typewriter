@@ -23,7 +23,6 @@
 #include <dm.h>
 #include <cros_ec.h>
 #include <asm/system.h>
-#include <asm/io.h>
 #include <time.h>
 #include "cmd_tw.h"
 #include "wubi_embed.h"
@@ -42,105 +41,27 @@ int  tw_cp_cols(u32 cp);
 int  tw_line_rows(struct tw_state *s, int fr);
 int  tw_backlight_set(int pct);   /* set brightness 0..100, returns applied */
 int  tw_backlight_step(int delta);/* step by delta (+/-), returns applied */
-void tw_backlight_dim(void);      /* power-save: dim to min (keeps user level) */
-void tw_backlight_restore(void);  /* power-save wake: restore user level */
 
 static struct tw_state g_tw;
 
-/* ------------------------------------------------------------ WFI idle --- */
+/* ------------------------------------------------------------ WFE idle --- */
 /*
- * Low-power idle nap using the ARM generic timer + WFI.
+ * Low-power idle nap = WFE via udelay. At EL2 udelay() uses the ARMv8 event
+ * stream (CONFIG_ARMV8_UDELAY_EVENT_STREAM) to WFE between counter checks rather
+ * than hot-spinning. It is not deep sleep (the event stream self-wakes every
+ * ~5 us) but it's what we use.
  *
- * The editor's key-wait loop used to spin in a WFE `udelay`, which - via the
- * event stream - self-wakes every ~5 us and so NEVER actually sleeps the core
- * (the "500 ms lazy poll" was really a 500 ms busy spin). Linux on this board
- * idles with real WFI (cpuidle state 0 = "ARM WFI"), woken by the non-secure
- * physical timer (arch_timer = GICv3 INTID 30), CPUs at EL2. We do the same:
- *
- *   enable INTID 30 in the GIC redistributor (once), then per nap:
- *   arm CNTP to fire in `ms`, WFI, disable CNTP.
- *
- * WHY THE FIRST TRY FROZE, and the fix (debugged live via md/mw on hardware):
- * a bare "arm CNTP + WFI" hung because **INTID 30 was DISABLED in CPU0's GIC
- * redistributor** (GICR_ISENABLER0 read 0x20004000 - bit 30 clear). The timer's
- * condition fired, but with the PPI disabled the GICv3 never forwarded it, so no
- * WFI wake-up event reached the core. Linux works because its arch_timer driver
- * enables that PPI; we never did. Setting bit 30 (write-1-to-set) fixed it, and
- * doing so did NOT storm (nothing was pending), confirmed on the board.
- *
- * We keep the timer IRQ MASKED (CNTP_CTL.IMASK=1) and leave DAIF masked, so the
- * interrupt WAKES WFI (a pending enabled interrupt is a wake event regardless of
- * PSTATE mask) but is never TAKEN - so U-Boot's panicking do_irq never runs and
- * we need no handler. A cros_ec keypress IRQ is also a wake event (early wake);
- * if it isn't, the timer tick wakes us within `ms`. A timer is always armed
- * before WFI, so it can't hang the way the un-enabled first attempt did.
+ * We investigated real WFI (deep sleep, timer-woken, like Linux). The GIC side
+ * is fully solvable from NonSecure EL2 - the arch-timer INTID 30 is Group1-NS
+ * (bl31 only secures INTID 29), and enabling GICD_CTLR.EnableGrp1NS +
+ * ICC_IGRPEN1_EL1 + the CNTP PPI makes the interrupt reach the PE (verified:
+ * ICC_HPPIR1 == 30). But WFI STILL does not wake even then - the interrupt is
+ * routed to EL3/bl31 (SCR_EL3.IRQ) or WFI is trapped, which we can't change from
+ * U-Boot. Kept as WFE. Full story + the `twwfi` diagnostic in POWERSAVE.md.
  */
-/* Real timer+WFI only in the actual arm64 U-Boot build. The host functest
- * (.cc/) defines neither CONFIG_ARM64 nor the U-Boot build context, so it takes
- * the udelay stub below - important on an Apple-Silicon host, where __aarch64__
- * alone is true but EL0 userspace must not run wfi / access these sysregs. */
-#if defined(CONFIG_ARM64) && defined(__aarch64__)
-#define CNTP_CTL_ENABLE  (1U << 0)
-#define CNTP_CTL_IMASK   (1U << 1)
-
-/* GICv3 redistributor for CPU0 on rk3399 (verified by md/mw from the U-Boot
- * shell): SGI_base = 0xfef10000, so GICR_ISENABLER0 = 0xfef10100. INTID 30 =
- * the non-secure physical arch-timer PPI. ISENABLER is write-1-to-set. */
-#define TW_GICR_ISENABLER0  0xfef10100UL
-#define TW_TIMER_PPI_BIT    (1U << 30)
-
-/* Enable the arch-timer PPI once so its interrupt can wake WFI. */
-static void tw_timer_ppi_enable(void)
-{
-	static int done;
-
-	if (!done) {
-		done = 1;
-		writel(TW_TIMER_PPI_BIT, (void *)TW_GICR_ISENABLER0);
-	}
-}
-
-static void tw_wfi_nap(unsigned int ms)
-{
-	unsigned long rate = get_tbclk();          /* 24 MHz on RK3399 */
-	unsigned long ticks = (rate / 1000) * ms;
-
-	tw_timer_ppi_enable();
-
-	/* Arm the physical timer: down-count `ticks`, enabled but IRQ masked. */
-	asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
-	asm volatile("msr cntp_ctl_el0, %0" : :
-		     "r" ((unsigned long)(CNTP_CTL_ENABLE | CNTP_CTL_IMASK)));
-	isb();
-
-	wfi();                                     /* sleep until timer or IRQ */
-
-	/* Disable the timer so its (masked) condition doesn't stay asserted. */
-	asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
-	isb();
-}
-#else   /* host build / non-arm64: just delay */
-static void tw_wfi_nap(unsigned int ms) { udelay(ms * 1000); }
-#endif
-
-/*
- * Nap `ms` ms. DEFAULT = WFE via udelay (proven, never hangs).
- *
- * WFI is DISABLED (TW_USE_WFI = 0): even after enabling the arch-timer PPI
- * (INTID 30) in the GIC redistributor, WFI still froze on gru/kevin - so the
- * wake model is still wrong (the armed CNTP timer is not producing a WFI wake-up
- * event here). The WFI code (tw_wfi_nap) is kept for further debugging; flip
- * TW_USE_WFI to 1 to try it. Using a runtime `if` on a constant (not #if) keeps
- * tw_wfi_nap referenced so it doesn't warn as unused; the dead branch is
- * eliminated by the optimiser when the flag is 0.
- */
-#define TW_USE_WFI 0
 static void tw_idle_nap(unsigned int ms)
 {
-	if (TW_USE_WFI)
-		tw_wfi_nap(ms);
-	else
-		udelay(ms * 1000);
+	udelay(ms * 1000);      /* WFE via the event stream at EL2 */
 }
 
 /* ----------------------------------------------------------- key input --- */
@@ -168,82 +89,42 @@ static int tw_getch_timeout(void)
 
 static int tw_poweroff_event_pending(void);   /* defined below (EC section) */
 
-/* Set by the key handler so the wait loop knows whether we're in power-saving
- * mode (lazy polling, no battery refresh). tw_read_key has no tw_state pointer,
- * so this file-static bridges the two. */
-static int tw_saving;
-static void tw_set_saving(int on) { tw_saving = on; }
-
 static int tw_read_key(void)
 {
 	static unsigned long batt_next;    /* ms deadline: next battery refresh */
 	static unsigned long ec_next;      /* ms deadline: next EC event poll */
-	static unsigned long last_input;   /* ms of last real keystroke */
-	static int seeded;
 	int c;
-
-	if (!seeded) {                     /* first call: start the idle clock now */
-		seeded = 1;
-		last_input = get_timer(0);
-	}
 
 	/*
 	 * Wait for a key. U-Boot's console is polled (no "sleep until key").
 	 *
-	 * Power: each nap is a real WFI sleep (tw_idle_nap -> tw_wfi_nap) - the core
-	 * clock-gates until an armed CNTP timer expiry (our tick) or a keypress IRQ
-	 * wakes it. The earlier bare WFI froze because the arch-timer PPI (INTID 30)
-	 * was disabled in the GIC redistributor, so the timer never woke it; we now
-	 * enable that PPI once (see tw_wfi_nap) and it wakes reliably.
-	 * TW_KEY_NAP_MS (25 ms) is the worst-case keystroke latency.
-	 *
-	 * Power-saving mode: after TW_IDLE_SAVE_MS with no key, we return KEY_PWRSAVE
-	 * (the handler dims the backlight + shows [power saving]) and switch to lazy
-	 * TW_SAVE_NAP_MS (500 ms) naps - now REAL 500 ms WFI sleeps, so the core is
-	 * genuinely idle (not the old self-waking WFE spin). The next real key ends
-	 * the wait normally; the handler notices power-saving, wakes (restores
-	 * brightness/speed), then types that key - so no keystroke is lost.
+	 * Idle: each nap is a WFE sleep (event-stream udelay, see tw_idle_nap).
+	 * Deep WFI isn't usable here (routed to EL3/bl31 - see POWERSAVE.md), so WFE
+	 * it is. TW_KEY_NAP_MS (25 ms) is the worst-case keystroke latency.
 	 *
 	 * The EC host-event poll (power button / lid) is a SPI transaction, so we
-	 * throttle it to TW_EC_POLL_MS (200 ms) awake / TW_SAVE_NAP_MS while saving.
-	 * We use the HOST EVENT channel, not the MKBP FIFO (shared with the cros_ec
-	 * keyboard - draining it would steal keys).
+	 * throttle it to TW_EC_POLL_MS (200 ms). We use the HOST EVENT channel, not
+	 * the MKBP FIFO (shared with the cros_ec keyboard - draining it steals keys).
 	 *
-	 * Every TW_BATT_POLL_MS (when awake) we return KEY_REFRESH so the caller
-	 * re-reads the battery gauge and repaints the title only if the % changed.
+	 * Every TW_BATT_POLL_MS we return KEY_REFRESH so the caller re-reads the
+	 * battery gauge and repaints the title only if the % changed.
 	 */
 	while (!tstc()) {
 		unsigned long now = get_timer(0);
-		unsigned long nap  = tw_saving ? TW_SAVE_NAP_MS  : TW_KEY_NAP_MS;
-		unsigned long ecp  = tw_saving ? TW_SAVE_NAP_MS  : TW_EC_POLL_MS;
-		unsigned long batp = tw_saving ? TW_BATT_SAVE_MS : TW_BATT_POLL_MS;
 
 		if (now >= ec_next) {
-			ec_next = now + ecp;
+			ec_next = now + TW_EC_POLL_MS;
 			if (tw_poweroff_event_pending())
 				return KEY_POWER_BTN;
 		}
-		/* Battery keeps refreshing even while saving (the user may be
-		 * reading the dimmed screen), just at a slower cadence. The
-		 * KEY_REFRESH handler only updates batt_pct/title - it does NOT
-		 * leave power-saving mode. */
 		if (now >= batt_next) {
-			batt_next = now + batp;
+			batt_next = now + TW_BATT_POLL_MS;
 			return KEY_REFRESH;
 		}
-		if (!tw_saving && now - last_input >= TW_IDLE_SAVE_MS)
-			return KEY_PWRSAVE;   /* enter power-saving */
-
 		schedule();               /* keep the watchdog fed */
-		tw_idle_nap(nap);         /* real WFI sleep (timer/keypress woken) */
+		tw_idle_nap(TW_KEY_NAP_MS);
 	}
 
-	last_input = get_timer(0);
-
-	/* A key ended the wait. If we were in power-saving, the key handler will
-	 * notice (s->power_saving) and wake first, THEN process this key - so the
-	 * waking key types normally rather than being swallowed. tw_read_key just
-	 * returns the real key either way. */
 	c = getchar();
 
 	if (c != KEY_ESC)
@@ -1344,32 +1225,6 @@ static void tw_handle_key(struct tw_state *s, int key)
 			s->dirty_title = 1;
 		}
 		return;
-	}
-
-	/* Enter power-saving: dim the backlight, flag it (title shows the mode),
-	 * and tell the wait loop to poll lazily. first_paint forces a full repaint
-	 * so ALL chrome bars pick up the black power-save background (not just the
-	 * title). */
-	if (key == KEY_PWRSAVE) {
-		if (!s->power_saving) {
-			s->power_saving = 1;
-			tw_backlight_dim();
-			tw_set_saving(1);
-			s->first_paint = 1;
-		}
-		return;
-	}
-
-	/* A real key arrived while power-saving: wake first (restore brightness +
-	 * normal polling, full repaint so the bars go back to gray), then FALL
-	 * THROUGH so this same key is processed normally - the waking key types
-	 * rather than being lost. (Reached only for genuine keys; the synthetic
-	 * maintenance keys above already returned.) */
-	if (s->power_saving) {
-		s->power_saving = 0;
-		tw_backlight_restore();
-		tw_set_saving(0);
-		s->first_paint = 1;
 	}
 
 	if (s->prompt != TW_PROMPT_NONE) {

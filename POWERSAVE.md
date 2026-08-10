@@ -9,30 +9,30 @@ they are U-Boot config.
 
 ## TL;DR
 
-Six levers. The idle-power ones are Fix 6 (real WFI sleep) and Fix 5 (dim +
-lengthen the sleep when idle); the rest are supporting.
+Four levers that helped, and one that was proven impossible:
 
-1. **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`** — makes plain `udelay()` sleep with
-   `WFE` (event stream) instead of busy-spinning. **Confirmed EL2 on gru/kevin.**
-   NB: this is a self-waking ~5 µs spin, good for short delays but *not* real
-   idle for the key-wait loop — that's what Fix 6 replaced it with.
+1. **`CONFIG_ARMV8_UDELAY_EVENT_STREAM=y`** — makes `udelay()` sleep with `WFE`
+   (event stream) instead of hot-spinning. **Confirmed EL2 on gru/kevin.** This
+   is a self-waking ~5 µs WFE, not deep sleep, but it's the idle mechanism we
+   use (see the WFI investigation for why deep WFI isn't available).
 2. **CPU frequency 600 MHz → 408 MHz** — fixed lower OPP; less active power/heat.
 3. **Dim the backlight** (`^-` / `^]`, default 40 %) — a big share of idle draw.
    Needs the backlight PWM config chain (`DM_PWM` + `PWM_CROS_EC` + …).
 4. **Throttle the idle loop** (Fix 4) — EC button/lid poll cut from 100 Hz to
    5 Hz; less EC/SPI traffic between keystrokes.
-5. **Idle power-saving mode** (Fix 5) — after 20 s idle, dim + `[power saving]` +
-   stretch the sleep to 500 ms. Any key wakes and that key still types.
-6. **Real WFI idle** (Fix 6) — **the key fix.** Each nap is now a true `WFI`
-   sleep woken by an armed CNTP timer (or a keypress IRQ), so the core actually
-   clock-gates. The earlier "lazy poll" was a WFE busy-spin that never slept.
-   Modelled on Linux, which idles this board the same way (WFI + arch_timer).
+
+**Deep WFI idle: not reachable from U-Boot here.** Linux idles this board with
+WFI woken by the arch-timer. We got the GIC fully configured from NonSecure EL2
+so the timer interrupt is deliverable to our PE (`ICC_HPPIR1 = 30`), but WFI
+*still* won't wake — IRQs are routed to EL3 / WFI is trapped by bl31, which we
+can't change. Fully investigated (and an earlier idle "power-saving mode" that
+assumed a longer `udelay` slept the CPU — it doesn't — was removed). See
+"Investigation: real WFI idle" below.
 
 Measured before any change: **~20 %/hr battery, warm CPU** (vs Linux ~6 %/hr,
-9 h life). The WFE "throttle" (Fixes 4–5) alone did *not* help (35 min → 9 %,
-~15 %/hr) because the CPU never actually slept — Fix 6 is what addresses that.
-Reference: a suspected further draw (Linux and U-Boot) is the **WiFi module left
-powered but unmanaged** — not yet addressed (would need regulator/PMIC gating).
+9 h life). Reference: a suspected further draw (Linux and U-Boot) is the **WiFi
+module left powered but unmanaged** — not yet addressed (needs regulator/PMIC
+gating).
 
 ---
 
@@ -273,120 +273,89 @@ unaffected (battery already polls at 30 s).
 
 ---
 
-## Fix 5 — idle power-saving mode (dim + go lazy)
+## Investigation: real WFI idle — and why it's impossible here
 
-The biggest idle lever, modelled on how terminals go idle: after
-`TW_IDLE_SAVE_MS` (20 s) with no keystroke the editor enters **power-saving
-mode** and stays there until you press a key.
+Deep sleep would be `WFI` (the core clock-gates until an interrupt), which is
+what Linux uses to idle this board (cpuidle state 0 = *"ARM WFI"*, woken by
+`arch_timer`). We tried hard to use it and **it cannot be done from where U-Boot
+runs.** This section records the investigation so nobody repeats it.
 
-While saving:
-- the **backlight dims to the minimum** (`tw_backlight_dim()` — remembers your
-  chosen level, doesn't clobber it);
-- the title bar shows **`[power saving]`** and all chrome bars go black;
-- the idle loop goes **lazy**: WFI nap and EC poll both stretch to
-  `TW_SAVE_NAP_MS` (500 ms) instead of 25/200 ms, so the core (real WFI sleep,
-  Fix 6) and the EC/SPI bus are almost entirely quiet.
+Also note what this kills: an earlier idea to add an **idle "power-saving mode"**
+(dim the backlight after N seconds, poll lazily at 500 ms, wake on a key) was
+built on the belief that a longer `udelay` nap sleeps the CPU. It does not — the
+event-stream `udelay` is a WFE spin that self-wakes every ~5 µs (Fix 1), so a
+"500 ms lazy nap" is a 500 ms busy spin. Measured: no idle-power benefit
+(~15 %/hr, unchanged). **That power-saving mode was removed** — it added
+complexity (dim/wake/swallow logic, a `[power saving]` state) for zero CPU-idle
+gain. WFE is the idle mechanism; the backlight is dimmed only on demand (`^-`).
 
-Waking: **any key** wakes it, and **that key still types** — the wait ends
-normally, the key handler notices power-saving is on, wakes (restores brightness
-+ normal cadence, repaints), then processes the key. So no keystroke is lost; you
-only pay the ≤500 ms wake latency on that first key.
+### Why WFI needs a wake source, and the freezes
 
-Power button / lid still work while saving (checked on the 500 ms lazy poll, so
-up to ~0.5 s latency there — fine for poweroff).
+A bare `WFI` froze the board because U-Boot has no armed interrupt to wake it
+(console is polled; the timer is only read, never set to fire an IRQ; no GIC
+init). To use WFI we must arm a timer interrupt that becomes a WFI wake event.
+Getting there was a chain of freezes, each debugged live from the U-Boot shell
+with `md`/`mw` and a standalone `twwfi` test command (which does a single armed
+WFI or a *safe, no-WFI* probe — see `cmd_twwfi.c`). What we found, in order:
 
-Tunables in `cmd_tw.h`: `TW_IDLE_SAVE_MS` (idle timeout), `TW_SAVE_NAP_MS` (lazy
-cadence). Implementation: the wait loop (`tw_read_key`) tracks `last_input` and
-returns synthetic `KEY_PWRSAVE` / `KEY_PWRSAVE_WAKE`; the handler flips
-`s->power_saving`, dims/restores, and toggles the loop's lazy flag.
+1. **Arch-timer PPI disabled.** `GICR_ISENABLER0 = 0x20004000` — bit 30 (INTID
+   30, the timer PPI) clear. Enabled it (`|= 1<<30`). Still froze.
+2. **Timer armed with `IMASK=1`.** The timer only asserts its interrupt when
+   `ENABLE=1 && ISTATUS=1 && IMASK=0`; with IMASK=1 it never fires. Fixed to
+   `IMASK=0` and masked the IRQ at the CPU (`PSTATE.I`) instead. Still froze.
+3. **`ICC_IGRPEN1 = 0`** — Group 1 disabled at the GIC CPU interface. Enabled
+   it. Still froze.
 
----
-
-## Fix 6 — REAL WFI idle (the nap actually sleeps now)
-
-**Correcting an earlier mistake.** Fixes 4–5 made the idle loop *nap* in
-`udelay()`, believing that was low-power because of the event stream (Fix 1).
-It is not, for the loop's purpose: the event-stream `udelay` is a **WFE spin that
-self-wakes every ~5 µs** (EVNTI=7 → 128 ticks at 24 MHz). So a "500 ms nap" was
-really a 500 ms *busy spin* — the core never slept, it just did the EC/keyboard
-work less often. Measured: 35 min → 9 % (~15 %/hr), i.e. **no CPU idle benefit**.
-(Thanks to the ARM review that caught this.)
-
-**The real fix: WFI woken by an armed timer whose PPI is enabled.** Linux on this
-board proves the path — cpuidle state 0 is *"ARM WFI"*, woken by `arch_timer`
-(GICv3 **INTID 30**, the non-secure physical timer `CNTP`), CPUs at **EL2**. The
-editor now naps with:
+At that point every "does WFI wake?" test cost a hard power-cycle, so `twwfi`
+grew a **safe probe** (`twwfi probe`) that arms the timer, polls the counter
+(no WFI), and reads how far the interrupt propagated. It reported:
 
 ```
-enable INTID 30 in the GIC redistributor (once)      ; GICR_ISENABLER0 |= 1<<30
-arm CNTP to fire in `ms`  (cntp_tval_el0 = ms·rate, cntp_ctl_el0 = ENABLE|IMASK)
-wfi()                     ; core clock-gates until timer expiry OR a keypress IRQ
-disable CNTP
+timer CTL    = 0x5   ISTATUS=1        -> the timer fired
+GICR_ISPENDR0= ...   bit30=1          -> it latched pending at the redistributor
+ICC_HPPIR1   = 1023  (not 30)         -> the CPU interface presents NOTHING
 ```
 
-### Why the FIRST attempt froze (debugged live via `md`/`mw`)
-
-The first version did only "arm CNTP + WFI" and **hung**. Reading the GIC from
-the U-Boot shell found the cause:
-
-```
-=> md.l 0xfef10100 1      # GICR_ISENABLER0 (CPU0 redistributor)
-   0xfef10100: 20004000   # bit 30 CLEAR -> INTID 30 (arch timer PPI) DISABLED
-```
-
-The `CNTP` condition fired, but with its PPI **disabled in the redistributor**
-the GICv3 never forwarded it, so **no WFI wake-up event reached the core** → it
-slept forever. Linux avoids this because its `arch_timer` driver enables the PPI
-(`enable_percpu_irq`); we never did. Enabling bit 30 live confirmed the fix:
+So the interrupt was pending but the CPU interface wouldn't present it
+(`HPPIR1 = 1023`). The missing piece turned out to be a **distributor** enable
+that bl31 leaves off for the normal world:
 
 ```
-=> mw.l 0xfef10100 0x40000000   # write-1-to-set bit 30
-=> md.l 0xfef10100 1
-   0xfef10100: 60004000         # bit 30 now set; board stayed alive (no storm)
+GICD_CTLR = 0x35 = EnableGrp0 | EnableGrp1S | ARE_S | ARE_NS
+                   -> EnableGrp1NS (bit1) is CLEAR: the distributor does not
+                      forward NonSecure Group1 interrupts at all.
 ```
 
-### ...but enabling the PPI was NOT sufficient — WFI still froze
+The arch timer is **not** secure. bl31 (`plat/rockchip/rk3399/rk3399_def.h`)
+secures only INTID 29 (the EL3 physical timer) + two SGIs; INTID 30 (CNTP, the
+NS timer) is Group1-NonSecure and ours to use. (An earlier draft of this doc
+wrongly blamed a "secure priority half" — priority `0x80`/PMR `0xf8` was never
+the blocker; the group-forwarding enable was.)
 
-With `GICR_ISENABLER0 |= (1<<30)` added, arm-CNTP + WFI **still hung**. So the
-wake model is still wrong. Leading theory: we run at **EL2**, but `CNTP_*_EL0` is
-the **EL1** physical timer (INTID 30 — what Linux fires *from EL1*). While
-executing at EL2 the EL1 timer's interrupt output can be gated by `CNTHCTL_EL2`,
-so it may never assert as a wake event for us. The **EL2-native** timer is
-`CNTHP_*_EL2` (INTID 26) — that is likely the one to arm when running at EL2.
+Setting all three NS enables — `GICD_CTLR.EnableGrp1NS`, `ICC_IGRPEN1_EL1`, and
+the CNTP PPI — the safe probe finally showed **`ICC_HPPIR1 = 30`**: the timer
+interrupt is now fully deliverable to our PE.
 
-**Current state: WFI idle is DISABLED** (`TW_USE_WFI = 0` in `cmd_tw.c`); the live
-idle path is the proven WFE `udelay`. The WFI code is kept for debugging.
+### ...and yet WFI STILL does not wake
 
-### Debugging safely: the `twwfi` command
+With `HPPIR1 = 30` (interrupt deliverable, `ICC_RPR = 0xff` idle), a real armed
+`WFI` **still hangs**. Everything the GIC can express from NonSecure is correct,
+so the remaining cause is above our pay grade: the physical IRQ is **routed to
+EL3** (bl31 runs with `SCR_EL3.IRQ = 1`, taking IRQs to EL3), and/or `WFI` is
+trapped (`SCR_EL3.TWI` / `HCR_EL2.TWI`). In either case the wake-up/handling is
+owned by firmware we can't change from U-Boot. The `twwfi probe` even prints
+this as the last-resort diagnosis ("PE CAN see INTID 30; if WFI doesn't wake,
+IRQ is routed to EL3 or WFI is trapped").
 
-To stop freezing the *editor* while testing, `cmd_twwfi.c` adds a standalone
-shell command that does a SINGLE armed WFI — a freeze there costs only a
-power-cycle, not an editing session:
+### Conclusion: keep WFE
 
-```
-=> twwfi            # dump EL, CNTFRQ, CNTPCT (x2), CNTHCTL_EL2, GICR_ISENABLER0
-=> twwfi hp         # enable INTID 26, arm CNTHP_EL2, one WFI (EL2-timer theory)
-=> twwfi p          # enable INTID 30, arm CNTP_EL0,  one WFI (the frozen case)
-```
-
-If the prompt returns, that timer wakes WFI (it prints the elapsed ms) — wire
-that timer into `tw_wfi_nap` and set `TW_USE_WFI = 1`. If it hangs, power-cycle
-and try the other. Expectation: `twwfi hp` (CNTHP/INTID 26) wakes; `twwfi p`
-(CNTP/INTID 30) hangs, matching the theory.
-
-The redistributor address (`GICR_ISENABLER0 = 0xfef10100` for CPU0 on rk3399) was
-verified by the `md`/`mw` session above; it is a `#define` in `cmd_tw.c` /
-`cmd_twwfi.c`.
-
-Host-build note: the real `mrs`/`msr`/`wfi` + `writel` are compiled only under
-`CONFIG_ARM64 && __aarch64__`; the `.cc` functest (and any non-arm64 build) uses
-a `udelay` stub — important on Apple-Silicon hosts where `__aarch64__` is true
-but EL0 can't run these.
-
-Net effect: awake, 25 ms naps become real WFI sleeps (same latency ceiling);
-power-saving 500 ms naps become **real 500 ms sleeps** — the core wakes twice a
-second, checks, sleeps again. This is the change that should move idle drain
-toward Linux's ~6 %/hr.
+Deep WFI idle is not reachable from U-Boot on this board — not because of a GIC
+misconfig (that part is fully solvable and was solved) but because IRQ
+routing/WFI-trapping is held at EL3 by bl31. `tw_idle_nap()` stays a plain
+event-stream `udelay` (WFE). The `twwfi` command remains in the tree as the
+diagnostic and the evidence trail. (The i.MX7D NXP-forum thread in
+`ref/power_consumption/` is the same shape: WFI-from-timer needs firmware/GIC
+cooperation that isn't there.)
 
 ---
 
@@ -395,39 +364,22 @@ toward Linux's ~6 %/hr.
 All periods are set in `cmd_tw.h`. The idle loop (`tw_read_key`) wakes every
 "nap", checks the keyboard, and services the other polls on their own deadlines.
 
-| What                          | Constant           | Awake    | Power-saving |
-|-------------------------------|--------------------|----------|--------------|
-| WFI nap = keystroke latency   | `TW_KEY_NAP_MS`    | 25 ms    | 500 ms¹      |
-| Power button / lid poll       | `TW_EC_POLL_MS`    | 200 ms   | 500 ms¹      |
-| Battery re-read (title `BAT:`)| `TW_BATT_POLL_MS` / `TW_BATT_SAVE_MS` | 30 s | 60 s² |
-| Idle before power-saving      | `TW_IDLE_SAVE_MS`  | 20 s     | —            |
-| Lazy nap/poll while saving    | `TW_SAVE_NAP_MS`   | —        | 500 ms       |
+| What                          | Constant          | Value  |
+|-------------------------------|-------------------|--------|
+| WFE nap = keystroke latency   | `TW_KEY_NAP_MS`   | 25 ms  |
+| Power button / lid poll       | `TW_EC_POLL_MS`   | 200 ms |
+| Battery re-read (title `BAT:`)| `TW_BATT_POLL_MS` | 30 s   |
 
-Each "nap" is a real WFI sleep (Fix 6), woken by the armed CNTP timer at the nap
-period or early by a keypress IRQ — the core is genuinely asleep in between, not
-spinning.
-
-¹ In power-saving mode the nap and the EC (button/lid) poll both run at
-  `TW_SAVE_NAP_MS` (500 ms). So a keypress, power button, or lid close is noticed
-  within ~0.5 s — and a keypress *wakes* the editor (restoring the 25 ms / 200 ms
-  awake cadence) and **still types**, so no keystroke is lost.
-
-² Battery keeps refreshing while saving (the dimmed screen is still readable),
-  just at 60 s instead of 30 s. The `KEY_REFRESH` handler only updates the title
-  — it does not leave power-saving. The 20 s idle timer only runs while awake and
-  resets on every keystroke.
+Each "nap" is a WFE sleep (event-stream `udelay`, Fix 1). The keyboard is checked
+(`tstc()`) every nap, so typing latency is bounded by `TW_KEY_NAP_MS` (25 ms).
 
 Notes on the choices:
 - **25 ms keystroke nap** — worst-case latency from key press to it being read;
-  well below perception, and one real WFI sleep per nap.
+  well below perception.
 - **200 ms button/lid poll** — each is an EC SPI transaction, so it's decoupled
   from the fast keyboard check; 200 ms is under human reaction time.
-- **30 s / 60 s battery** — battery moves ~1 %/several-min; the title only
-  repaints when the integer % changes, so this is near-free either way. Slower
-  (60 s) while saving since a dim, idle screen doesn't need a snappy gauge.
-- **20 s → power-saving** — terminals go idle around this mark (the reference
-  point: most stop blinking the cursor ~15 s). Short enough to save power during
-  a real pause, and since the waking key still types, an early trip is harmless.
+- **30 s battery** — battery moves ~1 %/several-min; the title only repaints when
+  the integer % changes, so this is near-free.
 
 ---
 
@@ -459,15 +411,18 @@ There's no `cpu`/cpufreq readout in U-Boot here, so measure indirectly:
 
 ## History / dead ends
 
-- **WFI in the key loop → froze the board.** Root cause: U-Boot proper has *no*
-  interrupt source (polled console, timer only polled via `CNTPCT`, no GIC init),
-  so the WFI wake event is never produced — masking is a red herring. Full
-  analysis in "Why WFE, not WFI — root cause of the WFI freeze" above. Fix: use
-  **WFE + event stream**, which self-wakes from the timer with no interrupt.
-- A full **timer-interrupt + GIC** setup would let WFI sleep deeper, but it is
-  much more involved and risky (see the i.MX8 case in `ref/power_consumption/`
-  where the same attempt hung); the event stream achieves near-equivalent idle
-  with one config option and no interrupt plumbing.
+- **WFI deep-idle → dead end (held at EL3 by firmware).** A long chain of
+  freezes; the GIC side turned out fully solvable from NonSecure EL2 (enable
+  `GICD_CTLR.EnableGrp1NS` + `ICC_IGRPEN1_EL1` + the CNTP PPI → `ICC_HPPIR1 = 30`,
+  interrupt deliverable), but WFI *still* won't wake because IRQs are routed to
+  EL3 / WFI is trapped by bl31. Full story in "Investigation: real WFI idle"
+  above. We use **WFE + event stream** instead.
+- **Idle "power-saving mode" (dim after 20 s + lazy 500 ms poll) → removed.** It
+  assumed a longer `udelay` sleeps the CPU; it doesn't (WFE self-wakes every
+  ~5 µs), so it saved no idle power while adding dim/wake/swallow complexity.
+- A full **timer-interrupt + GIC** setup can't help either, since the timer IRQ
+  itself is secure (see the i.MX8 case in `ref/power_consumption/` where a
+  similar attempt hung for a related reason).
 
 ---
 

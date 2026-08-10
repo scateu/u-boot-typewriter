@@ -24,18 +24,14 @@
 #include "cmd_tw.h"
 #include "font_data.h"
 
-/* Precomputed native-pixel colors. Text area is B/W (max contrast for reading);
- * the chrome bars (title + bottom hints) use a muted gray so they don't grab
- * attention. All packed once at init - drawing a colored bar costs the same as
- * a white one.
- *
- * C_BAR/C_BARTX are the ACTIVE bar colors, selected each frame in tw_render:
- * gray normally, or plain black in power-saving mode (a clear visual indicator
- * that the screen is dimmed/idle). The two variants are precomputed. */
-static u32 C_FG, C_BG;              /* text area: white on black */
-static u32 C_BAR, C_BARTX;          /* active title/candidate bar colors */
-static u32 C_BAR_GRAY, C_BAR_SAVE;  /* bar bg: gray (normal) / black (saving) */
-static u32 C_HINT, C_HINT_GRAY;     /* bottom hint bar bg (a touch darker) */
+/* Precomputed native-pixel colors. Text area is B/W (max contrast for reading).
+ * The title/candidate bar uses a muted gray so it doesn't grab attention; the
+ * bottom hint bar uses plain black (transparent) so it recedes fully. Text on
+ * both bars is light gray. All packed once at init - a colored bar costs the
+ * same as a white one. */
+static u32 C_FG, C_BG;      /* text area: white on black */
+static u32 C_BAR, C_BARTX;  /* title/candidate bar: light-gray text on gray */
+static u32 C_HINT;          /* bottom hint bar bg: plain black (transparent) */
 
 static struct udevice    *g_vdev;
 static struct video_priv *g_vp;
@@ -341,14 +337,11 @@ int tw_video_init(struct tw_state *s)
 	s->fb_w = g_vp->xsize;
 	s->fb_h = g_vp->ysize;
 
-	C_FG = tw_pack_bw(1);   /* white text */
-	C_BG = tw_pack_bw(0);   /* black background */
-	C_BAR_GRAY  = tw_pack_rgb(0x60, 0x60, 0x60); /* normal: muted gray bars */
-	C_BAR_SAVE  = tw_pack_bw(0);                 /* power-save: black bars */
-	C_HINT_GRAY = tw_pack_rgb(0x48, 0x48, 0x48); /* hint bar: a touch darker */
-	C_BARTX     = tw_pack_rgb(0xd0, 0xd0, 0xd0); /* light-gray text on bars */
-	C_BAR       = C_BAR_GRAY;                     /* active bg (set per frame) */
-	C_HINT      = C_HINT_GRAY;
+	C_FG    = tw_pack_bw(1);                  /* white text */
+	C_BG    = tw_pack_bw(0);                  /* black background */
+	C_BAR   = tw_pack_rgb(0x60, 0x60, 0x60);  /* title/candidate bar: gray */
+	C_BARTX = tw_pack_rgb(0xd0, 0xd0, 0xd0);  /* light-gray text on bars */
+	C_HINT  = tw_pack_bw(0);                  /* hint bar bg: plain black */
 
 	/* Geometry (all in scaled px): title (1 row) + text area + candidate
 	 * bar (1) + hints (2). Text area fills the screen edge to edge. */
@@ -424,18 +417,6 @@ int tw_backlight_step(int delta)
 	return tw_backlight_set(g_brightness + delta);
 }
 
-/* Power-save: dim to the minimum without forgetting the user's level. */
-void tw_backlight_dim(void)
-{
-	tw_backlight_apply(TW_BACKLIGHT_MIN);
-}
-
-/* Power-save wake: restore the user's remembered brightness level. */
-void tw_backlight_restore(void)
-{
-	tw_backlight_apply(g_brightness);
-}
-
 /* --------------------------------------------------------------- chrome -- */
 /* Muted-gray chrome bars (title/candidate/hints): light text on dark gray, so
  * they recede vs. the black-on-white text area. */
@@ -445,10 +426,9 @@ static void draw_title(struct tw_state *s)
 	int x;
 
 	fill_rect(0, 0, s->fb_w, TW_ROW_PX, C_BAR);   /* gray bar */
-	snprintf(line, sizeof(line), " typewriter    %s%s%s",
+	snprintf(line, sizeof(line), " typewriter    %s%s",
 		 s->filename[0] ? s->filename : "[ New Buffer ]",
-		 s->dirty ? "    Modified" : "",
-		 s->power_saving ? "    [power saving]" : "");
+		 s->dirty ? "    Modified" : "");
 	draw_str(TW_CELL_PX, 0, line, C_BARTX, C_BAR);
 
 	/* Right side: battery % (if known) then the IME chip. Battery is polled
@@ -757,12 +737,6 @@ void tw_render(struct tw_state *s)
 	int first = s->first_paint;
 
 	d_any = 0;   /* reset per-frame damage */
-
-	/* Chrome bar backgrounds: black in power-saving mode (a clear "dimmed/idle"
-	 * indicator), otherwise gray - with the bottom hint bar a shade darker than
-	 * the title/candidate bar. Set before any chrome is drawn this frame. */
-	C_BAR  = s->power_saving ? C_BAR_SAVE : C_BAR_GRAY;
-	C_HINT = s->power_saving ? C_BAR_SAVE : C_HINT_GRAY;
 
 	if (s->first_paint) {
 		fill_rect(0, 0, s->fb_w, s->fb_h, C_BG);
