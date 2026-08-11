@@ -649,19 +649,24 @@ static void draw_bar(struct tw_state *s)
  * (inverse-video) block; the description sits on the plain hint-bar background.
  * The hint bar bg (C_HINT) is a touch darker than the title/candidate bar.
  */
-#define TW_HINT_COLS   6
+#define TW_HINT_COLS   7
 #define TW_HINT_COL    16    /* full cell width, in character cells */
 #define TW_HINT_KEYW   6     /* key sub-column width (chars) before the desc */
 static void draw_hints(struct tw_state *s)
 {
 	struct hint { const char *key, *desc; };
+	/* 7 cells/row. The 7th only renders if the framebuffer is wide enough;
+	 * draw_hints below skips any cell that would fall off the right edge, so a
+	 * narrow panel just drops it (no corruption). ^T = on-demand battery %. */
 	static const struct hint row1[TW_HINT_COLS] = {
 		{"^S", "Save"},  {"^A/^E", "BOL/EOL"}, {"^B/^F", "back/fwd"},
 		{"^K", "Kill"},  {"^W", "DelWord"},    {"^Spc", "Wubi"},
+		{"^T", "Battery"},
 	};
 	static const struct hint row2[TW_HINT_COLS] = {
 		{"^X", "Exit"},  {"^R", "Open"},       {"^P/^N", "prev/next"},
 		{"^D", "Del"},   {"^-/^]", "Bright"},  {"^Q", "PowerOff"},
+		{"", ""},        /* 7th slot: ^T is in row1; leave this blank */
 	};
 	const struct hint *rows[2] = { row1, row2 };
 	int r, c;

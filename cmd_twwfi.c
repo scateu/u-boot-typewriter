@@ -32,6 +32,7 @@
 #include <linux/string.h>
 #include <linux/kernel.h>  /* ARRAY_SIZE */
 #include <cros_ec.h>       /* host-event flags: power button / lid wake */
+#include <power/regulator.h>  /* ppvar_litcpu voltage (A53 core rail) */
 
 /* PSCI invoke_psci_fn is provided by drivers/firmware/psci.c (probe it first
  * with uclass_get_device_by_name(UCLASS_FIRMWARE,"psci",...) as poweroff does).
@@ -41,27 +42,40 @@
 unsigned long invoke_psci_fn(unsigned long, unsigned long, unsigned long,
 			     unsigned long);
 
+/* Bump on every twwfi change so `twwfi` (no arg) proves the flashed binary is
+ * current - a stale reflash was confounding suspend-hang diagnosis. */
+#define TW_BUILD_TAG "litvolt-4"
+
+/* From cmd_tw.c: EC charge state (battery %, board charge current mA, on-AC).
+ * Returns 0 on success, <0 on error/no-EC. This is BOARD current, not CPU. */
+int tw_read_charge_state(int *pct, int *chg_ma, int *ac);
+
+/* From cmd_tw.c: editor idle-nap instrumentation - total naps, how many WFIs
+ * returned instantly (<1 ms = did NOT sleep), and total time spent in WFI. */
+void tw_idle_stats(unsigned long *count, unsigned long *instant,
+		   unsigned long *slept_us);
+
 /* CPU0 GICv3 redistributor SGI_base = 0xfef10000 on rk3399 (verified via
  * md/mw). Standard GICv3 SGI-frame register offsets from SGI_base. */
 #define GICR_IGROUPR0     0xfef10080UL   /* +0x080: interrupt group  */
 #define GICR_ISENABLER0   0xfef10100UL   /* +0x100: set-enable   */
 #define GICR_ISPENDR0     0xfef10200UL   /* +0x200: set-pending  */
 #define GICR_ICPENDR0     0xfef10280UL   /* +0x280: clear-pending */
-#define GICR_IPRIORITYR   0xfef10400UL   /* +0x400: priority (byte/INTID) */
+#define TW_GICR_IPRIORITYR   0xfef10400UL   /* +0x400: priority (byte/INTID) */
 #define GICR_IGRPMODR0    0xfef10d00UL   /* +0xD00: group modifier */
 
 /* GIC Distributor (GICD) base - for SPIs (INTID >= 32). Register arrays are
  * indexed by INTID: IGROUPR/IGRPMODR are 1 bit/INTID, IPRIORITYR 1 byte/INTID,
  * ISENABLER 1 bit/INTID. */
-#define GICD_BASE         0xfee00000UL
-#define GICD_CTLR         (GICD_BASE + 0x0000)
-#define GICD_IGROUPR      (GICD_BASE + 0x0080)
-#define GICD_ISENABLER    (GICD_BASE + 0x0100)
-#define GICD_IPRIORITYR   (GICD_BASE + 0x0400)
-#define GICD_IROUTER      (GICD_BASE + 0x6000)   /* 64-bit/INTID, affinity route */
-#define GICD_IGRPMODR     (GICD_BASE + 0x0D00)
-#define GICD_ISPENDR      (GICD_BASE + 0x0200)   /* 1 bit/INTID, pending state */
-#define GICD_ICPENDR      (GICD_BASE + 0x0280)   /* 1 bit/INTID, clear-pending */
+#define TW_GICD_BASE         0xfee00000UL
+#define TW_GICD_CTLR         (TW_GICD_BASE + 0x0000)
+#define TW_GICD_IGROUPR      (TW_GICD_BASE + 0x0080)
+#define TW_GICD_ISENABLER    (TW_GICD_BASE + 0x0100)
+#define TW_GICD_IPRIORITYR   (TW_GICD_BASE + 0x0400)
+#define TW_GICD_IROUTER      (TW_GICD_BASE + 0x6000)   /* 64-bit/INTID, affinity route */
+#define TW_GICD_IGRPMODR     (TW_GICD_BASE + 0x0D00)
+#define TW_GICD_ISPENDR      (TW_GICD_BASE + 0x0200)   /* 1 bit/INTID, pending state */
+#define TW_GICD_ICPENDR      (TW_GICD_BASE + 0x0280)   /* 1 bit/INTID, clear-pending */
 
 /* RK3399 GPIO0 (PMU GPIO, v1 controller) @ 0xff720000. The cros_ec interrupt
  * line is gpio0 PA1 (ec-interrupt, ACTIVE_LOW). Register offsets from gpio.h. */
@@ -86,6 +100,17 @@ unsigned long invoke_psci_fn(unsigned long, unsigned long, unsigned long,
  */
 #define PMU_BASE          0xff310000UL
 #define PMU_PWRDN_ST      (PMU_BASE + 0x18)
+/*
+ * PMU_CORE_PM_CON(cpu) = PMU_BASE + 0xC0 + cpu*4: per-core "auto power-down on
+ * WFI" control (bl31 pmu.h). bit0 core_pm_en = a WFI power-gates that core;
+ * bit1 core_pm_int_wakeup_en = an interrupt can wake it back. bl31 writes 0
+ * (CORES_PM_DISABLE) outside its PSCI sequences, which means a plain WFI HALTS
+ * the core but does NOT power-gate it - the rail stays on (warm chip). Reading
+ * this tells us whether our idle WFI actually drops the core's power. Pure read.
+ */
+#define PMU_CORE_PM_CON0  (PMU_BASE + 0xc0)   /* CPU0 (A53 little core 0) */
+#define CORE_PM_EN_BIT        0
+#define CORE_PM_INT_WAKE_BIT  1
 #define PMU_BUS_IDLE_ST   (PMU_BASE + 0x64)   /* 1 bit/NoC bus: 1 = bus IDLE */
 #define PD_CPUL0_BIT      0
 #define PD_CPUB0_BIT      4
@@ -181,11 +206,11 @@ static void dump_state(void)
 	printf("GICR_IGROUPR0   = 0x%08x (1=Group1/NS, 0=Group0/secure)\n",
 	       readl((void *)GICR_IGROUPR0));
 	printf("GICR_IGRPMODR0  = 0x%08x\n", readl((void *)GICR_IGRPMODR0));
-	printf("GICR_IPRIORITYR(30) byte = 0x%02x\n",
-	       readl((void *)(GICR_IPRIORITYR + (30 & ~3))) >> ((30 & 3) * 8)
+	printf("TW_GICR_IPRIORITYR(30) byte = 0x%02x\n",
+	       readl((void *)(TW_GICR_IPRIORITYR + (30 & ~3))) >> ((30 & 3) * 8)
 	       & 0xff);
-	printf("GICR_IPRIORITYR(26) byte = 0x%02x\n",
-	       readl((void *)(GICR_IPRIORITYR + (26 & ~3))) >> ((26 & 3) * 8)
+	printf("TW_GICR_IPRIORITYR(26) byte = 0x%02x\n",
+	       readl((void *)(TW_GICR_IPRIORITYR + (26 & ~3))) >> ((26 & 3) * 8)
 	       & 0xff);
 
 	/* CPU interface (the link to the PE). */
@@ -213,13 +238,13 @@ static int do_probe(int hyp, unsigned int ms)
 	       hyp ? "CNTHP_EL2" : "CNTP_EL0", intid, ms);
 
 	/* Enable everything the wake path needs:
-	 *  - GICD_CTLR.EnableGrp1NS (bit1): the DISTRIBUTOR forwards NS Group1 at
-	 *    all. bl31 leaves this CLEAR (GICD_CTLR=0x35), which is why HPPIR1 was
+	 *  - TW_GICD_CTLR.EnableGrp1NS (bit1): the DISTRIBUTOR forwards NS Group1 at
+	 *    all. bl31 leaves this CLEAR (TW_GICD_CTLR=0x35), which is why HPPIR1 was
 	 *    1023 before - the missing piece. (INTID 30 is Group1-NS, NOT secure:
 	 *    bl31 only secures INTID 29, the EL3 timer.)
 	 *  - ICC_IGRPEN1_EL1 (CPU interface Group1 enable)
 	 *  - the timer PPI in the redistributor. */
-	setbits_le32((void *)GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
+	setbits_le32((void *)TW_GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
 	dsb();
 	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
 	isb();
@@ -258,11 +283,11 @@ static int do_probe(int hyp, unsigned int ms)
 	/* Why 1023 despite pending+Group1NS? Check the two prime suspects: */
 	{
 		unsigned long igrpen1, rpr;
-		unsigned int gicd_ctlr = readl((void *)0xfee00000UL); /* GICD_CTLR */
+		unsigned int gicd_ctlr = readl((void *)0xfee00000UL); /* TW_GICD_CTLR */
 
 		asm volatile("mrs %0, " STR(ICC_IGRPEN1_EL1) : "=r" (igrpen1));
 		asm volatile("mrs %0, " STR(ICC_RPR_EL1) : "=r" (rpr));
-		printf("  GICD_CTLR(rb)  = 0x%08x (bit1 EnableGrp1NS=%u <- the fix)\n",
+		printf("  TW_GICD_CTLR(rb)  = 0x%08x (bit1 EnableGrp1NS=%u <- the fix)\n",
 		       gicd_ctlr, (gicd_ctlr >> 1) & 1);
 		printf("  ICC_IGRPEN1(rb)= 0x%lx (did our enable stick?)\n", igrpen1);
 		printf("  ICC_RPR        = 0x%lx (running priority; 0xff=idle)\n", rpr);
@@ -319,13 +344,13 @@ static int do_wfi_test(int hyp, unsigned int ms)
 	 * Enable ALL THREE NS enables the `probe` proved are needed to make the
 	 * interrupt reach the PE (ICC_HPPIR1 went 1023 -> 30 only with all three).
 	 * The earlier version of THIS function set only two of them - it never set
-	 * GICD_CTLR.EnableGrp1NS - which is why `twwfi p` still froze while `probe`
+	 * TW_GICD_CTLR.EnableGrp1NS - which is why `twwfi p` still froze while `probe`
 	 * showed HPPIR1=30. Now they match.
-	 *   1. GICD_CTLR.EnableGrp1NS (bit1) - distributor forwards NS Group1
+	 *   1. TW_GICD_CTLR.EnableGrp1NS (bit1) - distributor forwards NS Group1
 	 *   2. the timer PPI in the redistributor
 	 *   3. ICC_IGRPEN1_EL1 - CPU interface Group1 enable
 	 */
-	setbits_le32((void *)GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
+	setbits_le32((void *)TW_GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
 	dsb();
 	writel(1U << intid, (void *)GICR_ISENABLER0);
 	dsb();
@@ -387,20 +412,20 @@ static int do_wfi_test(int hyp, unsigned int ms)
 static int do_spi_probe(unsigned int intid)
 {
 	unsigned int word = intid / 32, bit = intid % 32;
-	unsigned int grp  = (readl((void *)(GICD_IGROUPR  + word * 4)) >> bit) & 1;
-	unsigned int gmod = (readl((void *)(GICD_IGRPMODR + word * 4)) >> bit) & 1;
-	unsigned int en   = (readl((void *)(GICD_ISENABLER + word * 4)) >> bit) & 1;
-	unsigned int prio = (readl((void *)(GICD_IPRIORITYR + (intid & ~3)))
+	unsigned int grp  = (readl((void *)(TW_GICD_IGROUPR  + word * 4)) >> bit) & 1;
+	unsigned int gmod = (readl((void *)(TW_GICD_IGRPMODR + word * 4)) >> bit) & 1;
+	unsigned int en   = (readl((void *)(TW_GICD_ISENABLER + word * 4)) >> bit) & 1;
+	unsigned int prio = (readl((void *)(TW_GICD_IPRIORITYR + (intid & ~3)))
 			     >> ((intid & 3) * 8)) & 0xff;
-	unsigned int ctlr = readl((void *)GICD_CTLR);
+	unsigned int ctlr = readl((void *)TW_GICD_CTLR);
 	unsigned long route;
 
 	/* IROUTER is 64-bit per INTID; read the low word (affinity 0-2). */
-	route = readl((void *)(GICD_IROUTER + (unsigned long)intid * 8));
+	route = readl((void *)(TW_GICD_IROUTER + (unsigned long)intid * 8));
 
 	printf("SPI INTID %u (GIC_SPI %u) in the distributor:\n",
 	       intid, intid - 32);
-	printf("  GICD_CTLR   = 0x%08x (bit6 DS=%u)\n", ctlr, (ctlr >> 6) & 1);
+	printf("  TW_GICD_CTLR   = 0x%08x (bit6 DS=%u)\n", ctlr, (ctlr >> 6) & 1);
 	printf("  IGROUPR     bit = %u (1=Group1/NS)\n", grp);
 	printf("  IGRPMODR    bit = %u  -> (grp,gmod)=(%u,%u): %s\n",
 	       gmod, grp, gmod,
@@ -423,7 +448,7 @@ static int do_spi_probe(unsigned int intid)
  * SAFE (no WFI) end-to-end test of the intended keypress wake path:
  *   set up GPIO0 PA1 as a level/active-low interrupt (the cros_ec line),
  *   enable INTID 46 + Group1 at the CPU interface,
- *   then loop ~5 s polling GPIO int_status / GICD_ISPENDR(46) / ICC_HPPIR1
+ *   then loop ~5 s polling GPIO int_status / TW_GICD_ISPENDR(46) / ICC_HPPIR1
  *   while YOU press keys / the power button / close+open the lid.
  * If HPPIR1 shows 46 when the EC asserts, WFI would wake here. No WFI, no
  * freeze. Restores GPIO/GIC state on exit.
@@ -447,7 +472,7 @@ static int do_gpio_probe(void)
 	dsb();
 
 	/* --- GIC: enable INTID 46, Group1 at CPU interface --- */
-	writel(1U << bit, (void *)(GICD_ISENABLER + word * 4));
+	writel(1U << bit, (void *)(TW_GICD_ISENABLER + word * 4));
 	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
 	isb();
 	dsb();
@@ -455,7 +480,7 @@ static int do_gpio_probe(void)
 	tend = rd_cntpct() + rate * 5;   /* ~5 seconds */
 	while (rd_cntpct() < tend) {
 		unsigned int st  = readl((void *)GPIO_INT_STATUS) & EC_PA1_BIT;
-		unsigned int pnd = (readl((void *)(GICD_ISPENDR + word * 4))
+		unsigned int pnd = (readl((void *)(TW_GICD_ISPENDR + word * 4))
 				    >> bit) & 1;
 		unsigned long hp;
 
@@ -467,7 +492,7 @@ static int do_gpio_probe(void)
 		 * reasserts while it still has events, which is fine. */
 		if (st) {
 			writel(EC_PA1_BIT, (void *)GPIO_PORTA_EOI);
-			writel(1U << bit, (void *)(GICD_ICPENDR + word * 4));
+			writel(1U << bit, (void *)(TW_GICD_ICPENDR + word * 4));
 			dsb();
 		}
 	}
@@ -496,6 +521,71 @@ static int do_gpio_probe(void)
 	return 0;
 }
 
+/* PSCI 32-bit signed return decode (spec Table: return codes). */
+static const char *psci_err(long r)
+{
+	switch (r) {
+	case 0:   return "SUCCESS";
+	case -1:  return "NOT_SUPPORTED";
+	case -2:  return "INVALID_PARAMETERS";
+	case -3:  return "DENIED";
+	case -4:  return "ALREADY_ON";
+	case -5:  return "ON_PENDING";
+	case -6:  return "INTERNAL_FAILURE";
+	case -7:  return "NOT_PRESENT";
+	case -8:  return "DISABLED";
+	case -9:  return "INVALID_ADDRESS";
+	default:  return "?";
+	}
+}
+
+/*
+ * SAFE PSCI diagnostics (no argument): query-only SMCs that ALWAYS return -
+ * VERSION, FEATURES(CPU_SUSPEND / SYSTEM_SUSPEND), AFFINITY_INFO. This proves
+ * the PSCI conduit works from EL2 and, crucially, whether bl31 even ADVERTISES
+ * CPU_SUSPEND / what it supports - before we risk an actual suspend. These
+ * cannot hang (they're pure queries). `twwfi psci suspend [ms]` (below, via
+ * do_suspend) is the risky armed one.
+ *
+ * The point: `twwfi suspend` "hangs". This tells us whether that's because bl31
+ * rejects the call (we'd see an error code here / a bad FEATURES result) or
+ * because the SMC genuinely never returns (a real EL/firmware problem).
+ */
+static int do_psci_query(void)
+{
+	struct udevice *psci;
+	long r;
+
+	if (uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci)) {
+		printf("PSCI driver not found (conduit not set up).\n");
+		return 1;
+	}
+
+	r = (long)(int)invoke_psci_fn(PSCI_0_2_FN_PSCI_VERSION, 0, 0, 0);
+	printf("PSCI_VERSION      = %ld.%ld\n",
+	       (r >> 16) & 0xffff, r & 0xffff);
+
+	r = (long)(int)invoke_psci_fn(PSCI_1_0_FN_PSCI_FEATURES,
+				      PSCI_0_2_FN64_CPU_SUSPEND, 0, 0);
+	printf("FEATURES(CPU_SUSPEND64)    = %ld (%s)  %s\n", r, psci_err(r),
+	       r >= 0 ? "-> CPU_SUSPEND supported" :
+			"-> NOT supported (that's why suspend fails)");
+
+	r = (long)(int)invoke_psci_fn(PSCI_1_0_FN_PSCI_FEATURES,
+				      PSCI_1_0_FN64_SYSTEM_SUSPEND, 0, 0);
+	printf("FEATURES(SYSTEM_SUSPEND64) = %ld (%s)\n", r, psci_err(r));
+
+	r = (long)(int)invoke_psci_fn(PSCI_0_2_FN64_AFFINITY_INFO, 0, 0, 0);
+	printf("AFFINITY_INFO(cpu0,lvl0)   = %ld (0=ON, 1=OFF, 2=ON_PENDING)\n", r);
+
+	printf("=> Conduit works from EL%u. If FEATURES(CPU_SUSPEND) is supported yet\n"
+	       "   `twwfi suspend` still hangs, the SMC returns but resumes wrong (the\n"
+	       "   EL2-vs-EL1 / SCR_EL3.HCE resume-target theory). If it's NOT\n"
+	       "   supported, bl31 simply lacks the state - EL1 won't help.\n",
+	       current_el());
+	return 0;
+}
+
 /*
  * PSCI CPU_SUSPEND (STANDBY) test - the route that should actually work.
  *
@@ -508,6 +598,19 @@ static int do_gpio_probe(void)
  * We arm the NS CNTP timer (with the GIC enables) as the wake source first, so
  * bl31's WFI has something to return from within `ms`. If CPU_SUSPEND returns,
  * this is our low-power idle mechanism. (A keypress would wake it too.)
+ *
+ * Two bugs made this "always hang", neither of which is bl31/PSCI (confirmed
+ * against the live Linux board: it reaches PSCI standby/cpu-sleep/cluster-sleep
+ * fine from EL2 over the same smc conduit):
+ *   1. printf() with PSTATE.I masked stalls this board's console -> fixed by
+ *      doing all arming+SMC+cleanup with zero console output while masked.
+ *   2. ICC_PMR_EL1 left closed -> the pending NS timer IRQ was not DELIVERABLE
+ *      to the PE, so bl31's rockchip_cpu_standby() WFI-at-EL3 never woke -> a
+ *      true hang INSIDE the SMC. Fixed by opening PMR=0xff before arming, like
+ *      the working twwfi irq/ecwake paths.
+ * power_state=0 is correct: bl31 maps it to STANDBY (rockchip_cpu_standby),
+ * which sets SCR_EL3.IRQ, WFIs at EL3, and returns IN PLACE (no context loss,
+ * no resume entry point needed) - the simplest and safest deep-idle path.
  */
 static int do_suspend(unsigned int ms)
 {
@@ -522,13 +625,38 @@ static int do_suspend(unsigned int ms)
 		return 1;
 	}
 
-	printf("PSCI CPU_SUSPEND (STANDBY), timer wake in %u ms...\n", ms);
+	printf("PSCI CPU_SUSPEND (STANDBY), timer wake in %u ms. SMC now...\n", ms);
 
-	/* Arm the NS timer as the wake source (same GIC enables as the probe). */
-	setbits_le32((void *)GICD_CTLR, (1U << 1));    /* EnableGrp1NS */
+	/*
+	 * CRITICAL: no printf() between the mask and the unmask. On this board the
+	 * console output path stalls while PSTATE.I is masked (framebuffer/console
+	 * putc waits on something IRQ-backed), so a printf with IRQs masked HANGS -
+	 * this is what every earlier "twwfi suspend hangs" actually was, NOT the SMC.
+	 * So: do ALL arming + the SMC + cleanup with no console output, then print
+	 * the result after unmasking.
+	 *
+	 * We keep IRQ MASKED (PSTATE.I=1) across the SMC so the fired CNTP timer
+	 * stays PENDING (not taken as an unhandled exception at EL2); bl31's STANDBY
+	 * handler runs at EL3 with its own SCR_EL3.IRQ and returns on that pending
+	 * NS interrupt.
+	 */
+	asm volatile("msr daifset, #2");   /* PSTATE.I = 1 (mask IRQ at the PE) */
+	isb();
+
+	/*
+	 * Arm the NS timer as the wake source. CRITICAL: open ICC_PMR_EL1 (priority
+	 * mask) too. bl31's rockchip_cpu_standby() sets SCR_EL3.IRQ and does WFI at
+	 * EL3, waking ONLY on a deliverable NS physical IRQ. If PMR is left closed
+	 * (its prior/reset value), the pending timer is NOT deliverable to the PE,
+	 * so bl31's EL3 WFI never wakes -> the SMC hangs forever. The working
+	 * twwfi irq/ecwake/keystroke paths all set PMR=0xff; do_suspend didn't -
+	 * THAT is why it hung ("STANDBY..." prints, then dead inside the SMC).
+	 */
+	setbits_le32((void *)TW_GICD_CTLR, (1U << 1));    /* EnableGrp1NS */
 	dsb();
 	writel(1U << 30, (void *)GICR_ISENABLER0);     /* INTID 30 = CNTP PPI */
 	dsb();
+	asm volatile("msr " STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));   /* allow all */
 	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
 	isb();
 	asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
@@ -538,18 +666,27 @@ static int do_suspend(unsigned int ms)
 	t0 = rd_cntpct();
 
 	/* power_state = 0: STANDBY, pwr level 0, state id 0. entry/ctx unused for
-	 * standby (CPU keeps state and resumes right here). */
+	 * standby (CPU keeps state and resumes right here). NO printf around this. */
 	ret = invoke_psci_fn(PSCI_0_2_FN64_CPU_SUSPEND, 0, 0, 0);
 
 	t1 = rd_cntpct();
 
+	/* Disable the timer, clear its pending state, then UNMASK IRQs again so the
+	 * console works and the shell returns with normal interrupt handling. */
 	asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));   /* disable timer */
+	writel(1U << 30, (void *)GICR_ICPENDR0);              /* clear CNTP pending */
+	dsb();
+	asm volatile("msr daifclr, #2");   /* PSTATE.I = 0 (unmask) */
 	isb();
 
-	printf("CPU_SUSPEND RETURNED. ret=%ld, elapsed=%lu ms\n",
-	       (long)ret, (t1 - t0) / (rate / 1000));
-	printf("=> If elapsed ~%u ms, PSCI standby idle WORKS - use it for idle.\n",
-	       ms);
+	printf("CPU_SUSPEND RETURNED. ret=%ld (%s), elapsed=%lu ms\n",
+	       (long)ret, psci_err((long)ret), (t1 - t0) / (rate / 1000));
+	if ((long)ret == 0)
+		printf("=> If elapsed ~%u ms, PSCI standby idle WORKS - use it for idle.\n",
+		       ms);
+	else
+		printf("=> bl31 REJECTED the call (not a hang): the state/param is wrong,\n"
+		       "   not the exception level. EL1 would not change this.\n");
 	return 0;
 }
 
@@ -627,7 +764,7 @@ static int do_irq_wfi(unsigned int ms)
 	printf("If the prompt returns, taking the IRQ at EL2 wakes WFI.\n");
 
 	/* GIC: forward NS Group1, enable PPI + CPU-interface group, open PMR. */
-	setbits_le32((void *)GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
+	setbits_le32((void *)TW_GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
 	dsb();
 	writel(1U << 30, (void *)GICR_ISENABLER0);    /* INTID 30 PPI */
 	dsb();
@@ -668,6 +805,91 @@ static int do_irq_wfi(unsigned int ms)
 }
 
 /*
+ * RISKY: core power-gate on WFI. `twwfi cpuinfo` shows PMU_CORE_PM_CON0=0, so a
+ * plain WFI halts CPU0 but leaves its rail ON (warm chip). bl31's own core-off
+ * path is just: write CORE_PM_CON0 = core_pm_en|int_wakeup_en, dsb, WFI - the
+ * PMU then POWER-GATES the core on WFI entry and an interrupt repowers+wakes it.
+ * We replicate exactly that, with the same IMO+handler+GIC setup as `irq`, and a
+ * CNTP timer as a BACKSTOP: if the PMU wake path fails, the timer IRQ should
+ * still repower/wake us. Restores CORE_PM_CON0=0 on return.
+ *
+ * If the prompt returns after ~ms, core power-gating works AND wakes -> worth
+ * wiring into the editor (should run cooler). If it HANGS, the gated core never
+ * came back: power-cycle, and we do NOT use this. This is the whole point of a
+ * timer-backstopped bench test before touching the editor.
+ */
+static int do_coredown(unsigned int ms)
+{
+	unsigned long rate = rd_cntfrq();
+	unsigned long ticks = (rate / 1000) * ms;
+	unsigned long vbar_save, hcr_save, t0, t1;
+	unsigned int pm_before, pm_after;
+
+	pm_before = readl((void *)PMU_CORE_PM_CON0);
+	printf("CORE-DOWN test: set CORE_PM_CON0=0x3 (auto power-gate CPU0 on WFI +\n");
+	printf("int-wake), IMO+handler, CNTP backstop %u ms. Before=0x%08x.\n",
+	       ms, pm_before);
+	printf("If the prompt does NOT return, the gated core did not wake -"
+	       " power-cycle.\n");
+
+	/* GIC: forward NS Group1, enable CNTP PPI + EC SPI, open PMR + grp. */
+	setbits_le32((void *)TW_GICD_CTLR, (1U << 1));
+	dsb();
+	writel(1U << 30, (void *)GICR_ISENABLER0);              /* INTID 30 PPI */
+	writel(1U << (EC_GPIO_INTID % 32),
+	       (void *)(TW_GICD_ISENABLER + (EC_GPIO_INTID / 32) * 4)); /* INTID 46 */
+	asm volatile("msr " STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));
+	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
+	isb();
+
+	/* Install EL2 vector + route phys IRQ to EL2 (HCR_EL2.IMO, bit4). */
+	asm volatile("mrs %0, vbar_el2" : "=r" (vbar_save));
+	asm volatile("mrs %0, hcr_el2"  : "=r" (hcr_save));
+	asm volatile("msr vbar_el2, %0" : : "r" ((unsigned long)tw_irq_vectors));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save | (1UL << 4)));
+	isb();
+
+	t0 = rd_cntpct();
+
+	/* Arm CNTP backstop, enable PMU auto-power-gate-on-WFI + int wake, WFI. */
+	asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
+	asm volatile("msr cntp_ctl_el0, %0" : : "r" (1UL));
+	isb();
+	writel((1U << CORE_PM_EN_BIT) | (1U << CORE_PM_INT_WAKE_BIT),
+	       (void *)PMU_CORE_PM_CON0);
+	dsb();
+	asm volatile("msr daifclr, #2");   /* PSTATE.I = 0 -> IRQ taken */
+	wfi();                             /* <-- core may power-gate here */
+	asm volatile("msr daifset, #2");   /* re-mask */
+
+	/* First thing on wake: restore CORE_PM_CON0=0 so no later WFI gates us. */
+	writel(0, (void *)PMU_CORE_PM_CON0);
+	dsb();
+
+	t1 = rd_cntpct();
+
+	/* Restore timer + VBAR/HCR. */
+	asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
+	asm volatile("msr vbar_el2, %0" : : "r" (vbar_save));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save));
+	isb();
+	/* Clear any pending we enabled; leave the EC line masked as the handler did. */
+	writel(1U << 30, (void *)GICR_ICPENDR0);
+	writel(1U << (EC_GPIO_INTID % 32),
+	       (void *)(TW_GICD_ICPENDR + (EC_GPIO_INTID / 32) * 4));
+	dsb();
+
+	pm_after = readl((void *)PMU_CORE_PM_CON0);
+	printf("WFI RETURNED. elapsed = %lu ms. CORE_PM_CON0 now 0x%08x.\n",
+	       (t1 - t0) / (rate / 1000), pm_after);
+	printf("=> The core power-gated on WFI and woke. If elapsed ~%u ms it was the\n"
+	       "   timer backstop; a keypress would wake it sooner. Feel the chip: if\n"
+	       "   this runs cooler at idle, wire CORE_PM_CON0=0x3 into the editor nap.\n",
+	       ms);
+	return 0;
+}
+
+/*
  * Prove the EC GPIO (INTID 46) can wake WFI as an INTERRUPT - so we can sleep
  * for 30 s and wake only on a key / power button / lid, with NO timer tick and
  * NO 200 ms EC poll. Same take-the-IRQ recipe as `irq`, but the wake source is
@@ -693,9 +915,9 @@ static int do_ecwake(void)
 	dsb();
 
 	/* GIC: forward NS Group1, enable INTID 46, open PMR + CPU-interface grp. */
-	setbits_le32((void *)GICD_CTLR, (1U << 1));
+	setbits_le32((void *)TW_GICD_CTLR, (1U << 1));
 	dsb();
-	writel(1U << bit, (void *)(GICD_ISENABLER + word * 4));
+	writel(1U << bit, (void *)(TW_GICD_ISENABLER + word * 4));
 	asm volatile("msr " STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));
 	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
 	dsb();
@@ -784,7 +1006,7 @@ static int do_keystroke(unsigned int ms)
 	 * (GPIO0 PA1 -> INTID 46) as a second wake source, or a keypress can't
 	 * wake the WFI early and each nap runs to the full timer expiry. Same
 	 * setup do_ecwake proved works. */
-	setbits_le32((void *)GICD_CTLR, (1U << 1));
+	setbits_le32((void *)TW_GICD_CTLR, (1U << 1));
 	dsb();
 	writel(1U << 30, (void *)GICR_ISENABLER0);
 	asm volatile("msr " STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));
@@ -795,7 +1017,7 @@ static int do_keystroke(unsigned int ms)
 	clrbits_le32((void *)GPIO_INT_POL, EC_PA1_BIT);   /* 0 = active-low */
 	clrbits_le32((void *)GPIO_INTMASK, EC_PA1_BIT);   /* unmask */
 	setbits_le32((void *)GPIO_INTEN,  EC_PA1_BIT);    /* enable */
-	writel(1U << bit, (void *)(GICD_ISENABLER + word * 4));
+	writel(1U << bit, (void *)(TW_GICD_ISENABLER + word * 4));
 	dsb();
 
 	t_start = rd_cntpct();
@@ -846,7 +1068,7 @@ static int do_keystroke(unsigned int ms)
 		writel(EC_PA1_BIT, (void *)GPIO_PORTA_EOI);
 		clrbits_le32((void *)GPIO_INTMASK, EC_PA1_BIT);
 		writel(1U << 30, (void *)GICR_ICPENDR0);   /* CNTP PPI 30 if pending */
-		writel(1U << bit, (void *)(GICD_ICPENDR + word * 4)); /* SPI 46 */
+		writel(1U << bit, (void *)(TW_GICD_ICPENDR + word * 4)); /* SPI 46 */
 		dsb();
 
 		naps++;
@@ -1191,20 +1413,161 @@ static unsigned int cpu_cluster_mhz(unsigned long pll_con, unsigned long clksel,
 }
 
 /*
- * SAFE (read-only): decode the live CPU cluster frequencies from the CRU. CPU0
- * (the typewriter's core) is the A53 little cluster off APLL_L. Confirms what a
- * frequency change (e.g. the editor's 408 MHz set) actually took effect. Only
- * reads CRU registers; cannot hang.
+ * SAFE (read-only): report the editor's idle-nap instrumentation, to PROVE
+ * whether its no-timer WFI actually deep-sleeps or busy-spins. Run the editor,
+ * let it sit idle a while, exit, then `twwfi napstats`. Interpretation:
+ *   - instant/count near 0, and slept/count large (seconds)  => WFI sleeps GOOD
+ *   - instant ~= count, slept/count ~0                       => WFI SPINS (bug):
+ *     it returns immediately every time (a level IRQ left pending), so the CPU
+ *     never idles and battery draw is unchanged. That confirms the editor's
+ *     no-timer path is broken even though `twwfi keystroke` (timer-armed) slept.
+ */
+static int do_napstats(void)
+{
+	unsigned long count = 0, instant = 0, slept_us = 0;
+
+	tw_idle_stats(&count, &instant, &slept_us);
+	printf("editor idle naps: count=%lu, instant(<1ms)=%lu, slept=%lu ms\n",
+	       count, instant, slept_us / 1000);
+	if (!count) {
+		printf("=> no naps recorded yet - run the `typewriter` editor and let it\n"
+		       "   sit idle >2 s (past the active window) before checking.\n");
+	} else {
+		printf("=> avg %lu us/nap. ", slept_us / count);
+		if (instant * 2 > count)
+			printf("MOSTLY INSTANT: WFI is NOT sleeping (busy-spin) -\n"
+			       "   the no-timer idle path is broken; this explains flat"
+			       " battery draw.\n");
+		else
+			printf("naps blocked properly: WFI IS sleeping. Flat battery\n"
+			       "   draw is then NOT the CPU - look elsewhere.\n");
+	}
+	return 0;
+}
+
+/*
+ * SAFE (read-only): decode the live CPU cluster frequencies from the CRU, the
+ * CPU power-domain state, and (as a whole-BOARD proxy, not CPU-specific) the
+ * EC battery current. CPU0 (the typewriter's core) is the A53 little cluster off
+ * APLL_L. Confirms whether a frequency change (e.g. the editor's 408 MHz set)
+ * took effect and that the core is actually powered + working. Register reads +
+ * one EC host command; cannot hang.
  */
 static int do_cpuinfo(void)
 {
+	unsigned int st = readl((void *)PMU_PWRDN_ST);
+	unsigned int pm = readl((void *)PMU_CORE_PM_CON0);
+	int cpu0_on = !((st >> PD_CPUL0_BIT) & 1);
+	int scul_on = !((st >> PD_SCUL_BIT) & 1);
+	int pm_en   = (pm >> CORE_PM_EN_BIT) & 1;
+	int pm_intw = (pm >> CORE_PM_INT_WAKE_BIT) & 1;
+	unsigned int cpul_mhz;
+	int pct = 0, chg_ma = 0, ac = 0, ret;
+
 	printf("Current EL = %u, CNTFRQ = %lu Hz\n", current_el(), rd_cntfrq());
+
+	/* Power status first: a frequency is meaningless if the core is off. */
+	printf("--- CPU power status (PMU_PWRDN_ST = 0x%08x) ---\n", st);
+	printf("  CPU0 / CPUL0 (A53, our core) : %s\n",
+	       cpu0_on ? "POWERED (working)" : "OFF (!)");
+	printf("  little-cluster L2/SCU (SCUL) : %s\n", scul_on ? "on" : "off");
+
+	/* The key question for the "warm chip at idle" puzzle: does a WFI actually
+	 * power-gate the core, or just halt it with the rail still on? */
+	printf("  PMU_CORE_PM_CON0 = 0x%08x: auto-power-down-on-WFI=%s, int-wake=%s\n",
+	       pm, pm_en ? "ON" : "off", pm_intw ? "on" : "off");
+	if (!pm_en)
+		printf("  => core_pm_en=0: a WFI HALTS CPU0 but does NOT drop its power\n"
+		       "     rail - the core stays powered (warm) while 'asleep'. This is\n"
+		       "     why the chip is hot at idle: napstats sees WFI block, but the\n"
+		       "     A53 rail never gates. Enabling it needs bl31/PSCI or a careful\n"
+		       "     PMU write with a proven wake path (risky - see notes).\n");
+	else
+		printf("  => core_pm_en=1: WFI should auto power-gate CPU0 (wake via IRQ\n"
+		       "     if int-wake=on). If the chip is still warm, look at the\n"
+		       "     cluster/SCU or rails, not the core.\n");
+
 	printf("--- little cluster (CPU0 = A53, APLL_L) ---\n");
-	cpu_cluster_mhz(CRU_APLL_L_CON, CRU_CLKSEL_CON0, "CPUL", 0);
+	cpul_mhz = cpu_cluster_mhz(CRU_APLL_L_CON, CRU_CLKSEL_CON0, "CPUL", 0);
 	printf("--- big cluster (A72, APLL_B) ---\n");
 	cpu_cluster_mhz(CRU_APLL_B_CON, CRU_CLKSEL_CON2, "CPUB", 1);
-	printf("=> CPU0 (the core the typewriter runs on) is the CPUL figure above.\n");
-	printf("   `twwfi pmu` shows which cores are actually powered.\n");
+
+	printf("=> CPU0 verdict: %s @ %u MHz.\n",
+	       cpu0_on ? "powered + clocked = WORKING" : "NOT powered", cpul_mhz);
+
+	/*
+	 * Current draw. There is NO on-die CPU power/current telemetry on RK3399
+	 * (no TSADC/SARADC in this build), so we cannot report CPU-specific draw.
+	 * The one real current reading is the EC's battery/charger current - a
+	 * WHOLE-BOARD figure (display + DDR + rails + CPU), useful only as a gross
+	 * idle-draw gauge, NOT as CPU power.
+	 */
+	printf("--- board current (EC; NOT CPU-specific) ---\n");
+	ret = tw_read_charge_state(&pct, &chg_ma, &ac);
+	if (ret < 0) {
+		printf("  EC charge state unavailable (%d)\n", ret);
+	} else {
+		printf("  battery %d%%, on-AC=%d, charge current = %d mA\n",
+		       pct, ac, chg_ma);
+		printf("  (whole-board via the battery/charger; on battery, |mA| ~ total\n"
+		       "   system draw. No register gives CPU-only current on this SoC.)\n");
+	}
+	printf("   `twwfi pmu` shows every powered domain.\n");
+	return 0;
+}
+
+/*
+ * Lower the A53 little-cluster core voltage (ppvar_litcpu_pwm) to match the 408
+ * MHz OPP. Found via the live Linux board: at 408 MHz Linux DVFS runs it at
+ * 0.80 V, but U-Boot leaves it at 0.90 V (the ~1008 MHz OPP voltage) - the
+ * A53 is over-volted, burning (0.90/0.80)^2 = 1.27x the core power as heat for
+ * no benefit (same freq). 0.80 V is proven-stable at 408 MHz on this exact
+ * silicon by Linux, and we only ever LOWER voltage at a already-low freq, so
+ * this is safe. `twwfi litvolt [uV]` sets it (default 800000), holds ~10 s to
+ * feel the chip / read a meter, then RESTORES the original so a bad value can't
+ * persist. Refuses to raise above the current value (lowering only).
+ */
+static int do_litvolt(unsigned int target_uv)
+{
+	struct udevice *reg;
+	int before, after, restored, ret;
+	unsigned long t;
+
+	if (regulator_get_by_platname("ppvar_litcpu_pwm", &reg) || !reg) {
+		printf("ppvar_litcpu_pwm regulator not found.\n");
+		return 1;
+	}
+	before = regulator_get_value(reg);
+	printf("ppvar_litcpu_pwm now = %d uV; target = %u uV.\n", before, target_uv);
+	if (before <= 0) {
+		printf("can't read current voltage; aborting.\n");
+		return 1;
+	}
+	if ((int)target_uv >= before) {
+		printf("target >= current - refusing to RAISE voltage (lowering only,\n"
+		       "   raising needs a matching freq increase first). No change.\n");
+		return 0;
+	}
+
+	ret = regulator_set_value(reg, (int)target_uv);
+	after = regulator_get_value(reg);
+	printf("set_value ret=%d, readback = %d uV.\n", ret, after);
+	printf(">>> Holding ~10 s at %d uV - feel the chip / read the meter. A key\n"
+	       "    ends early. (Editing/typing still works; core just runs cooler.)\n",
+	       after);
+
+	t = rd_cntpct() + rd_cntfrq() * 10;
+	while (rd_cntpct() < t && !tstc())
+		udelay(2000);
+	if (tstc())
+		(void)getchar();
+
+	/* Restore the original voltage so the test leaves no lasting change. */
+	regulator_set_value(reg, before);
+	restored = regulator_get_value(reg);
+	printf("Restored ppvar_litcpu_pwm to %d uV.\n", restored);
+	printf("=> If the chip ran cooler at %u uV with no instability, it's safe to\n"
+	       "   set this at editor startup (after dropping to 408 MHz).\n", target_uv);
 	return 0;
 }
 
@@ -1214,6 +1577,10 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	unsigned int ms = 300;
 
 	if (argc < 2) {
+		/* Build stamp: confirms the FLASHED binary matches the source. Bump
+		 * TW_BUILD_TAG whenever we change twwfi so a stale reflash is obvious.
+		 * (No __DATE__/__TIME__ - U-Boot forbids them via -Werror=date-time.) */
+		printf("twwfi build tag: %s\n", TW_BUILD_TAG);
 		dump_state();
 		printf("\nRun `twwfi probe [p|hp]` FIRST (safe, no WFI) to trace the"
 		       " interrupt, then `twwfi p`/`hp` to try a real WFI.\n");
@@ -1228,16 +1595,25 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		return do_pmu();          /* which CPU cores/clusters are powered */
 	if (!strcmp(argv[1], "cpuinfo"))
 		return do_cpuinfo();      /* live CPU cluster frequencies (CRU) */
+	if (!strcmp(argv[1], "litvolt"))
+		return do_litvolt(argc >= 3 ? simple_strtoul(argv[2], NULL, 10)
+					    : 800000);  /* A53 core rail -> 0.80V */
+	if (!strcmp(argv[1], "napstats"))
+		return do_napstats();     /* did the editor's WFI actually sleep? */
 	if (!strcmp(argv[1], "gate"))
 		return do_gate(argc >= 3 ? (int)simple_strtoul(argv[2], NULL, 10)
 					 : -1);  /* -1 = all 10; else one domain 0..9 */
 	if (!strcmp(argv[1], "keystroke"))
 		return do_keystroke(argc >= 3 ? simple_strtoul(argv[2], NULL, 10)
 					      : 5000);  /* 5 s naps: human-observable */
+	if (!strcmp(argv[1], "psci"))
+		return do_psci_query();   /* SAFE: query PSCI version/features/affinity */
 	if (!strcmp(argv[1], "suspend"))
 		return do_suspend(ms);
 	if (!strcmp(argv[1], "irq"))
 		return do_irq_wfi(ms);
+	if (!strcmp(argv[1], "coredown"))
+		return do_coredown(ms);   /* power-gate CPU0 on WFI (timer-backstopped) */
 	if (!strcmp(argv[1], "ecwake"))
 		return do_ecwake();
 	if (!strcmp(argv[1], "gpio"))
@@ -1257,8 +1633,8 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (!strcmp(argv[1], "p"))
 		return do_wfi_test(0, ms);
 
-	printf("usage: twwfi [pmu|cpuinfo|gate|keystroke|irq|ecwake|suspend|probe"
-	       "|gpio|spi|p|hp] [ms|N]\n");
+	printf("usage: twwfi [pmu|cpuinfo|napstats|psci|litvolt|gate|coredown"
+	       "|keystroke|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV]\n");
 	return CMD_RET_USAGE;
 }
 
@@ -1267,7 +1643,10 @@ U_BOOT_CMD(
 	"WFI/idle test (power idle debug)",
 	"                 - dump EL/timer/GIC state (safe, no WFI)\n"
 	"twwfi pmu          - SAFE: which CPU + peripheral power domains are on (PMU_PWRDN_ST)\n"
-	"twwfi cpuinfo      - SAFE: live CPU cluster frequencies from the CRU (APLL_L/B)\n"
+	"twwfi cpuinfo      - SAFE: CPU freq (CRU) + power-domain status + EC board current\n"
+	"twwfi litvolt [uV] - lower A53 core rail ppvar_litcpu to uV (def 800000=0.80V,\n"
+	"                     Linux's 408MHz OPP), hold 10s to feel heat, then restore\n"
+	"twwfi napstats     - SAFE: did the editor's idle WFI actually sleep or busy-spin?\n"
 	"twwfi gate [N]     - RISKY: power-gate editor-unused domain N (0=GPU 1=VCODEC\n"
 	"                     2=VDU 3=RGA 4=IEP 5=ISP0 6=ISP1 7=HDCP 8=USB3 9=GMAC), or\n"
 	"                     ALL if N omitted; hold 15s to meter, then restore. Gate one\n"
@@ -1277,12 +1656,15 @@ U_BOOT_CMD(
 	"                     freeze till a key; reports naps/avg to prove WFI sleeps.\n"
 	"twwfi irq [ms]     - TAKE timer IRQ (HCR_EL2.IMO + handler) + WFI. Works;\n"
 	"                     this is what the editor's idle nap does.\n"
+	"twwfi coredown [ms]- RISKY: PMU auto-power-gate CPU0 on WFI (CORE_PM_CON0=0x3)\n"
+	"                     + CNTP backstop. Returns => core gates+wakes (cooler idle).\n"
 	"twwfi ecwake       - EC GPIO (INTID 46) as WFI wake IRQ, NO timer. Press a\n"
 	"                     key/power button/lid; returns => can sleep 30 s.\n"
-	"twwfi suspend [ms] - PSCI CPU_SUSPEND (STANDBY) via bl31 (HANGS - evidence)\n"
+	"twwfi psci         - SAFE: query PSCI version/features/affinity from EL2 (no suspend)\n"
+	"twwfi suspend [ms] - PSCI CPU_SUSPEND (STANDBY) via bl31 (masks IRQ, then SMC)\n"
 	"twwfi probe [p|hp] - SAFE: arm timer, poll (no WFI), report propagation\n"
 	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
 	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"
 	"twwfi p|hp [ms]    - arm CNTP/CNTHP + one raw WFI (hangs - no IMO/handler)\n"
-	"  pmu/cpuinfo/probe/spi/gpio/dump never hang. gate/suspend/p/hp may - power-cycle if so."
+	"  pmu/cpuinfo/napstats/psci/probe/spi/gpio/dump never hang. gate/coredown/suspend/p/hp may - power-cycle if so."
 );

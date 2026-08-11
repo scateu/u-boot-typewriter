@@ -25,33 +25,60 @@ Every subcommand is one of two kinds. **Know which before you run it.**
 
 | Class | Meaning | Subcommands |
 |---|---|---|
-| **SAFE** | Reads only (or polls, never sleeps). Cannot hang. Re-runnable freely. | `dump` (no arg), `pmu`, `cpuinfo`, `probe`, `spi`, `gpio` |
-| **MAY HANG** | Does a real WFI or writes power/clock hardware. If a path is broken the prompt never returns — **power-cycle** to recover (you lose the shell, not an editing session). | `gate`, `keystroke`, `irq`, `ecwake`, `suspend`, `p`, `hp` |
+| **SAFE** | Reads only (or polls / self-restores, never sleeps). Cannot hang. Re-runnable freely. | `dump` (no arg, prints build tag), `pmu`, `cpuinfo`, `napstats`, `psci`, `litvolt`, `probe`, `spi`, `gpio` |
+| **MAY HANG** | Does a real WFI or powers off the running core. If a path is broken the prompt never returns — **power-cycle** to recover (you lose the shell, not an editing session). | `gate`, `coredown`, `keystroke`, `irq`, `ecwake`, `suspend`, `p`, `hp` |
 
 The `keystroke`/`irq`/`ecwake` paths are the *working* WFI recipe (the same one
-the editor uses) and return normally; `p`/`hp`/`suspend` are the *broken/legacy*
-experiments kept as evidence and will freeze. See each entry below.
+the editor uses) and return normally; `p`/`hp`/`suspend`/`coredown` are broken or
+risky experiments kept as evidence and may freeze. See each entry below.
+
+> **Build tag.** Bare `twwfi` prints `twwfi build tag: <tag>` (a static string,
+> bumped on each twwfi change). Confirm it matches the source before trusting any
+> result — a stale reflash confounded a lot of suspend-hang diagnosis this cycle.
 
 ---
 
 ## Quick reference
 
 ```
-twwfi                 - dump EL / timer / GIC state (SAFE)
+twwfi                 - dump build tag + EL / timer / GIC state (SAFE)
 twwfi pmu             - CPU + peripheral power-domain state (SAFE)
-twwfi cpuinfo         - live CPU cluster frequencies (SAFE)
+twwfi cpuinfo         - CPU freq (CRU) + power-domain status + EC board current (SAFE)
+twwfi napstats        - did the editor's idle WFI actually sleep or busy-spin? (SAFE)
+twwfi psci            - query PSCI version/features/affinity from EL2 (SAFE)
+twwfi litvolt [uV]    - lower A53 core rail ppvar_litcpu_pwm (def 800000), hold 10s, restore (SAFE)
 twwfi gate [N]        - power-gate editor-unused domain N (or all); MAY HANG
+twwfi coredown [ms]   - PMU auto-power-gate CPU0 on WFI + timer backstop; MAY HANG
 twwfi keystroke [ms]  - the editor's real idle-nap loop until a key (works)
 twwfi irq [ms]        - take a timer IRQ at EL2 + WFI (works)
 twwfi ecwake          - EC keypress/lid/power IRQ wakes WFI, no timer (works)
-twwfi suspend [ms]    - PSCI CPU_SUSPEND via bl31 (HANGS - evidence)
+twwfi suspend [ms]    - PSCI CPU_SUSPEND (STANDBY) via bl31 (masks IRQ, opens PMR, then SMC)
 twwfi probe [p|hp]    - arm timer + poll (no WFI), trace propagation (SAFE)
 twwfi spi [n]         - read an SPI's group/priority in the GICD (SAFE)
 twwfi gpio            - EC GPIO IRQ poll ~5 s, press keys (SAFE)
 twwfi p|hp [ms]       - arm CNTP/CNTHP + one raw WFI (HANGS - no IMO/handler)
 ```
 
-`[ms]` defaults to 300 (or 5000 for `keystroke`). `[N]`/`[n]` are integers.
+`[ms]` defaults to 300 (or 5000 for `keystroke`). `[N]`/`[n]`/`[uV]` are integers.
+
+### The power-investigation subcommands (this cycle)
+
+- **`cpuinfo`** — decodes live A53/A72 frequency (CRU APLL), power-domain status
+  (is CPU0 powered?), the `PMU_CORE_PM_CON0` auto-power-down bit, and reads the
+  EC battery/board current (whole-board mA, not CPU-specific — no per-CPU
+  telemetry exists on RK3399).
+- **`napstats`** — reports the editor idle-nap instrumentation: total naps, how
+  many WFIs returned in <1 ms ("instant" = did NOT sleep), total slept time.
+  Proved the editor's no-timer WFI genuinely deep-sleeps (0 instant, ~16 s/nap).
+- **`psci`** — safe PSCI queries (VERSION / FEATURES / AFFINITY_INFO). Confirmed
+  PSCI 1.1, CPU_SUSPEND supported, conduit works from EL2.
+- **`litvolt [uV]`** — lowers the A53 core rail (`ppvar_litcpu_pwm`) to `uV`
+  (default 0.80 V, Linux's 408 MHz OPP), holds 10 s to feel the chip, then
+  RESTORES the original. Lower-only. This is how the over-voltage heat fix was
+  validated before wiring 0.80 V into the editor. See POWERSAVE.md.
+- **`coredown [ms]`** — RISKY: sets `PMU_CORE_PM_CON0` so a WFI power-gates CPU0,
+  timer-backstopped. On RK3399 a gated core resets to a bl31 entry point we don't
+  own, so this hangs — kept as evidence that core power-down is bl31 territory.
 
 ---
 

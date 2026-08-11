@@ -217,38 +217,65 @@ Rationale for the values:
   powered; the other little cores and BOTH A72 big cores are already off (U-Boot
   never PSCI-CPU_ON's them). The big-cluster L2/SCU domain (SCUB) is still on but
   that's leakage bl31 won't cleanly let EL2 gate. Nothing to do CPU-side.
+- **The idle WFI itself not sleeping** — ruled out by measurement. `twwfi
+  napstats` instruments the editor's actual no-timer nap: a run showed
+  `count=3, instant(<1ms)=0, slept=47623ms` (avg ~15.9 s/nap) — the core was
+  genuinely halted the whole idle period. So flat battery draw is NOT the CPU
+  busy-spinning; the deep WFI works. (Also cross-checked by `twwfi keystroke`.)
 
 ---
 
-## CPU little-cluster frequency: 600 → 408 MHz (confirmed working)
+## CPU A53 operating point: 408 MHz + 0.80 V (the real heat fix)
 
-CPU0 is the **A53 little cluster**, clocked from **APLL_L**. Stock `rkclk_init`
-leaves it at **600 MHz**. The editor lowers it to **408 MHz** at startup
-(`tw_set_cpu_408()` in cmd_tw.c) — self-contained CRU register pokes (no U-Boot
-clk-driver dependency; the core tree stays stock), using the same safe sequence
-`rkclk_set_pll` uses: PLL → slow/bypass (core on 24 MHz OSC) → set divisors →
-wait lock → normal mode. Glitch-free on the running core.
+CPU0 is the **A53 little cluster**, clocked from **APLL_L**, powered by the
+**`ppvar_litcpu_pwm`** rail. The editor sets BOTH freq and voltage to the 408 MHz
+operating point at startup (`tw_set_cpu_408()` in cmd_tw.c).
 
-408 MHz = 24 MHz × 68 / (1 × 2 × 2); VCO = 1632 MHz (in the 800–2000 range).
+**Why voltage, not just frequency — the finding that mattered.** The board runs
+noticeably HOTTER under the U-Boot editor than under Linux at idle (confirmed by
+touch). Comparing against the live Linux box on the same hardware (see the
+"Reference: live Linux measurements" section below) found the cause: at 408 MHz
+Linux DVFS runs `ppvar_litcpu` at **0.80 V**, but U-Boot leaves it at **0.90 V**
+(≈ the 1008 MHz OPP voltage). Same frequency, higher voltage → **(0.90/0.80)² =
+1.27× the core power burned as heat for nothing.** That over-voltage is the heat.
 
-**Confirmed via `twwfi cpuinfo`:** at the U-Boot shell CPUL reads 600 MHz; after
-launching `typewriter` it reads **408 MHz**. So the change takes effect.
+**What the editor now does (both, safe order):**
+1. Frequency 600 → **408 MHz** — self-contained CRU APLL_L pokes (no clk-driver
+   dependency, core tree stays stock; same slow→reprogram→lock→normal sequence
+   as `rkclk_set_pll`, glitch-free on the running core).
+   408 MHz = 24 MHz × 68 / (1 × 2 × 2); VCO = 1632 MHz (in 800–2000).
+2. Voltage 0.90 → **0.80 V** on `ppvar_litcpu_pwm` — DM regulator API
+   (`regulator_get_by_platname` + `regulator_set_value`), **lower-only** guard.
+
+Order matters: frequency dropped FIRST, then voltage — never under-volt for the
+running clock. 0.80 V @ 408 MHz is the exact Linux OPP, proven stable on this
+silicon (Linux + `twwfi litvolt` held it 10 s, no instability).
+
+**Confirmed:**
+- `twwfi cpuinfo` → CPUL 600 MHz at the shell, **408 MHz** after launching the editor.
+- `twwfi litvolt` → set 0.80 V, held 10 s, recovered cleanly (safe).
+- `md.l 0xff760000 2` → `00000044 00002201` (the 408 MHz PLL divisors).
+
+**Checking the CPU voltage yourself (U-Boot shell):**
+```
+regulator dev ppvar_litcpu_pwm
+regulator value            # prints the current core voltage in uV
+```
+Expect ~900000 (0.90 V) at the bare shell; ~800000 (0.80 V) after the editor ran.
+(`ppvar_bigcpu_pwm` is the A72 rail — see the open lead below.)
 
 Notes:
-- **`CONFIG_SYS_CLK_FREQ` does nothing here** — it's a mach-sunxi/legacy Kconfig
-  the Rockchip clock path never reads. Setting it had no effect; that's why the
-  real change is a runtime register write, not a config knob.
-- **CPUB (A72 big cluster) still shows 600 MHz** in `twwfi cpuinfo` — that's just
-  APLL_B's *configured* rate. Both A72 cores are powered OFF (`twwfi pmu`), so
-  nothing is clocked from it; it's a dormant locked PLL (a few mW, leakage-scale,
-  not worth touching — and its management is bl31/init territory, not the editor).
-- **Power benefit is small** — one A53, 600→408 is single-digit mW; it does NOT
-  move the 14 %/hr (the CPU isn't the draw). Kept anyway; a lower core clock is
-  the right default for a typewriter and it's a real, verified change.
+- **`CONFIG_SYS_CLK_FREQ` does nothing here** — mach-sunxi/legacy Kconfig the
+  Rockchip clock path never reads. The real change is a runtime register write.
+- **CPUB (A72) shows 600 MHz** in `twwfi cpuinfo` — APLL_B's *configured* rate;
+  its cores are OFF (`twwfi pmu`), so nothing is clocked from it. **Open lead:**
+  if `ppvar_bigcpu_pwm` is likewise over-volted while the A72 sits idle/off, that
+  is more free heat to shave (the editor never uses the big cluster). Check its
+  U-Boot value vs. the Linux idle value before touching it.
 - **Subordinate cluster clocks** (ACLKM/PCLK_DBG/ATCLK) keep their boot-time
-  dividers (set against 600), so they now run proportionally lower — within spec
-  (lower is safe), just below nominal. Not restored on editor exit (shell keeps
-  408). To revert, drop the `tw_set_cpu_408()` call, or change the divisors.
+  dividers (set against 600), so they now run proportionally lower — within spec.
+  Not restored on editor exit (shell keeps 408 MHz / 0.80 V). To revert, drop the
+  `tw_set_cpu_408()` call.
 
 ---
 
@@ -291,6 +318,53 @@ By elimination it's the **load-bearing** draws:
 
 Bottom line: the kept win is the WFI idle work. Beyond it, the display is the one
 remaining cheap lever; everything else needs instrumentation.
+
+---
+
+## Reference: live Linux measurements (same board)
+
+The gru/kevin board dual-boots a full Linux (6.12) — the ~6 %/hr reference. SSH
+onto it made several session-long assumptions measurable. Key findings:
+
+**Linux runs at EL2** (`dmesg`: "All CPU(s) started at EL2"), same as the U-Boot
+editor, over the same `smc` PSCI conduit. So EL2-vs-EL1 was never the blocker —
+running the editor at EL1 would not help. (This killed a long EL1 detour.)
+
+**PSCI deep CPU idle does NOT measurably cut current here.** Battery current
+(`/sys/class/power_supply/sbs-9-000b/current_now`) at settled idle was ~633 mA
+whether cluster-sleep was enabled OR forced off (WFI-only, like U-Boot). WiFi
+down and backlight off also didn't move it. So the CPU *idle state depth* is not
+the lever — a PSCI CPU_SUSPEND / context-save port into U-Boot would buy ~nothing.
+
+**s2idle does not cleanly resume** on this board's Linux (rtcwake -m freeze hangs
+on resume, needs power-cycle) — the one whole-system quiesce that *would* cut
+DDR/rails is itself broken here. That's the TI "Why Won't My CPU Sleep" wake
+problem; not reachable from a U-Boot editor.
+
+**The A53 OPP table** (little cluster, from Linux DT `opp-table-0`) — freq → volt:
+
+| MHz | Volt | | MHz | Volt |
+|----:|-----:|-|----:|-----:|
+| 408 | 0.800 V | | 1008 | 0.900 V |
+| 600 | 0.825 V | | 1200 | 0.975 V |
+| 816 | 0.850 V | | 1512 | 1.150 V |
+
+At 408 MHz Linux sets `ppvar_litcpu` = **0.80 V**; U-Boot left it at **0.90 V**
+(the ~1008 MHz point). That 0.90→0.80 V gap is the editor's over-voltage / heat,
+now fixed (see the CPU operating-point section above). The A72 table
+(`opp-table-1`) tops out at 2016 MHz / 1.25 V; its idle rail was ~0.975 V.
+
+**Temperatures (Linux, settled idle):** `cpu-thermal` ~36 °C, `gpu`/`bigcpu` ~35 °C
+— the target the editor should approach after the voltage fix.
+
+**Reading current/voltage on Linux (for future comparisons):**
+```
+cat /sys/class/power_supply/sbs-9-000b/current_now   # uA, live battery current
+cat /sys/class/thermal/thermal_zone*/temp            # m°C per zone
+for r in /sys/class/regulator/regulator.*; do echo "$(cat $r/name)=$(cat $r/microvolts)"; done
+```
+The same SBS battery gauge is reachable from U-Boot via the EC (see
+`twwfi cpuinfo`'s board-current line) — the one real power instrument we have.
 
 ---
 

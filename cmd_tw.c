@@ -22,6 +22,7 @@
 #include <irq_func.h>
 #include <dm.h>
 #include <cros_ec.h>
+#include <power/regulator.h>  /* lower A53 core rail to its 408 MHz OPP voltage */
 #include <asm/system.h>
 #include <time.h>
 #if defined(CONFIG_ARM64) && defined(__aarch64__)
@@ -173,6 +174,25 @@ static void tw_wfi_setup(void)
 }
 
 /*
+ * Idle-nap instrumentation (debug). tw_idle_nap measures the timer counter
+ * across each WFI and tallies: total naps, how many returned "instantly" (<1 ms
+ * = WFI did NOT sleep, e.g. a level IRQ kept it pending), and the total slept
+ * time. `twwfi napstats` prints these so we can PROVE whether the editor's
+ * no-timer WFI actually deep-sleeps or busy-spins. Read via tw_idle_stats().
+ */
+unsigned long tw_nap_count;       /* total tw_idle_nap() calls */
+unsigned long tw_nap_instant;     /* of those, WFIs that returned in <1 ms */
+unsigned long tw_nap_slept_us;    /* total time spent inside WFI (us) */
+
+void tw_idle_stats(unsigned long *count, unsigned long *instant,
+		   unsigned long *slept_us)
+{
+	if (count)    *count    = tw_nap_count;
+	if (instant)  *instant  = tw_nap_instant;
+	if (slept_us) *slept_us = tw_nap_slept_us;
+}
+
+/*
  * One deep WFI: sleep until an EC event (key / power button / lid, all on INTID
  * 46). If `ms` is non-zero a CNTP backstop timer (INTID 30) is also armed and
  * wakes it after `ms`; `ms == 0` means NO timer - sleep purely until an EC IRQ
@@ -183,6 +203,7 @@ static void tw_idle_nap(unsigned int ms)
 {
 	unsigned long ticks = (get_tbclk() / 1000) * ms;
 	unsigned long vbar_save, hcr_save;
+	unsigned long t_in, t_out, us, hz = get_tbclk();
 
 	tw_wfi_setup();
 
@@ -206,8 +227,18 @@ static void tw_idle_nap(unsigned int ms)
 	}
 	isb();
 	asm volatile("msr daifclr, #2");     /* PSTATE.I = 0 -> IRQ taken */
+	t_in = get_ticks();
 	wfi();
+	t_out = get_ticks();
 	asm volatile("msr daifset, #2");     /* re-mask */
+
+	/* Instrument: how long did this WFI actually block? <1 ms = it did NOT
+	 * sleep (returned instantly), the tell-tale of a stuck/pending IRQ. */
+	us = hz ? (t_out - t_in) / (hz / 1000000) : 0;
+	tw_nap_count++;
+	tw_nap_slept_us += us;
+	if (us < 1000)
+		tw_nap_instant++;
 	asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));   /* ensure off */
 
 	/* Restore U-Boot's vectors + IRQ routing. */
@@ -232,25 +263,25 @@ static void tw_idle_nap(unsigned int ms)
 
 /* --------------------------------------------------- CPU little-cluster clk --- */
 /*
- * Drop CPU0 (A53 little cluster) to 408 MHz at editor startup. The board's
- * rkclk_init leaves it at 600 MHz; a typewriter needs far less, and a lower
- * core clock trims (a little) dynamic power.
+ * Drop CPU0 (A53 little cluster) to its 408 MHz operating point at editor
+ * startup - BOTH frequency AND voltage. The board's rkclk_init leaves the A53 at
+ * 600 MHz, and (measured on the live Linux board) the ppvar_litcpu_pwm rail at
+ * 0.90 V - but Linux DVFS runs 408 MHz at only 0.80 V. Same freq at 0.90 vs
+ * 0.80 V wastes (0.90/0.80)^2 = 1.27x the core power as HEAT for nothing; this
+ * is why the U-Boot editor ran hotter than Linux at idle. So we lower freq first
+ * (600->408), then voltage (0.90->0.80 V) - reductions only, always in the safe
+ * order (voltage never below what the current freq needs). 0.80 V @ 408 MHz is
+ * the exact Linux OPP, proven stable on this silicon.
  *
- * Self-contained: pokes the RK3399 CRU APLL_L registers directly (no dependency
- * on the U-Boot clk driver, so this builds against a stock U-Boot tree). We use
- * the SAME safe sequence U-Boot's rkclk_set_pll does: force the PLL to slow
- * (bypass) mode so the core runs off the 24 MHz OSC while we reprogram, set the
- * divisors, wait for PLL lock, switch back to normal mode. Glitch-free even
- * though we're executing on that very core.
+ * Frequency: self-contained CRU APLL_L pokes (no clk-driver dep; builds against
+ * stock U-Boot), the SAME safe slow->reprogram->lock->normal sequence as
+ * rkclk_set_pll. Voltage: the DM regulator API on ppvar_litcpu_pwm.
  *
- * 408 MHz = 24MHz * fbdiv / (refdiv * postdiv1 * postdiv2)
- *         = 24 * 68 / (1 * 2 * 2). VCO = 24*68/1 = 1632 MHz (in 800-2000 range).
- * Then select APLL_L as the core mux and set the core divider to /1 so CPU0
- * runs at the full 408 MHz PLL output.
- *
- * Verify after flashing with `md.l 0xff760000 2` -> expect 00000044 00002201.
- * Not restored on editor exit (the shell keeps 408 too).
+ * 408 MHz = 24MHz * 68 / (1 * 2 * 2). VCO = 24*68 = 1632 MHz (in 800-2000).
+ * Verify: `md.l 0xff760000 2` -> 00000044 00002201; `twwfi cpuinfo` -> 408 MHz.
+ * Not restored on editor exit (the shell keeps 408 MHz / 0.80 V too).
  */
+#define TW_LITCPU_OPP_UV   800000   /* Linux's 408 MHz OPP voltage for the A53 */
 #define TW_CRU_BASE          0xff760000UL
 #define TW_APLL_L_CON0       (TW_CRU_BASE + 0x00)   /* [11:0] fbdiv */
 #define TW_APLL_L_CON1       (TW_CRU_BASE + 0x04)   /* refdiv/postdiv1/postdiv2 */
@@ -292,11 +323,36 @@ static void tw_set_cpu_408(void)
 	/* 5. little-core mux -> APLL_L (CLKSEL_CON0 [7:6]=0) and core div -> /1
 	 *    ([4:0]=0), so CPU0 = full PLL output = 408 MHz. */
 	writel(TW_WMSK((0x3U << 6) | 0x1fU, 0), (void *)TW_CRU_CLKSEL_CON0);
+
+	/*
+	 * 6. Now that the A53 is at 408 MHz, lower its core rail to the matching
+	 *    0.80 V OPP (from ~0.90 V). Frequency dropped FIRST (above), voltage
+	 *    second - the safe order (never under-volt for the running freq). Only
+	 *    ever lowers; if the read/set fails, leave the rail as-is (harmless,
+	 *    just warmer). Proven stable + non-hanging via `twwfi litvolt`.
+	 */
+	{
+		struct udevice *reg;
+		int cur;
+
+		if (!regulator_get_by_platname("ppvar_litcpu_pwm", &reg) && reg) {
+			cur = regulator_get_value(reg);
+			if (cur > TW_LITCPU_OPP_UV)      /* only lower, never raise */
+				regulator_set_value(reg, TW_LITCPU_OPP_UV);
+		}
+	}
 }
 
 #else   /* host / non-arm64: plain delay (WFE-equivalent) */
 static void tw_idle_nap(unsigned int ms) { udelay(ms * 1000); }
 static void tw_set_cpu_408(void) { }
+void tw_idle_stats(unsigned long *count, unsigned long *instant,
+		   unsigned long *slept_us)
+{
+	if (count)    *count    = 0;
+	if (instant)  *instant  = 0;
+	if (slept_us) *slept_us = 0;
+}
 #endif
 
 /* ----------------------------------------------------------- key input --- */
@@ -1059,6 +1115,43 @@ static int tw_read_battery(void)
 }
 
 /*
+ * Non-static: read the EC charge state for the `twwfi cpuinfo` diagnostic.
+ * Fills *pct / *chg_ma (battery charge current, mA; negative = discharging on
+ * some ECs) / *ac (1 if on AC). Returns 0 on success, <0 on error / no EC.
+ * This is BOARD/battery current, not CPU - twwfi labels it as such. Reuses the
+ * editor's working charge-state path (U-Boot's cros_ec_read_batt_charge is buggy
+ * here - see the tw_ec_command note above).
+ */
+int tw_read_charge_state(int *pct, int *chg_ma, int *ac)
+{
+	struct udevice *ec = tw_ec();
+	struct ec_response_charge_state resp;
+	uint8_t reqcmd = CHARGE_STATE_CMD_GET_STATE;
+	uint8_t *din = NULL;
+	int len;
+
+	if (!ec)
+		return -ENODEV;
+
+	len = tw_ec_command(ec, EC_CMD_CHARGE_STATE, 0,
+			    &reqcmd, sizeof(reqcmd),
+			    &din, sizeof(resp));
+	if (len < 0)
+		return len;
+	if (!din || len < (int)sizeof(resp.get_state))
+		return -EINVAL;
+
+	memcpy(&resp, din, sizeof(resp.get_state));
+	if (pct)
+		*pct = resp.get_state.batt_state_of_charge;
+	if (chg_ma)
+		*chg_ma = resp.get_state.chg_current;
+	if (ac)
+		*ac = resp.get_state.ac;
+	return 0;
+}
+
+/*
  * Power-off triggers: the physical power button AND closing the lid. Detection
  * done RIGHT.
  *
@@ -1747,7 +1840,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 
 	tw_bind_ime(s);
 	tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
-	tw_set_cpu_408();            /* little cluster 600 -> 408 MHz (low power) */
+	tw_set_cpu_408();            /* A53 -> 408 MHz + 0.80 V OPP (cooler idle) */
 	/* Show the exception level in the startup line: the event-stream WFE idle
 	 * (low power) only engages at EL>=2. EL2 = good; EL1 would mean the idle
 	 * loop is busy-spinning and power-saving isn't active. See POWERSAVE.md. */
