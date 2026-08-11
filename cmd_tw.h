@@ -73,6 +73,7 @@
 #define KEY_CTRL_P    0x10       /* previous line */
 #define KEY_CTRL_Q    0x11       /* power off (save+sync+EC hibernate), confirmed */
 #define KEY_CTRL_S    0x13       /* save (one-handed; replaced ^O write-out) */
+#define KEY_CTRL_T    0x14       /* show battery % on demand (no auto-poll) */
 #define KEY_CTRL_R    0x12       /* open file (read into buffer) */
 #define KEY_CTRL_W    0x17       /* delete word backward */
 #define KEY_CTRL_X    0x18       /* exit */
@@ -104,17 +105,24 @@
  * not a real console byte). Dispatched like ^Q -> Y: save + power off. */
 #define KEY_POWER_BTN   0x220
 
-/* Synthetic key: the periodic battery-poll timer elapsed. Not a real byte;
- * the handler re-reads the gauge and repaints the title bar if the % changed. */
-#define KEY_REFRESH     0x221
-#define TW_BATT_POLL_MS 30000    /* battery re-read interval (ms) */
-
-/* Idle-loop tuning (power). TW_KEY_NAP_MS is one WFE nap = worst-case keystroke
- * latency (imperceptible). TW_EC_POLL_MS throttles the EC host-event SPI poll
- * (power button / lid) - human reaction time is ~150 ms, so 200 ms is plenty
- * and cuts EC bus traffic vs. polling every nap. See POWERSAVE.md. */
-#define TW_KEY_NAP_MS   25       /* WFE nap length per idle iteration (ms) */
-#define TW_EC_POLL_MS   200      /* EC power-button/lid poll interval (ms) */
+/*
+ * Idle model (power): the key-wait loop has two states -
+ *   1. Active window - for TW_ACTIVE_WINDOW_MS after the last keypress, a cheap
+ *      1 ms poll (no deep sleep), so bursty typing and multi-byte escape
+ *      sequences are caught without a sleep/wake per byte.
+ *   2. Deep sleep - once the window lapses, a WFI with NO timer armed: the CPU
+ *      sleeps until the cros_ec IRQ (INTID 46) fires. Key, power button, and lid
+ *      all ride that one line, so any wakes it instantly. There is no periodic
+ *      wake - an idle typewriter draws its floor until touched.
+ * Battery is NOT polled automatically (that would force a periodic wake); Ctrl-T
+ * reads and shows it on demand. See POWERSAVE.md.
+ */
+#define TW_ACTIVE_WINDOW_MS 2000 /* stay-awake tail after a keypress (ms) - long
+				  * enough to cover think-pauses and held-key
+				  * auto-repeat (each key re-arms it), so the
+				  * input layer keeps being polled while a key is
+				  * down; deep WFI only after real idle */
+#define TW_ACTIVE_POLL_MS   25   /* poll interval within the active window (ms) */
 
 #define KEY_META_F      0x210    /* M-f: forward one word */
 #define KEY_META_B      0x211    /* M-b: backward one word */
@@ -201,8 +209,8 @@ struct tw_state {
 	int   pick_sel;         /* selected index */
 	int   pick_top;         /* first visible row (scroll) */
 
-	/* Battery %, shown in the title bar. Refreshed by the periodic poll
-	 * (KEY_REFRESH, every TW_BATT_POLL_MS). >= 0 is a percentage (drawn);
+	/* Battery %, shown in the title bar. Refreshed on demand by Ctrl-T (no
+	 * periodic poll - see POWERSAVE.md). >= 0 is a percentage (drawn);
 	 * negative means unavailable (no EC / read failed) and is hidden. */
 	int   batt_pct;
 

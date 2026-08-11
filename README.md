@@ -111,7 +111,8 @@ should report `0 wanted codepoints had no unifont glyph`).
 >
 > Board-specific companion docs: **[POWEROFF.md](POWEROFF.md)** (how `^Q`
 > powers off / boots the OS via PSCI), **[POWERSAVE.md](POWERSAVE.md)** (cutting
-> idle power/heat via the event-stream `udelay` + 408 MHz), and
+> idle power/heat via deep WFI + 408 MHz), **[TWWFI.md](TWWFI.md)** (the `twwfi`
+> RK3399 idle/power debug command — CPU freq, power domains, WFI wake paths), and
 > **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** (the eMMC FAT-write defect).
 
 There are three edits to the tree, then you enable the option. **Steps 2 and 3
@@ -137,7 +138,7 @@ Append this one line:
 ```makefile
 obj-$(CONFIG_CMD_TYPEWRITER) += cmd_tw.o cmd_tw_fs.o cmd_tw_video.o \
 				ime_table.o wubi_embed.o font_data.o
-# optional WFI-idle debug command (temporary; see POWERSAVE.md):
+# optional idle/power debug command (temporary; see TWWFI.md):
 obj-$(CONFIG_CMD_TYPEWRITER) += cmd_twwfi.o
 ```
 

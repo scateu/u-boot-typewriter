@@ -50,33 +50,60 @@ int  tw_backlight_step(int delta);/* step by delta (+/-), returns applied */
 
 static struct tw_state g_tw;
 
-/* ------------------------------------------------------------ WFE idle --- */
+/* ------------------------------------------------------------ WFI idle --- */
 /*
- * Low-power idle nap = real WFI deep sleep, woken by the NonSecure physical
- * timer (CNTP, INTID 30) - the same way Linux idles this board.
+ * Low-power idle = real WFI deep sleep, woken by an actually-TAKEN NonSecure
+ * physical IRQ - the same way Linux idles this board. Two wake sources are
+ * armed: the CNTP timer (INTID 30) as a battery backstop, and the cros_ec line
+ * (gpio0 PA1 → INTID 46) which fires for a key / power button / lid.
  *
  * The long investigation (see POWERSAVE.md + the `twwfi` command) landed here:
- * WFI wakes only if the timer IRQ is actually TAKEN, which needs three things
- * U-Boot doesn't set up by default -
+ * WFI wakes only if the IRQ is actually TAKEN, which needs three things U-Boot
+ * doesn't set up by default -
  *   1. HCR_EL2.IMO = 1     - route physical IRQ to EL2 (U-Boot only sets AMO,
  *                            so IRQs targeted EL1 and our EL2 WFI never woke);
  *   2. the GIC enabled for NS Group1 (GICD_CTLR.EnableGrp1NS + ICC_IGRPEN1_EL1
- *      + the CNTP PPI + ICC_PMR open);
- *   3. an EL2 IRQ handler that acks (ICC_IAR1) + EOIs (ICC_EOIR1) the timer.
- * Then: arm CNTP (IMASK=0), unmask PSTATE.I, WFI - the taken timer IRQ wakes it.
- * A cros_ec keypress/button/lid (INTID 46, also NS Group1) wakes it early too.
+ *      + the CNTP PPI + INTID 46 + ICC_PMR open);
+ *   3. an EL2 IRQ handler that acks (ICC_IAR1) + EOIs (ICC_EOIR1) and silences
+ *      the source (disable CNTP; mask gpio0 PA1 - the EC line is level-held).
+ * Then: arm CNTP (IMASK=0), unmask PSTATE.I, WFI - the taken IRQ wakes it.
  * bl31 leaves IRQs un-routed to EL3 in normal running, so taking them at EL2
- * works. (Verified: `twwfi irq` returns after the armed interval.)
+ * works. (Verified: `twwfi irq`/`twwfi keystroke` return on the armed event.)
  */
 #if defined(CONFIG_ARM64) && defined(__aarch64__)
 #define TW_GICD_CTLR        0xfee00000UL      /* GIC distributor control */
+#define TW_GICD_ISENABLER   0xfee00100UL      /* GICD set-enable (SPIs, 1 bit/INTID) */
+#define TW_GICD_ICPENDR     0xfee00280UL      /* GICD clear-pending (1 bit/INTID) */
 #define TW_GICR_ISENABLER0  0xfef10100UL      /* CPU0 redistributor SGI frame */
+#define TW_GICR_ICPENDR0    0xfef10280UL      /* CPU0 redist clear-pending (PPIs) */
+
+/*
+ * The cros_ec interrupt line (gpio0 PA1, "ec-interrupt" in the DT) -> GIC_SPI 14
+ * = INTID 46. The EC asserts it for ANY event: a key scan (MKBP), the power
+ * button, or a lid-close. We enable it as a WFI wake source so a keypress wakes
+ * the idle WFI instantly (and power/lid wake it too - both are handled by the
+ * host-event poll on the very next loop iteration). GPIO0 v1 controller regs:
+ */
+#define TW_GPIO0_BASE       0xff720000UL
+#define TW_GPIO_INTEN       (TW_GPIO0_BASE + 0x30)
+#define TW_GPIO_INTMASK     (TW_GPIO0_BASE + 0x34)
+#define TW_GPIO_INTTYPE     (TW_GPIO0_BASE + 0x38)   /* 0=level, 1=edge */
+#define TW_GPIO_INT_POL     (TW_GPIO0_BASE + 0x3c)   /* 0=active-low */
+#define TW_GPIO_PORTA_EOI   (TW_GPIO0_BASE + 0x4c)
+#define TW_EC_PA1_BIT       (1U << 1)                /* PA1 = ec-interrupt pin */
+#define TW_EC_GPIO_INTID    46                       /* GPIO0 bank = GIC_SPI 14 */
 
 /*
  * Minimal EL2 vector table. Only the Current-EL-SPx IRQ slot (offset 0x280) has
- * a handler; it acks the pending interrupt, disables CNTP so it de-asserts, EOIs,
- * and returns. Every other slot just eret (we only ever expect the timer IRQ
- * while napping, with all other exceptions still impossible). 2 KiB aligned.
+ * a handler; it acks the pending interrupt, silences BOTH possible wake sources
+ * (disables CNTP so the timer de-asserts; masks gpio0 PA1 so the level-triggered
+ * EC line stops asserting), EOIs, and returns. Every other slot just eret (we
+ * only ever expect the timer or the EC IRQ while napping, with all other
+ * exceptions still impossible). 2 KiB aligned.
+ *
+ * Masking PA1 is essential: the EC line is level-triggered and stays asserted
+ * until its event is consumed, so without the mask the IRQ re-fires forever and
+ * WFI never settles. tw_idle_nap re-unmasks it after each wake.
  */
 extern char tw_idle_vectors[];
 asm(
@@ -89,13 +116,19 @@ asm(
 "	.align 7\n eret\n"	/* SP0 err   */
 "	.align 7\n eret\n"	/* SPx sync  */
 "	.align 7					\n"	/* SPx IRQ - ours */
-"	stp	x0, x1, [sp, #-16]!			\n"
+"	stp	x0, x1, [sp, #-32]!			\n"
+"	str	x2, [sp, #16]				\n"
 "	mrs	x0, S3_0_C12_C12_0			\n"	/* ICC_IAR1_EL1 ack */
 "	msr	cntp_ctl_el0, xzr			\n"	/* disable CNTP     */
+"	movz	x1, #0xff72, lsl #16			\n"	/* gpio0 base 0xff720000 */
+"	ldr	w2, [x1, #0x34]				\n"	/* GPIO_INTMASK */
+"	orr	w2, w2, #0x2				\n"	/* mask PA1 (bit1) */
+"	str	w2, [x1, #0x34]				\n"
 "	dsb	sy					\n"
 "	msr	S3_0_C12_C12_1, x0			\n"	/* ICC_EOIR1_EL1 EOI */
 "	isb						\n"
-"	ldp	x0, x1, [sp], #16			\n"
+"	ldr	x2, [sp, #16]				\n"
+"	ldp	x0, x1, [sp], #32			\n"
 "	eret						\n"
 "	.align 7\n eret\n"	/* SPx fiq   */
 "	.align 7\n eret\n"	/* SPx err   */
@@ -112,6 +145,7 @@ asm(
 static void tw_wfi_setup(void)
 {
 	static int done;
+	unsigned int word = TW_EC_GPIO_INTID / 32, bit = TW_EC_GPIO_INTID % 32;
 
 	if (done)
 		return;
@@ -123,8 +157,28 @@ static void tw_wfi_setup(void)
 	asm volatile("msr " TW_STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));
 	asm volatile("msr " TW_STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
 	isb();
+
+	/*
+	 * EC keypress/power/lid wake: gpio0 PA1 as a level, active-low IRQ +
+	 * INTID 46 enabled in the distributor. The cros_ec driver owns this pin
+	 * only as a DATA input (it reads the level for tstc/MKBP); it never
+	 * touches these interrupt-control registers, so there's no conflict.
+	 */
+	clrbits_le32((void *)TW_GPIO_INTTYPE, TW_EC_PA1_BIT);   /* 0 = level */
+	clrbits_le32((void *)TW_GPIO_INT_POL, TW_EC_PA1_BIT);   /* 0 = active-low */
+	clrbits_le32((void *)TW_GPIO_INTMASK, TW_EC_PA1_BIT);   /* unmask */
+	setbits_le32((void *)TW_GPIO_INTEN,   TW_EC_PA1_BIT);   /* enable */
+	writel(1U << bit, (void *)(TW_GICD_ISENABLER + word * 4));
+	dsb();
 }
 
+/*
+ * One deep WFI: sleep until an EC event (key / power button / lid, all on INTID
+ * 46). If `ms` is non-zero a CNTP backstop timer (INTID 30) is also armed and
+ * wakes it after `ms`; `ms == 0` means NO timer - sleep purely until an EC IRQ
+ * (the typewriter's idle: no periodic wake, lowest power). The taken IRQ wakes
+ * it; the handler silences the source. This is where nearly all time is spent.
+ */
 static void tw_idle_nap(unsigned int ms)
 {
 	unsigned long ticks = (get_tbclk() / 1000) * ms;
@@ -141,10 +195,15 @@ static void tw_idle_nap(unsigned int ms)
 	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save | (1UL << 4)));
 	isb();
 
-	/* Arm CNTP (ENABLE, IMASK=0 so it asserts), take IRQs, WFI. The handler
-	 * acks/disables/EOIs; a keypress IRQ can wake early too. */
-	asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
-	asm volatile("msr cntp_ctl_el0, %0" : : "r" (1UL));
+	/* Arm CNTP only if a backstop was requested (ms != 0); otherwise leave the
+	 * timer off so the EC IRQ is the sole wake source. Take IRQs, WFI. The
+	 * handler acks/disables CNTP/masks the EC line/EOIs. */
+	if (ms) {
+		asm volatile("msr cntp_tval_el0, %0" : : "r" (ticks));
+		asm volatile("msr cntp_ctl_el0, %0" : : "r" (1UL));
+	} else {
+		asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
+	}
 	isb();
 	asm volatile("msr daifclr, #2");     /* PSTATE.I = 0 -> IRQ taken */
 	wfi();
@@ -155,9 +214,89 @@ static void tw_idle_nap(unsigned int ms)
 	asm volatile("msr vbar_el2, %0" : : "r" (vbar_save));
 	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save));
 	isb();
+
+	/*
+	 * If the EC IRQ woke us, the handler masked gpio0 PA1 to quiet the level
+	 * line. Clear the GPIO latch and re-unmask it so the next nap can wake on
+	 * the next event, and clear any pending INTID 30/46 so it starts clean.
+	 * (The cros_ec keyboard reads the pin's DATA level for tstc, unaffected by
+	 * the interrupt mask, so keys pressed during the wake are still seen.)
+	 */
+	writel(TW_EC_PA1_BIT, (void *)TW_GPIO_PORTA_EOI);
+	clrbits_le32((void *)TW_GPIO_INTMASK, TW_EC_PA1_BIT);
+	writel(1U << 30, (void *)TW_GICR_ICPENDR0);                 /* CNTP PPI */
+	writel(1U << (TW_EC_GPIO_INTID % 32),
+	       (void *)(TW_GICD_ICPENDR + (TW_EC_GPIO_INTID / 32) * 4)); /* SPI 46 */
+	dsb();
 }
+
+/* --------------------------------------------------- CPU little-cluster clk --- */
+/*
+ * Drop CPU0 (A53 little cluster) to 408 MHz at editor startup. The board's
+ * rkclk_init leaves it at 600 MHz; a typewriter needs far less, and a lower
+ * core clock trims (a little) dynamic power.
+ *
+ * Self-contained: pokes the RK3399 CRU APLL_L registers directly (no dependency
+ * on the U-Boot clk driver, so this builds against a stock U-Boot tree). We use
+ * the SAME safe sequence U-Boot's rkclk_set_pll does: force the PLL to slow
+ * (bypass) mode so the core runs off the 24 MHz OSC while we reprogram, set the
+ * divisors, wait for PLL lock, switch back to normal mode. Glitch-free even
+ * though we're executing on that very core.
+ *
+ * 408 MHz = 24MHz * fbdiv / (refdiv * postdiv1 * postdiv2)
+ *         = 24 * 68 / (1 * 2 * 2). VCO = 24*68/1 = 1632 MHz (in 800-2000 range).
+ * Then select APLL_L as the core mux and set the core divider to /1 so CPU0
+ * runs at the full 408 MHz PLL output.
+ *
+ * Verify after flashing with `md.l 0xff760000 2` -> expect 00000044 00002201.
+ * Not restored on editor exit (the shell keeps 408 too).
+ */
+#define TW_CRU_BASE          0xff760000UL
+#define TW_APLL_L_CON0       (TW_CRU_BASE + 0x00)   /* [11:0] fbdiv */
+#define TW_APLL_L_CON1       (TW_CRU_BASE + 0x04)   /* refdiv/postdiv1/postdiv2 */
+#define TW_APLL_L_CON2       (TW_CRU_BASE + 0x08)   /* [31] lock status */
+#define TW_APLL_L_CON3       (TW_CRU_BASE + 0x0c)   /* [9:8] mode, [3] dsmpd */
+#define TW_CRU_CLKSEL_CON0   (TW_CRU_BASE + 0x100)  /* little-core mux + div */
+/* RK3399 CRU regs are write-masked: high 16 bits enable the low-16-bit write. */
+#define TW_WMSK(mask, val)   (((mask) << 16) | ((val) & (mask)))
+#define TW_PLL_MODE_SLOW     0
+#define TW_PLL_MODE_NORM     1
+
+static void tw_set_cpu_408(void)
+{
+	/* 408 MHz little-cluster PLL divisors. */
+	const unsigned int fbdiv = 68, refdiv = 1, postdiv1 = 2, postdiv2 = 2;
+	unsigned int spin = 100000;
+
+	/* 1. PLL -> slow/bypass mode: core now on 24 MHz OSC, safe to reprogram.
+	 *    (CON3 bits[9:8] = mode.) */
+	writel(TW_WMSK(0x3U << 8, TW_PLL_MODE_SLOW << 8), (void *)TW_APLL_L_CON3);
+	/*    integer mode: CON3 bit[3] DSMPD = 1. */
+	writel(TW_WMSK(0x1U << 3, 0x1U << 3), (void *)TW_APLL_L_CON3);
+
+	/* 2. divisors. CON0[11:0]=fbdiv; CON1[5:0]=refdiv,[10:8]=pd1,[14:12]=pd2.
+	 *    Mask 0x773f = postdiv2(14:12) | postdiv1(10:8) | refdiv(5:0), exactly
+	 *    the fields U-Boot's rkclk_set_pll touches. */
+	writel(TW_WMSK(0xfffU, fbdiv), (void *)TW_APLL_L_CON0);
+	writel(TW_WMSK(0x773fU,
+		       refdiv | (postdiv1 << 8) | (postdiv2 << 12)),
+	       (void *)TW_APLL_L_CON1);
+
+	/* 3. wait for PLL lock (CON2 bit31), bounded so we can't hang forever. */
+	while (!(readl((void *)TW_APLL_L_CON2) & (1U << 31)) && --spin)
+		udelay(1);
+
+	/* 4. back to normal mode: core now runs off the relocked 408 MHz PLL. */
+	writel(TW_WMSK(0x3U << 8, TW_PLL_MODE_NORM << 8), (void *)TW_APLL_L_CON3);
+
+	/* 5. little-core mux -> APLL_L (CLKSEL_CON0 [7:6]=0) and core div -> /1
+	 *    ([4:0]=0), so CPU0 = full PLL output = 408 MHz. */
+	writel(TW_WMSK((0x3U << 6) | 0x1fU, 0), (void *)TW_CRU_CLKSEL_CON0);
+}
+
 #else   /* host / non-arm64: plain delay (WFE-equivalent) */
 static void tw_idle_nap(unsigned int ms) { udelay(ms * 1000); }
+static void tw_set_cpu_408(void) { }
 #endif
 
 /* ----------------------------------------------------------- key input --- */
@@ -185,41 +324,68 @@ static int tw_getch_timeout(void)
 
 static int tw_poweroff_event_pending(void);   /* defined below (EC section) */
 
+/* Set the "stay awake" window: keep polling cheaply (no deep WFI) until this ms
+ * deadline. Re-armed only on real keyboard input, so bursty typing and multi-
+ * byte escape sequences don't pay a sleep/wake cycle per byte. After it lapses
+ * (TW_ACTIVE_WINDOW_MS past the last keypress) the loop drops to deep WFI. */
+static unsigned long tw_active_until;
+
+static inline void tw_stay_awake(void)
+{
+	tw_active_until = get_timer(0) + TW_ACTIVE_WINDOW_MS;
+}
+
 static int tw_read_key(void)
 {
-	static unsigned long batt_next;    /* ms deadline: next battery refresh */
-	static unsigned long ec_next;      /* ms deadline: next EC event poll */
 	int c;
 
 	/*
-	 * Wait for a key. U-Boot's console is polled (no "sleep until key").
+	 * Wait for an event. Two states:
 	 *
-	 * Idle: each nap is a WFE sleep (event-stream udelay, see tw_idle_nap).
-	 * Deep WFI isn't usable here (routed to EL3/bl31 - see POWERSAVE.md), so WFE
-	 * it is. TW_KEY_NAP_MS (25 ms) is the worst-case keystroke latency.
+	 *  1. Active window - for TW_ACTIVE_WINDOW_MS (2 s) after the last keypress,
+	 *     poll cheaply every TW_ACTIVE_POLL_MS. This spans think-pauses between
+	 *     keys and, crucially, keeps the input layer polled while a key is HELD
+	 *     so its auto-repeat fires (a held key emits no fresh IRQ, so a WFI would
+	 *     never wake for the repeat). Each key re-arms the window.
 	 *
-	 * The EC host-event poll (power button / lid) is a SPI transaction, so we
-	 * throttle it to TW_EC_POLL_MS (200 ms). We use the HOST EVENT channel, not
-	 * the MKBP FIFO (shared with the cros_ec keyboard - draining it steals keys).
+	 *  2. Deep sleep - once the window lapses with nothing pending, drop into a
+	 *     WFI with NO timer armed: the CPU sleeps until the cros_ec IRQ (INTID
+	 *     46) fires. A key, the power button, and the lid all ride that one line,
+	 *     so any of them wakes it instantly. There is no periodic wake at all -
+	 *     an idle typewriter draws its true floor until you touch it.
 	 *
-	 * Every TW_BATT_POLL_MS we return KEY_REFRESH so the caller re-reads the
-	 * battery gauge and repaints the title only if the % changed.
+	 * A key surfaces as a console byte (tstc/getchar). The power button and lid
+	 * do NOT - they latch EC host-event flags on a separate channel - so once we
+	 * wake with no key pending we do a single host-event read to catch them and
+	 * power off. That read is a slow EC SPI transaction, but it only runs on a
+	 * genuine no-key wake (never during typing: keys short-circuit via tstc, and
+	 * the active window polls without touching the EC), so it never lags keys.
 	 */
 	while (!tstc()) {
 		unsigned long now = get_timer(0);
 
-		if (now >= ec_next) {
-			ec_next = now + TW_EC_POLL_MS;
-			if (tw_poweroff_event_pending())
-				return KEY_POWER_BTN;
+		/* Active window: cheap poll, no deep sleep, no EC access. Polling
+		 * (not WFI) here keeps the input layer's auto-repeat serviced while a
+		 * key is held - a held key emits no new IRQ, so a WFI would never wake
+		 * for the repeat. */
+		if (now < tw_active_until) {
+			schedule();
+			udelay(TW_ACTIVE_POLL_MS * 1000);
+			continue;
 		}
-		if (now >= batt_next) {
-			batt_next = now + TW_BATT_POLL_MS;
-			return KEY_REFRESH;
-		}
-		schedule();               /* keep the watchdog fed */
-		tw_idle_nap(TW_KEY_NAP_MS);
+
+		/* Window lapsed. Before sleeping, decode a possible power/lid press
+		 * (the only non-key events); they share the WFI's INTID 46 wake. */
+		if (tw_poweroff_event_pending())
+			return KEY_POWER_BTN;
+
+		schedule();               /* keep any housekeeping fed */
+		tw_idle_nap(0);           /* no timer: sleep until an EC IRQ */
 	}
+
+	/* A key is pending: activity, so keep the CPU awake for another window -
+	 * covers fast typing and the trailing bytes of an escape/Meta sequence. */
+	tw_stay_awake();
 
 	c = getchar();
 
@@ -866,8 +1032,8 @@ static int tw_ec_command(struct udevice *ec, int cmd, int cmd_version,
 /*
  * Read the battery charge as a percentage (0..100) on success, or a negative
  * value on failure (TW_BATT_NO_EC = no EC, else a negative EC result code) -
- * the title bar hides any negative. Called from the periodic KEY_REFRESH poll
- * (every TW_BATT_POLL_MS), one EC transaction per refresh.
+ * the title bar hides any negative. Called on demand from Ctrl-T (one EC
+ * transaction per press); there is no periodic battery poll (see POWERSAVE.md).
  */
 static int tw_read_battery(void)
 {
@@ -1310,19 +1476,6 @@ static void tw_handle_key(struct tw_state *s, int key)
 		return;
 	}
 
-	/* Periodic battery refresh: re-read the gauge, repaint the title bar only
-	 * if the displayed % changed. Doesn't touch mode/prompt/status - works in
-	 * any state, no flicker between updates. */
-	if (key == KEY_REFRESH) {
-		int b = tw_read_battery();
-
-		if (b != s->batt_pct) {
-			s->batt_pct = b;
-			s->dirty_title = 1;
-		}
-		return;
-	}
-
 	if (s->prompt != TW_PROMPT_NONE) {
 		tw_prompt_key(s, key);
 		tw_mark_dirty(s, &snap);
@@ -1362,6 +1515,17 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_CTRL_S:            /* save (one-handed) */
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;
+	case KEY_CTRL_T: {         /* battery % on demand (bottom status only) */
+		int b = tw_read_battery();
+
+		if (b == TW_BATT_NO_EC)
+			tw_status(s, "[ Battery: no EC ]");
+		else if (b < 0)
+			tw_status(s, "[ Battery: read failed (%d) ]", b);
+		else
+			tw_status(s, "[ Battery: %d%% ]", b);
+		break;
+	}
 	case KEY_CTRL_R:            /* open a file: arrow-select picker */
 		tw_picker_open(s);
 		break;
@@ -1547,7 +1711,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	}
 
 	memset(s, 0, sizeof(*s));
-	s->batt_pct = -1;   /* unknown until the first poll (hides "0%" flash) */
+	s->batt_pct = -1;   /* unknown until first Ctrl-T (hidden in title) */
 
 	/*
 	 * Writable unless the user forced `ro`, EXCEPT the eMMC (mmc 0:*) is
@@ -1583,6 +1747,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 
 	tw_bind_ime(s);
 	tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
+	tw_set_cpu_408();            /* little cluster 600 -> 408 MHz (low power) */
 	/* Show the exception level in the startup line: the event-stream WFE idle
 	 * (low power) only engages at EL>=2. EL2 = good; EL1 would mean the idle
 	 * loop is busy-spinning and power-saving isn't active. See POWERSAVE.md. */
@@ -1613,7 +1778,7 @@ U_BOOT_CMD(
 	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
 	"  ^S save  ^R open (pick)  ^X exit  ^Q power off / boot OS  ^G help\n"
-	"  ^B/^F char  ^P/^N line  ^A/^E bol/eol  arrows/PgUp/PgDn move\n"
+	"  ^T battery %  ^B/^F char  ^P/^N line  ^A/^E bol/eol  arrows move\n"
 	"  ^D del  ^W del-word-back  ^K kill-eol  ^Y yank\n"
 	"  ^- dim / ^] brighten backlight (20% steps)\n"
 	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"

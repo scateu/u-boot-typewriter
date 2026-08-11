@@ -163,30 +163,49 @@ regress — check that first.
 
 ## Cycle-time / wake reference
 
-The editor's key-wait loop (`tw_read_key`, `cmd_tw.c`) sleeps in `WFI` and wakes
-on interrupts or on its own timed deadlines. What wakes / polls, how often, and
-by what mechanism:
+The editor's key-wait loop (`tw_read_key`, `cmd_tw.c`) has just two states:
 
-| Event                         | Rate / latency   | Constant           | Method |
-|-------------------------------|------------------|--------------------|--------|
-| **Keystroke**                 | instant (IRQ)¹   | `TW_KEY_NAP_MS` 25 ms | cros_ec keyboard IRQ (INTID 46) wakes WFI early; worst case, next 25 ms timer tick |
-| **Power button**              | ≤ 200 ms         | `TW_EC_POLL_MS` 200 ms | polled: EC **host-event** flags (`cros_ec_get_host_events`), *not* the MKBP FIFO |
-| **Lid close**                 | ≤ 200 ms         | `TW_EC_POLL_MS` 200 ms | same EC host-event poll (`EC_HOST_EVENT_LID_CLOSED`) |
-| **Battery % (title `BAT:`)**  | 30 s             | `TW_BATT_POLL_MS` 30 s | polled: one EC `CHARGE_STATE` transaction; title repaints only if the % changed |
-| **WFI wake tick**             | 25 ms            | `TW_KEY_NAP_MS` 25 ms | armed CNTP timer (INTID 30) — bounds keystroke latency, re-checks the polls |
+1. **Active window** — for `TW_ACTIVE_WINDOW_MS` (2 s) after the last keypress, a
+   cheap `TW_ACTIVE_POLL_MS` (25 ms) poll, no deep sleep. This spans the natural
+   think-pauses between keys and, crucially, keeps U-Boot's input layer polled
+   while a key is **held** so its auto-repeat fires — a held key emits no fresh
+   IRQ, so a WFI would never wake for the repeat. Each key re-arms the window.
+2. **Deep sleep** — once the window lapses, a `WFI` with **no timer armed**: the
+   CPU sleeps until the cros_ec IRQ (INTID 46) fires. There is no periodic wake at
+   all — an idle typewriter draws its true floor until you touch it.
 
-¹ A keypress asserts the cros_ec interrupt (gpio0 PA1 → GIC INTID 46, NonSecure
-  Group1), which wakes the `WFI` immediately; the 25 ms tick is only the fallback
-  ceiling. Power button and lid are **polled** (not IRQ-woken) because they share
-  the EC host-event channel we read every 200 ms — well under human reaction time.
+What wakes it, and by what mechanism:
+
+| Event            | Latency          | Method |
+|------------------|------------------|--------|
+| **Keystroke**    | instant (IRQ)    | cros_ec IRQ (gpio0 PA1 → INTID 46) wakes the WFI; `tstc()` returns the key. No EC-SPI on this path. For 2 s after a key, a 25 ms poll (not WFI) catches the next byte / auto-repeat. |
+| **Power button** | instant (IRQ)    | same INTID 46 wakes the WFI; on a no-key wake, one `cros_ec_get_host_events()` read decodes it → save + power off |
+| **Lid close**    | instant (IRQ)    | same INTID 46 wake; EC host-event flag (`EC_HOST_EVENT_LID_CLOSED`) |
+| **Battery %**    | on demand (^T)   | not polled — `Ctrl-T` reads the gauge once and shows it; keeping it off a timer is what lets the CPU sleep indefinitely |
+
+The EC multiplexes key, power button, and lid onto its single interrupt line
+(gpio0 PA1 → GIC INTID 46, NonSecure Group1), so any of the three wakes the WFI
+immediately. A key surfaces as a console byte (`tstc`/`getchar`); power/lid do not
+(they latch host-event flags on a separate channel), so after a no-key wake the
+loop does **one** host-event read to catch them. That read is a slow EC SPI
+transaction, but it runs only on a genuine no-key wake — never during typing
+(keys short-circuit via `tstc`, and the active window polls without touching the
+EC) — so it never lags keystrokes.
+
+There is deliberately **no backstop timer**: a lost IRQ edge would leave the
+editor asleep until the next real keypress (which itself wakes it). On a
+typewriter that trade — lowest possible idle power vs. a theoretical missed edge
+that a keypress recovers — is the right one.
 
 Rationale for the values:
-- **25 ms nap** — worst-case key-to-read latency, below perception; also the WFI
-  re-check interval.
-- **200 ms EC poll** — each is a SPI transaction to the EC; decoupled from the
-  fast keyboard path so the bus isn't clocked every nap.
-- **30 s battery** — battery moves ~1 %/several-min; near-free (repaint only on
-  change).
+- **2 s active window** — covers the think-pauses between keys and the whole span
+  of a held key (auto-repeat needs the input layer polled every ~30 ms; a shorter
+  window would drop back to WFI mid-hold and repeat would die). Each key re-arms
+  it, so sustained input keeps the CPU in the cheap poll; 2 s after you truly stop,
+  it deep-sleeps. The 2 s of 25 ms-polling after each key is negligible power
+  versus the deep-WFI floor it returns to.
+- **25 ms poll** — was the old worst-case key latency; imperceptible for typing,
+  and faster than the 30 ms auto-repeat rate so no repeat slot is missed.
 
 ---
 
@@ -194,14 +213,93 @@ Rationale for the values:
 
 - **The device tree / `.dtb`** — describes hardware, not CPU run-mode/idle. Not
   the cause of the draw.
-- **Multiple CPU cores** — U-Boot proper runs on CPU0 only; the others are parked
-  by the earlier boot stage.
+- **Multiple CPU cores** — confirmed via `twwfi pmu`: only CPUL0 (A53) is
+  powered; the other little cores and BOTH A72 big cores are already off (U-Boot
+  never PSCI-CPU_ON's them). The big-cluster L2/SCU domain (SCUB) is still on but
+  that's leakage bl31 won't cleanly let EL2 gate. Nothing to do CPU-side.
+
+---
+
+## CPU little-cluster frequency: 600 → 408 MHz (confirmed working)
+
+CPU0 is the **A53 little cluster**, clocked from **APLL_L**. Stock `rkclk_init`
+leaves it at **600 MHz**. The editor lowers it to **408 MHz** at startup
+(`tw_set_cpu_408()` in cmd_tw.c) — self-contained CRU register pokes (no U-Boot
+clk-driver dependency; the core tree stays stock), using the same safe sequence
+`rkclk_set_pll` uses: PLL → slow/bypass (core on 24 MHz OSC) → set divisors →
+wait lock → normal mode. Glitch-free on the running core.
+
+408 MHz = 24 MHz × 68 / (1 × 2 × 2); VCO = 1632 MHz (in the 800–2000 range).
+
+**Confirmed via `twwfi cpuinfo`:** at the U-Boot shell CPUL reads 600 MHz; after
+launching `typewriter` it reads **408 MHz**. So the change takes effect.
+
+Notes:
+- **`CONFIG_SYS_CLK_FREQ` does nothing here** — it's a mach-sunxi/legacy Kconfig
+  the Rockchip clock path never reads. Setting it had no effect; that's why the
+  real change is a runtime register write, not a config knob.
+- **CPUB (A72 big cluster) still shows 600 MHz** in `twwfi cpuinfo` — that's just
+  APLL_B's *configured* rate. Both A72 cores are powered OFF (`twwfi pmu`), so
+  nothing is clocked from it; it's a dormant locked PLL (a few mW, leakage-scale,
+  not worth touching — and its management is bl31/init territory, not the editor).
+- **Power benefit is small** — one A53, 600→408 is single-digit mW; it does NOT
+  move the 14 %/hr (the CPU isn't the draw). Kept anyway; a lower core clock is
+  the right default for a typewriter and it's a real, verified change.
+- **Subordinate cluster clocks** (ACLKM/PCLK_DBG/ATCLK) keep their boot-time
+  dividers (set against 600), so they now run proportionally lower — within spec
+  (lower is safe), just below nominal. Not restored on editor exit (shell keeps
+  408). To revert, drop the `tw_set_cpu_408()` call, or change the divisors.
+
+---
+
+## Unused-peripheral power-gating — tried, REMOVED (no benefit)
+
+We tried gating the RK3399 peripheral domains a text editor never uses (GPU,
+VCODEC, VDU, RGA, IEP, ISP0, ISP1, HDCP, USB3, GMAC) at editor startup, using
+bl31's own sequence — request the domain's NoC bus idle (`PMU_BUS_IDLE_REQ` →
+wait `_ST` & `_ACK`), then set its `PMU_PWRDN_CON` bit (→ wait `PMU_PWRDN_ST`).
+
+> **Measured result: NO CHANGE.** Idle drain stayed at ~14 %/hr, identical to
+> before. These domains were powered-but-idle *leakage*, negligible next to the
+> real draw. The startup gating was **removed** — it added risk/complexity for no
+> win. Don't re-chase PMU-domain gating for power on this board.
+
+The bench tool `twwfi gate [N]` was kept for future meter-based testing (gates
+one domain, holds ~15 s, restores; 0=GPU 1=VCODEC 2=VDU 3=RGA 4=IEP 5=ISP0
+6=ISP1 7=HDCP 8=USB3 9=GMAC). Verified safe there — all ten gate + restore with
+no hang — but with no measurable effect on drain.
+
+### WiFi — also ruled out
+
+`regulator disable pp3300_wifi_bt` refuses (-114); `regulator info` shows the rail
+is neither always-on nor boot-on; `gpio status -a` shows both WiFi control pins
+(`regulator-pp3300-wifi-bt.gpio`, `regulator-wlan-pd-n.gpio`) at output 0 — i.e.
+WiFi/BT is already effectively off at idle. Not a contributor.
+
+## Where the remaining ~14 %/hr actually is
+
+After the WFI work (~20→14 %/hr), the leftover is **not** cheap unused blocks:
+CPU is minimal (1 core), peripheral PMU domains gate to **0 delta**, WiFi is off.
+By elimination it's the **load-bearing** draws:
+- **Display panel + backlight** — on at full brightness the entire session. Almost
+  certainly the biggest single item. Cheapest next experiment (no meter): dim to
+  minimum (`Ctrl--`) or blank the panel on idle and compare %/hr. If that moves
+  the needle, build "auto-dim/blank after N s idle."
+- **DDR self-refresh + always-on core/logic rails** (`pp1200_lpddr`, `ppvar_logic`,
+  `ppvar_centerlogic`, `pp900_ap`, …) — the machine doing its job; not disableable
+  without hanging, and tuning needs a **power meter**. Don't guess-tune rails blind.
+
+Bottom line: the kept win is the WFI idle work. Beyond it, the display is the one
+remaining cheap lever; everything else needs instrumentation.
 
 ---
 
 ## Measuring
 
-No `cpu`/cpufreq readout in U-Boot here, so measure indirectly:
+The `twwfi` command (see **[TWWFI.md](TWWFI.md)**) is the on-board instrument for
+all of this: `twwfi cpuinfo` (live CPU MHz), `twwfi pmu` (powered domains), and
+the `probe`/`irq`/`ecwake`/`keystroke` WFI-wake proofs. Beyond registers, measure
+power indirectly:
 1. **CPU temperature** — idle a few minutes; cooler = WFI idle engaged.
 2. **Battery drain** — battery % over 15–30 min idle → %/hr. Target: from
    ~20 %/hr toward Linux's ~6 %/hr.

@@ -431,9 +431,9 @@ static void draw_title(struct tw_state *s)
 		 s->dirty ? "    Modified" : "");
 	draw_str(TW_CELL_PX, 0, line, C_BARTX, C_BAR);
 
-	/* Right side: battery % (if known) then the IME chip. Battery is polled
-	 * on a timer (see cmd_tw.c) into s->batt_pct; >= 0 is a percentage,
-	 * negative means unavailable (hidden). */
+	/* Right side: battery % (if known) then the IME chip. Battery is read on
+	 * demand by Ctrl-T (see cmd_tw.c) into s->batt_pct; >= 0 is a percentage,
+	 * negative means unavailable / not yet read (hidden). */
 	x = s->fb_w - 7 * TW_CELL_PX;
 	draw_str(x, 0, s->ime.mode == TW_IME_WUBI ? "[Wubi]" : "[ En ]",
 		 C_BARTX, C_BAR);

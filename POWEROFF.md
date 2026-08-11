@@ -163,11 +163,11 @@ again to retry.
 ## Battery % (title bar) — and why it needed a private EC command path
 
 The **title bar** shows the battery percentage (near the `[En]`/`[Wubi]` chip).
-It's polled from the EC on a timer — every `TW_BATT_POLL_MS` (30 s), the key-wait
-loop returns a synthetic `KEY_REFRESH`; the handler re-reads the gauge and
-repaints the title **only if the % changed** (no flicker between updates). One EC
-SPI command per 30 s is immeasurable drain. Getting the read working hit two EC
-quirks worth recording:
+It is read from the EC **on demand** — pressing `Ctrl-T` runs one EC SPI command,
+updates `s->batt_pct`, and repaints the title. It is deliberately NOT polled on a
+timer: a periodic poll would force the CPU to wake out of deep WFI at that
+cadence, defeating the idle-power design (see POWERSAVE.md). Getting the read
+working hit two EC quirks worth recording:
 
 1. **U-Boot's `cros_ec_read_batt_charge()` is buggy.** It does `if (ret) return
    ret`, but `ret` is `ec_command()`'s **byte count** (positive on success), not
