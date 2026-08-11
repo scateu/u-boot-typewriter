@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <vsprintf.h>
 #include <asm/system.h>
+#include <cpu_func.h>     /* flush_dcache_range (secondary-core stub to PoC) */
 #include <asm/io.h>
 #include <asm/gic.h>
 #include <time.h>
@@ -44,7 +45,7 @@ unsigned long invoke_psci_fn(unsigned long, unsigned long, unsigned long,
 
 /* Bump on every twwfi change so `twwfi` (no arg) proves the flashed binary is
  * current - a stale reflash was confounding suspend-hang diagnosis. */
-#define TW_BUILD_TAG "litvolt-4"
+#define TW_BUILD_TAG "cpuall-5"
 
 /* From cmd_tw.c: EC charge state (battery %, board charge current mA, on-AC).
  * Returns 0 on success, <0 on error/no-EC. This is BOARD current, not CPU. */
@@ -949,6 +950,77 @@ static int do_ecwake(void)
 }
 
 /*
+ * Secondary-core entry stub for `twwfi cpuall`. When we PSCI CPU_ON a secondary
+ * core, it starts executing HERE, cold (MMU off, no valid stack). To be safe it
+ * must touch NOTHING - so it immediately SMCs PSCI_CPU_OFF (0x84000002) to power
+ * ITSELF back down, and spins in WFI if that ever returns. Position-independent,
+ * no memory/stack use. This is the "bring the core up, then deep-sleep it" body.
+ */
+extern char tw_sec_cpu_stub[];
+asm(
+"	.pushsection .text.tw_sec_cpu_stub, \"ax\"	\n"
+"	.align 4					\n"
+"tw_sec_cpu_stub:					\n"
+"	movz	x0, #0x8400, lsl #16			\n"   /* PSCI_CPU_OFF = */
+"	movk	x0, #0x0002				\n"   /*   0x84000002   */
+"	smc	#0					\n"   /* power self off */
+"1:	wfi						\n"   /* never reached  */
+"	b	1b					\n"
+"	.popsection					\n"
+);
+
+/*
+ * `twwfi cpuall`: explicitly PSCI CPU_ON each of the 5 secondary cores, each with
+ * the self-CPU_OFF stub as its entry point - i.e. bring every core up and put it
+ * straight back into deep power-down through the PROPER bl31 path (CPU_ON gives
+ * bl31 the resume context that a raw PMU poke, twwfi coredown, lacked).
+ *
+ * EXPECTATION (honest): twwfi pmu shows these cores are ALREADY off, so CPU_ON
+ * will likely return ALREADY_ON only if bl31 thinks they're up, or SUCCESS then
+ * they immediately CPU_OFF again - net zero power change. This tests the theory
+ * that "explicitly parking them" helps; the measured pmu state says it won't.
+ *
+ * RISKY: CPU_ON starting a core that then SMCs CPU_OFF exercises bl31's secondary
+ * boot+off path. If a started core doesn't cleanly power off, or corrupts shared
+ * state, the board may wedge - power-cycle. Never run from the editor.
+ */
+static int do_cpuall(void)
+{
+	struct udevice *psci;
+	/* MPIDR affinity per the DT: little L1..L3 = 1/2/3, big B0/B1 = 0x100/0x101 */
+	static const struct { const char *name; unsigned long mpidr; } sec[] = {
+		{ "CPUL1", 0x001 }, { "CPUL2", 0x002 }, { "CPUL3", 0x003 },
+		{ "CPUB0", 0x100 }, { "CPUB1", 0x101 },
+	};
+	unsigned long stub = (unsigned long)tw_sec_cpu_stub;
+	unsigned int i;
+
+	if (uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci)) {
+		printf("PSCI driver not found.\n");
+		return 1;
+	}
+	printf("CPU_ON each secondary -> self CPU_OFF stub @ 0x%lx.\n", stub);
+	printf("pmu says they're already off; expect ALREADY_ON / no power change.\n");
+	printf("If the prompt does NOT return, a started core wedged - power-cycle.\n");
+
+	for (i = 0; i < ARRAY_SIZE(sec); i++) {
+		long r;
+
+		/* flush the stub to PoC so a cold secondary (caches off) fetches it */
+		flush_dcache_range((unsigned long)tw_sec_cpu_stub,
+				   (unsigned long)tw_sec_cpu_stub + 64);
+		dsb();
+		r = (long)invoke_psci_fn(PSCI_0_2_FN64_CPU_ON, sec[i].mpidr,
+					 stub, 0);
+		printf("  CPU_ON %s (mpidr 0x%lx) -> %ld (%s)\n",
+		       sec[i].name, sec[i].mpidr, r, psci_err(r));
+		udelay(2000);   /* let it start + CPU_OFF itself before the next */
+	}
+	printf("=> Done. Check `twwfi pmu` (domains) - likely unchanged (already off).\n");
+	return 0;
+}
+
+/*
  * Replicate the EDITOR's exact idle nap (tw_idle_nap in cmd_tw.c) in a loop
  * until a key is pressed - to test the real thing, not a variant. Expected:
  * the board goes quiet (deep WFI) and "freezes" until you press a key, then it
@@ -1614,6 +1686,8 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		return do_irq_wfi(ms);
 	if (!strcmp(argv[1], "coredown"))
 		return do_coredown(ms);   /* power-gate CPU0 on WFI (timer-backstopped) */
+	if (!strcmp(argv[1], "cpuall"))
+		return do_cpuall();       /* CPU_ON each secondary -> self CPU_OFF */
 	if (!strcmp(argv[1], "ecwake"))
 		return do_ecwake();
 	if (!strcmp(argv[1], "gpio"))
@@ -1633,7 +1707,7 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (!strcmp(argv[1], "p"))
 		return do_wfi_test(0, ms);
 
-	printf("usage: twwfi [pmu|cpuinfo|napstats|psci|litvolt|gate|coredown"
+	printf("usage: twwfi [pmu|cpuinfo|napstats|psci|litvolt|gate|coredown|cpuall"
 	       "|keystroke|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV]\n");
 	return CMD_RET_USAGE;
 }
@@ -1658,6 +1732,8 @@ U_BOOT_CMD(
 	"                     this is what the editor's idle nap does.\n"
 	"twwfi coredown [ms]- RISKY: PMU auto-power-gate CPU0 on WFI (CORE_PM_CON0=0x3)\n"
 	"                     + CNTP backstop. Returns => core gates+wakes (cooler idle).\n"
+	"twwfi cpuall       - RISKY: PSCI CPU_ON each secondary core -> self CPU_OFF stub\n"
+	"                     (explicitly park all 5; pmu says already off, expect no-op).\n"
 	"twwfi ecwake       - EC GPIO (INTID 46) as WFI wake IRQ, NO timer. Press a\n"
 	"                     key/power button/lid; returns => can sleep 30 s.\n"
 	"twwfi psci         - SAFE: query PSCI version/features/affinity from EL2 (no suspend)\n"
@@ -1666,5 +1742,5 @@ U_BOOT_CMD(
 	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
 	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"
 	"twwfi p|hp [ms]    - arm CNTP/CNTHP + one raw WFI (hangs - no IMO/handler)\n"
-	"  pmu/cpuinfo/napstats/psci/probe/spi/gpio/dump never hang. gate/coredown/suspend/p/hp may - power-cycle if so."
+	"  pmu/cpuinfo/napstats/psci/litvolt/probe/spi/gpio/dump never hang. gate/coredown/cpuall/suspend/p/hp may - power-cycle if so."
 );
