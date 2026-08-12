@@ -1,5 +1,13 @@
 # typewriter — a Nano-like editor with Wubi Chinese input for U-Boot
 
+
+<img  alt="image" src="https://github.com/user-attachments/assets/2e24de0d-fb55-410a-90b1-ee036b8abd0b" />
+<img  alt="image" src="https://github.com/user-attachments/assets/4b67c121-6205-4c51-8395-d3e0253cd902" />
+<img  alt="image" src="https://github.com/user-attachments/assets/836760fa-2cb0-417f-b921-efa663d39752" />
+<img  alt="image" src="https://github.com/user-attachments/assets/095bdab0-2619-430b-84bb-d219374679f1" />
+
+
+
  - Youtube Demo: [1](https://youtu.be/vDTKMEDWPtY) [2](https://youtube.com/shorts/Up-6oE29sNA)
 
 `typewriter` adds a full-screen, GNU **Nano**-style text editor to the U-Boot
@@ -16,10 +24,10 @@ Target tree: **U-Boot 2026.07**.
 +------------------------------------------------------------------------+
 | typewriter    /notes.txt    Modified                    BAT: 68% [En]  |  title bar (gray)
 |                                                                        |
-|  你好，世界                                                            |  text area (B/W)
+|  你好，世界                                                              |  text area (B/W)
 |  boot config: setenv bootargs ...                                      |  (hanzi = 2 cols)
 |                                                                        |
-| [五] wq  1.你 2.低 3.父荫 4.仰卧 …                              (1/2)  |  candidate bar (gray)
+| [五] wq  1.你 2.低 3.父荫 4.仰卧 …                              (1/2)    |  candidate bar (gray)
 | ^S Save         ^A/^E BOL/EOL   ^B/^F ^P/^N mv  ^K Kill  ^W DelWord  … |  hints, aligned
 | ^X Exit         ^R Open         ^Y Yank         ^D Del  ^-/^] Bright  … |  columns (gray)
 +------------------------------------------------------------------------+
