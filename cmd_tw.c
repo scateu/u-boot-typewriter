@@ -43,6 +43,7 @@ int tw_fs_probe(struct tw_fs *fs, const char *iftype, const char *dev_part,
 int tw_file_load(struct tw_state *s, const char *path);
 int tw_file_save(struct tw_state *s);
 int tw_list_files(struct tw_state *s);
+int tw_fs_unlink_name(struct tw_state *s, const char *name);
 
 /* --- from cmd_tw_video.c --- */
 int  tw_video_init(struct tw_state *s);
@@ -1601,10 +1602,45 @@ static void tw_switch_file(struct tw_state *s, const char *name)
 		  s->filename, s->num_lines, s->num_lines == 1 ? "" : "s");
 }
 
+/*
+ * New empty buffer named `name` (picker 'n'). Auto-saves the outgoing buffer
+ * first (like tw_switch_file), then starts a blank buffer. NOTHING is written to
+ * disk here - the file appears only on the first ^S - so this can't overwrite an
+ * existing file merely by naming it. Leaves the picker for the editor.
+ */
+static void tw_new_named(struct tw_state *s, const char *name)
+{
+	if (!name || !name[0])
+		return;
+
+	if (s->writable && s->dirty && s->filename[0]) {
+		if (tw_file_save(s) != 0) {
+			tw_status(s, "[ Save of %s failed - not switching ]",
+				  s->filename);
+			s->prompt = TW_PROMPT_PICK;
+			return;
+		}
+	}
+
+	strncpy(s->filename, name, TW_MAX_FILENAME - 1);
+	s->filename[TW_MAX_FILENAME - 1] = '\0';
+	s->num_lines = 1;
+	s->line_len[0] = 0;
+	s->cur_row = 0;
+	s->cur_col = 0;
+	s->scroll_top = 0;
+	s->dirty = 0;
+	s->writable = 1;                /* a new file is writable */
+	s->prompt = TW_PROMPT_NONE;     /* into the editor */
+	s->first_paint = 1;
+	tw_status(s, "[ New file: %s (^S to write) ]", s->filename);
+}
+
 /* ^R: list files on the current device and enter the arrow-select picker. If
  * the directory is empty or unreadable, fall back to a typed "File to open:". */
 static void tw_picker_open(struct tw_state *s)
 {
+	s->dirty_hints = 1;    /* swap to the picker hint bar (or back on fallback) */
 	if (tw_list_files(s) > 0) {
 		s->prompt = TW_PROMPT_PICK;
 		/* pre-select the current file if it's in the list */
@@ -1614,10 +1650,12 @@ static void tw_picker_open(struct tw_state *s)
 				break;
 			}
 	} else {
-		s->prompt = TW_PROMPT_OPEN;     /* nothing to pick: type a name */
+		/* Empty dir: no list to pick, but still offer New so the user can
+		 * create the first file. Enter the picker with a New prompt. */
+		s->prompt = TW_PROMPT_NEW;
 		s->prompt_ans[0] = '\0';
 		s->prompt_len = 0;
-		tw_status(s, "[ No files - type a name ]");
+		tw_status(s, "[ No files - (n)ew a name, or Esc ]");
 	}
 }
 
@@ -1666,15 +1704,63 @@ static void tw_prompt_key(struct tw_state *s, int key)
 			strncpy(name, s->pick_name[s->pick_sel], sizeof(name) - 1);
 			name[sizeof(name) - 1] = '\0';
 			s->prompt = TW_PROMPT_NONE;
+			s->dirty_hints = 1;
 			tw_switch_file(s, name);
 			return;
 		}
 		case KEY_ESC:
 		case KEY_CTRL_X:
 			s->prompt = TW_PROMPT_NONE;
+			s->dirty_hints = 1;
 			tw_status(s, "[ Cancelled ]");
 			break;
+		/* Pine/alpine-style file ops. Bare letters (the picker isn't a
+		 * text-entry mode): n=New, d=Delete. (No rename: this U-Boot's fs
+		 * layer has no fs_rename, and FAT has no rename primitive here.) */
+		case 'n': case 'N':
+			s->prompt = TW_PROMPT_NEW;
+			s->prompt_ans[0] = '\0';
+			s->prompt_len = 0;
+			s->dirty_hints = 1;
+			break;
+		case 'd': case 'D':
+			s->prompt = TW_PROMPT_PICKDEL;   /* y/N confirm */
+			s->dirty_hints = 1;
+			break;
 		}
+		return;
+	}
+
+	/* Delete confirmation (from the picker). y = unlink selected + re-list. */
+	if (s->prompt == TW_PROMPT_PICKDEL) {
+		if (key == 'y' || key == 'Y') {
+			char name[TW_PICK_NAMELEN];
+			int r;
+
+			strncpy(name, s->pick_name[s->pick_sel], sizeof(name) - 1);
+			name[sizeof(name) - 1] = '\0';
+			r = tw_fs_unlink_name(s, name);
+			if (r == 0) {
+				tw_list_files(s);           /* refresh the list */
+				if (s->pick_count == 0) {
+					s->prompt = TW_PROMPT_NONE;
+					tw_status(s, "[ Deleted %s - no files left ]",
+						  name);
+				} else {
+					if (s->pick_sel >= s->pick_count)
+						s->pick_sel = s->pick_count - 1;
+					s->prompt = TW_PROMPT_PICK;
+					tw_status(s, "[ Deleted %s ]", name);
+				}
+			} else {
+				s->prompt = TW_PROMPT_PICK;
+				tw_status(s, "[ Delete failed (FAT only) ]");
+			}
+		} else if (key == 'n' || key == 'N' || key == KEY_ESC) {
+			s->prompt = TW_PROMPT_PICK;
+			tw_status(s, "[ Cancelled ]");
+		}
+		s->dirty_hints = 1;
 		return;
 	}
 
@@ -1729,11 +1815,30 @@ static void tw_prompt_key(struct tw_state *s, int key)
 				tw_switch_file(s, s->prompt_ans);
 		} else if (which == TW_PROMPT_SHELL) {
 			tw_run_and_insert(s, s->prompt_ans);
+		} else if (which == TW_PROMPT_NEW) {
+			/* New file: empty buffer named prompt_ans. No disk write
+			 * until ^S - so this can't clobber an existing file here. */
+			s->dirty_hints = 1;
+			if (s->prompt_ans[0]) {
+				tw_new_named(s, s->prompt_ans);
+			} else {
+				s->prompt = TW_PROMPT_PICK;   /* empty: back to list */
+			}
 		}
 		return;
 	}
 	if (key == KEY_ESC) {
+		/* From New, Esc returns to the picker if there's a list to return
+		 * to; otherwise (empty dir) back to the editor. */
+		if (s->prompt == TW_PROMPT_NEW) {
+			s->prompt = (s->pick_count > 0) ? TW_PROMPT_PICK
+						        : TW_PROMPT_NONE;
+			s->dirty_hints = 1;
+			tw_status(s, "[ Cancelled ]");
+			return;
+		}
 		s->prompt = TW_PROMPT_NONE;
+		s->dirty_hints = 1;
 		tw_status(s, "[ Cancelled ]");
 		return;
 	}

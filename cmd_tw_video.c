@@ -563,11 +563,23 @@ static void draw_bar(struct tw_state *s)
 	fill_rect(0, s->bar_y, s->fb_w, TW_ROW_PX, C_BAR);   /* gray bar */
 
 	if (s->prompt == TW_PROMPT_PICK) {
-		char hint[80];
+		char hint[96];
 
 		snprintf(hint, sizeof(hint),
-			 " Open file  [%d/%d]  Up/Dn select  Enter open  Esc cancel ",
-			 s->pick_count ? s->pick_sel + 1 : 0, s->pick_count);
+			 " Files  [%d/%d]  %s ",
+			 s->pick_count ? s->pick_sel + 1 : 0, s->pick_count,
+			 s->pick_count ? s->pick_name[s->pick_sel] : "");
+		draw_str(0, s->bar_y, hint, C_BARTX, C_BAR);
+		return;
+	}
+
+	/* Delete confirm names the selected file (destructive - be explicit). */
+	if (s->prompt == TW_PROMPT_PICKDEL) {
+		char hint[96];
+
+		snprintf(hint, sizeof(hint),
+			 " Delete \"%s\"?  y)es  N)o ",
+			 s->pick_count ? s->pick_name[s->pick_sel] : "");
 		draw_str(0, s->bar_y, hint, C_BARTX, C_BAR);
 		return;
 	}
@@ -585,6 +597,7 @@ static void draw_bar(struct tw_state *s)
 			s->prompt == TW_PROMPT_OPEN   ? " File to open: " :
 			s->prompt == TW_PROMPT_SEARCH ? " Search: " :
 			s->prompt == TW_PROMPT_SHELL  ? " Run cmd (output inserted): !" :
+			s->prompt == TW_PROMPT_NEW    ? " New file name: " :
 			" Save modified buffer?  Y)es  N)o  C)ancel ";
 		x = draw_str(0, s->bar_y, label, C_BARTX, C_BAR);
 		x = draw_str(x, s->bar_y, s->prompt_ans, C_BARTX, C_BAR);
@@ -653,22 +666,13 @@ static void draw_bar(struct tw_state *s)
 #define TW_HINT_COLS   7
 #define TW_HINT_COL    16    /* full cell width, in character cells */
 #define TW_HINT_KEYW   6     /* key sub-column width (chars) before the desc */
-static void draw_hints(struct tw_state *s)
+struct hint { const char *key, *desc; };
+
+/* Render two rows of key/desc cells into the bottom hint bar. Common to the
+ * editing bar and the context-aware picker bar. */
+static void draw_hint_rows(struct tw_state *s, const struct hint *row1,
+			   const struct hint *row2)
 {
-	struct hint { const char *key, *desc; };
-	/* 7 cells/row. The 7th only renders if the framebuffer is wide enough;
-	 * draw_hints below skips any cell that would fall off the right edge, so a
-	 * narrow panel just drops it (no corruption). ^T = on-demand battery %. */
-	static const struct hint row1[TW_HINT_COLS] = {
-		{"^S", "Save"},  {"^A/^E", "BOL/EOL"}, {"^B/^F", "back/fwd"},
-		{"^K", "Kill"},  {"^W", "DelWord"},    {"^Spc", "Wubi"},
-		{"^T", "Battery"},
-	};
-	static const struct hint row2[TW_HINT_COLS] = {
-		{"^X", "Exit"},  {"^R", "Open"},       {"^P/^N", "prev/next"},
-		{"^D", "Del"},   {"^-/^]", "Bright"},  {"^Q", "PowerOff"},
-		{"^V", "Run cmd"},  /* 7th slot: directly below ^T Battery */
-	};
 	const struct hint *rows[2] = { row1, row2 };
 	int r, c;
 
@@ -681,6 +685,8 @@ static void draw_hints(struct tw_state *s)
 			int kx = TW_CELL_PX + c * TW_HINT_COL * TW_CELL_PX;
 			int dx = kx + TW_HINT_KEYW * TW_CELL_PX;
 
+			if (!h->key)
+				continue;              /* empty cell */
 			if (kx > s->fb_w - TW_CELL_PX)
 				break;                 /* off the right edge */
 			/* Key: inverse video (light block, dark text) so it pops. */
@@ -689,6 +695,44 @@ static void draw_hints(struct tw_state *s)
 			draw_str(dx, py, h->desc, C_BARTX, C_HINT);
 		}
 	}
+}
+
+/*
+ * Context-aware bottom hint bar. In the ^R file picker (and its New/Delete
+ * sub-prompts) the editing chords (Save/Wubi/Run cmd/...) don't apply, so
+ * we swap the whole bar for a picker-specific set, Pine/alpine style. Otherwise
+ * the normal editing bar. Redrawn whenever s->dirty_hints is set (picker enter/
+ * exit); the static editing bar is otherwise painted once on first_paint.
+ */
+static void draw_hints(struct tw_state *s)
+{
+	static const struct hint edit1[TW_HINT_COLS] = {
+		{"^S", "Save"},  {"^A/^E", "BOL/EOL"}, {"^B/^F", "back/fwd"},
+		{"^K", "Kill"},  {"^W", "DelWord"},    {"^Spc", "Wubi"},
+		{"^T", "Battery"},
+	};
+	static const struct hint edit2[TW_HINT_COLS] = {
+		{"^X", "Exit"},  {"^R", "Open"},       {"^P/^N", "prev/next"},
+		{"^D", "Del"},   {"^-/^]", "Bright"},  {"^Q", "PowerOff"},
+		{"^V", "Run cmd"},  /* 7th slot: directly below ^T Battery */
+	};
+	/* Picker bar: only what works in the file browser. */
+	static const struct hint pick1[TW_HINT_COLS] = {
+		{"Enter", "Open"}, {"n", "New"},    {"d", "Delete"},
+		{NULL, NULL},      {NULL, NULL},    {NULL, NULL}, {NULL, NULL},
+	};
+	static const struct hint pick2[TW_HINT_COLS] = {
+		{"\x18\x19", "Move"}, {"^P/^N", "Move"}, {"Esc", "Cancel"},
+		{NULL, NULL}, {NULL, NULL}, {NULL, NULL}, {NULL, NULL},
+	};
+	int in_picker = (s->prompt == TW_PROMPT_PICK ||
+			 s->prompt == TW_PROMPT_NEW ||
+			 s->prompt == TW_PROMPT_PICKDEL);
+
+	if (in_picker)
+		draw_hint_rows(s, pick1, pick2);
+	else
+		draw_hint_rows(s, edit1, edit2);
 }
 
 /*
@@ -758,8 +802,17 @@ void tw_render(struct tw_state *s)
 		s->dirty_title = 0;
 	}
 
-	/* The ^R picker takes over the text area with its file list. */
-	if (s->prompt == TW_PROMPT_PICK) {
+	/* Context-aware hint bar: swap edit<->picker set on prompt transitions. */
+	if (s->dirty_hints) {
+		draw_hints(s);
+		s->dirty_hints = 0;
+	}
+
+	/* The ^R picker takes over the text area with its file list. Its New/
+	 * Delete sub-prompts keep the list visible underneath (the prompt shows
+	 * in the bar), so draw the picker for the whole family. */
+	if (s->prompt == TW_PROMPT_PICK || s->prompt == TW_PROMPT_NEW ||
+	    s->prompt == TW_PROMPT_PICKDEL) {
 		draw_picker(s);
 		s->dirty_all = 1;    /* force a text repaint when the picker exits */
 	} else {

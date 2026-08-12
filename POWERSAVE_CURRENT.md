@@ -23,7 +23,7 @@ Every power lever investigated, with its measured battery-current contribution.
 | **WFI vs busy-spin (deep idle)** | **~8–11 mA** | **NOISE — the WFI idle saves only a few mA. Correct + harmless, but NOT a power lever.** |
 | CPU 600→408 MHz + 0.90→0.80 V  | ~few mA      | below noise for power; done for HEAT, not battery. |
 | PSCI cpu-sleep / cluster-sleep | **0 mA**     | even gating the whole A53 cluster+L2 saves nothing. |
-| GPU domain gate / GPU rail     | ~0 / refused | domain gate ~0; rail disable refused by DM. |
+| GPU domain gate / GPU rail     | ~0 / refused | domain 15 GATED at startup (bit15 OFF, verified) = matches Linux idle; rail immovable at 0.85V both. |
 | WiFi/BT, GPU freq, audio rail  | ~0–3 mA      | noise; WiFi already off. |
 
 **Takeaway on WFI specifically:** the deep-WFI idle path (`tw_idle_nap`, EC-IRQ
@@ -238,6 +238,20 @@ Shipped: `tw_gate_usb3()` in cmd_tw.c runs at editor startup (after DDR-400),
 replicating bl31's pmu_set_power_domain (bus-idle req → PWRDN_CON). Best-effort
 with timeout-abort/back-out, so it can only ever be a no-op, never a startup
 wedge. Permanent for the session (no restore).
+
+## GPU idle mode — already MATCHES Linux (verified 2026-08, closed)
+
+Checked against panfrost (kernel 6.6.100 source). Linux idles the Mali GPU by:
+(1) `panfrost_gpu_power_off()` writes the GPU-internal SHADER/TILER/L2 power-off
+regs (GPU_BASE 0xff9a0000 +0x1c0/0x1d0/0x1e0), (2) `clk_disable` the GPU clock,
+(3) genpd drops the PMU "gpu" domain — end state `genpd gpu off`.
+
+Typewriter gates PMU domain 15 (GPU) at startup. `twwfi bench-gpu` read
+**PMU_PWRDN_ST bit15 = OFF** on the target — so the gate genuinely takes, the GPU
+core is unpowered, and everything inside it (shaders/tiler/L2) is dark. That IS
+Linux's end state. Panfrost's internal PWROFF is just a step on the way to the
+same domain-off; once domain 15 loses power there's nothing lower to reach. The
+rail (`ppvar_gpu_pwm`) stays 0.85 V in BOTH (immovable). No gap, no lever.
 
 ## GPU rail — NOT gateable (tested 2026-08, closed)
 

@@ -314,7 +314,7 @@ WiFi/BT is already effectively off at idle. Not a contributor.
 ## Where the power actually goes (now MEASURED, not estimated)
 
 Once the on-board EC current meter existed, every lever got a real mA number (on
-battery; see [POWER_CURRENT.md](POWER_CURRENT.md) for the full table). Ranked:
+battery; see [POWERSAVE_CURRENT.md](POWERSAVE_CURRENT.md) for the full table). Ranked:
 
 | Lever | mA | Status |
 |---|---|---|
@@ -337,7 +337,7 @@ system-suspend / rail-sequencing (large effort, uncertain payoff), NOT by any
 lever the editor can flip.
 
 A **~3 %/hr gap vs Linux** remains (typewriter ~9 %/hr, Linux ~6 %/hr on the same
-pack). Investigated hard (see POWER_CURRENT.md): it is NOT idle depth, peripheral
+pack). Investigated hard (see POWERSAVE_CURRENT.md): it is NOT idle depth, peripheral
 gating, litcpu/centerlogic voltage, GPU, or WiFi — all ruled out by measurement,
 and Linux actually idles *worse* (constant timer wakeups) yet wins. The residual
 is most likely DDR self-refresh residency or a display-path difference that can't

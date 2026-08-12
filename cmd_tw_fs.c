@@ -116,6 +116,29 @@ int tw_list_files(struct tw_state *s)
 	return s->pick_count;
 }
 
+/*
+ * Delete a file in the root of the current device (Del in the ^R picker).
+ * Returns 0 ok, nonzero on failure (fs doesn't support unlink - only FAT/exFAT
+ * do in this U-Boot - or the file is missing). Re-asserts the device first
+ * (fs ops clear the active blk dev, same as every other op here).
+ */
+int tw_fs_unlink_name(struct tw_state *s, const char *name)
+{
+	char path[TW_PICK_NAMELEN + 1];
+
+	if (!name || !name[0])
+		return -1;
+	if (tw_fs_set(&s->fs) != 0)
+		return -1;
+
+	path[0] = '/';
+	strncpy(path + 1, name, sizeof(path) - 2);
+	path[sizeof(path) - 1] = '\0';
+
+	return fs_unlink(path);
+}
+
+
 /* Decode one UTF-8 codepoint from s (len bytes available). Returns bytes
  * consumed and sets *cp. Malformed input consumes 1 byte and yields U+FFFD. */
 static int utf8_decode(const char *s, int len, u32 *cp)

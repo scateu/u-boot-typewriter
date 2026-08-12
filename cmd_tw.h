@@ -167,6 +167,8 @@ struct tw_fs {
 #define TW_PROMPT_PICK   5       /* ^R file picker: arrow-select from fatls */
 #define TW_PROMPT_POWEROFF 6     /* ^Q: "Save & power off? (Y/N)" */
 #define TW_PROMPT_SHELL  7       /* ^V: "!cmd:" run U-Boot cmd, insert output */
+#define TW_PROMPT_NEW    8       /* picker 'n': "New file name: " */
+#define TW_PROMPT_PICKDEL 10     /* picker 'd': "Delete <x>? (y/N)" confirm */
 
 /* Sentinel for tw_read_battery(): distinct from a real negative errno so the
  * popup can say "no EC" vs. "EC command failed with code N". */
@@ -234,6 +236,7 @@ struct tw_state {
 	int   dirty_all;                /* repaint entire text area */
 	int   dirty_bar;                /* candidate/status bar changed */
 	int   dirty_title;              /* title (filename/modified/mode) changed */
+	int   dirty_hints;              /* bottom hint bar changed (edit<->picker) */
 	int   first_paint;              /* draw static chrome once */
 	int   last_cur_row, last_cur_col; /* to erase the old cursor cell */
 	int   last_scroll_top;

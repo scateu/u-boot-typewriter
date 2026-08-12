@@ -226,7 +226,7 @@ hang is the culprit; power-cycle to recover).
 > they only add up as a group. Now **shipped** at editor startup
 > (`tw_gate_unused_domains()` in cmd_tw.c), plus a USB2 host clock-gate (~4 mA,
 > see `usb2`) — total ~27 mA. The earlier "zero change" was a %/hr-resolution
-> limit, not a true zero. See POWER_CURRENT.md.
+> limit, not a true zero. See POWERSAVE_CURRENT.md.
 
 > **Excluded:** `SDIOAUDIO` (PD 31 / bus 29) **WEDGED** when gated and was removed
 > from the table. `TCPD0/TCPD1` (Type-C) have no bus-idle bit in bl31's enum, so

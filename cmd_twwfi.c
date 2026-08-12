@@ -45,7 +45,7 @@ unsigned long invoke_psci_fn(unsigned long, unsigned long, unsigned long,
 
 /* Bump on every twwfi change so `twwfi` (no arg) proves the flashed binary is
  * current - a stale reflash was confounding suspend-hang diagnosis. */
-#define TW_BUILD_TAG "tcpd-ship-23"
+#define TW_BUILD_TAG "picker-newdel-26"
 
 /* From cmd_tw.c: EC charge state (battery %, board charge current mA, on-AC).
  * Returns 0 on success, <0 on error/no-EC. This is BOARD current, not CPU. */
@@ -2133,6 +2133,82 @@ static int do_gpurail(void)
 }
 
 /*
+ * BENCH: inspect + replicate what Linux's panfrost does to idle the Mali GPU.
+ * Panfrost's runtime-suspend (kernel drivers/gpu/drm/panfrost/panfrost_gpu.c
+ * panfrost_gpu_power_off) writes the GPU's OWN internal power-off registers -
+ * SHADER_PWROFF/TILER_PWROFF/L2_PWROFF at GPU_BASE + 0x1c0/0x1d0/0x1e0 - to drop
+ * the shader cores, tiler, and L2 power islands INSIDE the GPU block, THEN the
+ * genpd "gpu" PMU domain (RK3399 domain 15) goes off. This is a LOWER level than
+ * our PMU-domain gate.
+ *
+ * First it just REPORTS whether the PMU GPU domain (PWRDN_ST bit 15) is actually
+ * off - the honest check of whether our startup gate took (the gate does a
+ * bus-idle handshake and ABORTS silently if the GPU bus won't idle, so "we call
+ * gate" != "it's off"). Then:
+ *  - if the domain is OFF, the GPU regs are unpowered - we can't touch them, and
+ *    there's nothing more to do (domain-off already = everything inside dark).
+ *  - if the domain is ON, we do the panfrost internal PWROFF (safe: the editor
+ *    never uses the GPU) and self-meter, to see if the internal islands cost
+ *    anything the domain gate isn't already covering.
+ *
+ * GPU_BASE 0xff9a0000; offsets/poll from panfrost_regs.h (READY 0x140/0x160,
+ * PWROFF 0x1c0/0x1d0/0x1e0, PWRTRANS 0x200/0x220). Not restored (leaves the GPU
+ * powered down for the session - editor doesn't use it); a full GPU power-ON
+ * needs the panfrost init quirks we don't replicate, so this is one-way.
+ */
+static int do_bench_gpu(void)
+{
+	const unsigned long GPU = 0xff9a0000UL;
+	unsigned int st = readl((void *)PMU_PWRDN_ST);
+	int dom_off = (st >> 15) & 1;   /* PWRDN_ST bit15: 1 = GPU domain OFF */
+	int base_ma = 0, off_ma = 0, base_n, off_n, us;
+
+	printf("PMU_PWRDN_ST = 0x%08x -> GPU domain (bit15) is %s.\n",
+	       st, dom_off ? "OFF (our startup gate took)" : "ON (gate did NOT take)");
+
+	if (dom_off) {
+		printf("GPU PMU domain already OFF - the core is unpowered, so panfrost's\n");
+		printf("internal SHADER/TILER/L2 power-off is moot (nothing to power down)\n");
+		printf("and the GPU regs aren't accessible. We already match Linux's idle\n");
+		printf("GPU state (genpd 'gpu off'). Nothing more to gate here.\n");
+		return 0;
+	}
+
+	/* Domain is ON -> our gate is failing (bus won't idle). Do what panfrost
+	 * does instead: power off the GPU's internal islands via its own regs. */
+	printf("Domain ON -> replicating panfrost internal power-off (SHADER/TILER/L2).\n");
+	base_n = gate_avg_ma(5, 1000, &base_ma);
+	printf("  before: %d mA (%d samples)\n", base_ma, base_n);
+
+	writel(0xffffffffU, (void *)(GPU + 0x1c0));   /* SHADER_PWROFF_LO = all */
+	dsb();
+	for (us = 0; us < 20000 && readl((void *)(GPU + 0x200)); us++)  /* PWRTRANS */
+		udelay(1);
+	writel(0xffffffffU, (void *)(GPU + 0x1d0));   /* TILER_PWROFF_LO */
+	dsb();
+	writel(0xffffffffU, (void *)(GPU + 0x1e0));   /* L2_PWROFF_LO */
+	dsb();
+	for (us = 0; us < 20000 && readl((void *)(GPU + 0x220)); us++)  /* L2 PWRTRANS */
+		udelay(1);
+	printf("  SHADER_READY=0x%x L2_READY=0x%x (0 = powered off)\n",
+	       readl((void *)(GPU + 0x140)), readl((void *)(GPU + 0x160)));
+
+	off_n = gate_avg_ma(8, 1000, &off_ma);
+	printf("--- GPU internal power-off delta (smart battery) ---\n");
+	if (base_n && off_n) {
+		int d = base_ma - off_ma;
+
+		printf("  before : %d mA\n  after  : %d mA\n  saved  : %d mA%s\n",
+		       base_ma, off_ma, d < 0 ? -d : d,
+		       (d < 15 && d > -15) ? "  (< noise floor)" : "");
+	}
+	printf("(one-way: GPU left powered down; editor doesn't use it. If this saved\n");
+	printf(" real mA, the fix is to make the startup domain gate actually take,\n");
+	printf(" or do this internal PWROFF before gating.)\n");
+	return 0;
+}
+
+/*
  * BENCH: clock-gate the two USB2 host controllers (fe3a0000/fe3e0000, the
  * EHCI/OHCI hosts) and their PHY reference clocks, self-meter the battery delta,
  * then restore. USB2 is NOT a standalone PMU power domain (only USB3 is, bit 27
@@ -2348,6 +2424,8 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 					     : 4000);  /* per-phase ms; A/B WFI power */
 	if (!strcmp(argv[1], "gpurail"))
 		return do_gpurail();      /* disable Mali GPU rail, self-meter, restore */
+	if (!strcmp(argv[1], "bench-gpu"))
+		return do_bench_gpu();    /* check GPU domain off; panfrost internal PWROFF */
 	if (!strcmp(argv[1], "rail"))
 		return (argc >= 3) ? do_rail(argv[2])   /* disable ANY named rail, meter */
 				   : (printf("usage: twwfi rail <regulator-name>\n"),
@@ -2382,7 +2460,7 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		return do_wfi_test(0, ms);
 
 	printf("usage: twwfi [pmu|cpuinfo|napstats|psci|litvolt|ddr|gate|coredown|cpuall"
-	       "|keystroke|wfibench|gpurail|rail|centervolt|usb2|gatesweep|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV|MHz|name]\n");
+	       "|keystroke|wfibench|gpurail|rail|bench-gpu|centervolt|usb2|gatesweep|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV|MHz|name]\n");
 	return CMD_RET_USAGE;
 }
 
@@ -2418,6 +2496,9 @@ U_BOOT_CMD(
 	"twwfi rail <name>  - SAFE: disable ANY named regulator (e.g. pp1800_pcie,\n"
 	"                     pp1800_audio, p3.3v_dig), self-meter ~8 s, then restore.\n"
 	"                     Probe a peripheral rail's draw; refuses if always-on.\n"
+	"twwfi bench-gpu    - report if the GPU PMU domain is actually OFF (bit15); if\n"
+	"                     ON, do panfrost's internal SHADER/TILER/L2 power-off +\n"
+	"                     self-meter. One-way (GPU left down; editor doesn't use it).\n"
 	"twwfi centervolt [uV] - lower DDR/NoC centerlogic rail (ppvar_centerlogic_pwm)\n"
 	"                     to uV (def 900000=Linux DDR-400 pt), self-meter, restore.\n"
 	"                     bl31 DDR SET_RATE doesn't touch this PMIC rail = over-volt.\n"

@@ -110,7 +110,7 @@ The power tooling (`twwfi`, and the editor's DDR/CPU/domain power-saving at
 startup) uses the DM regulator, PSCI firmware, and cros-ec drivers — on the
 gru/kevin defconfig these are already enabled (`CONFIG_DM_REGULATOR`,
 `CONFIG_PWM_REGULATOR`, `CONFIG_CROS_EC`, `CONFIG_SYSRESET`), so no extra config
-is normally needed. See TWWFI.md and POWER_CURRENT.md for what each lever does.
+is normally needed. See TWWFI.md and POWERSAVE_CURRENT.md for what each lever does.
 
 For a quick one-off test you can instead edit the live config after a
 configure step:

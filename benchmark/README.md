@@ -4,7 +4,7 @@ Scripts used while characterizing typewriter idle power on the Kevin (RK3399)
 Chromebook. Two kinds: some run in **Linux on the target** (read the same EC
 smart-battery gauge the U-Boot editor reads), some run on the **build host**.
 
-The authoritative results these produced live in [`../POWER_CURRENT.md`](../POWER_CURRENT.md).
+The authoritative results these produced live in [`../POWERSAVE_CURRENT.md`](../POWERSAVE_CURRENT.md).
 The on-board equivalents (measure from inside the editor, no external meter) are
 the `twwfi` metering subcommands — see [`../TWWFI.md`](../TWWFI.md).
 
@@ -29,9 +29,9 @@ anything under ~15 mA as noise.
 The target's Linux (same board, same gauge) was the reference for every U-Boot
 power lever: it's where the 408 MHz→0.80 V OPP, DDR-400 rate, and centerlogic
 voltage points were read, and where "idle depth is a wash" and "the ~3%/hr gap is
-not CPU-side" were proven. See `../POWER_CURRENT.md` for the cross-checks.
+not CPU-side" were proven. See `../POWERSAVE_CURRENT.md` for the cross-checks.
 
-## Summary of what was measured (see ../POWER_CURRENT.md for detail)
+## Summary of what was measured (see ../POWERSAVE_CURRENT.md for detail)
 
 - **DDR 928→400 MHz ≈ 78 mA** — biggest firmware lever (shipped).
 - **Backlight ≈ 50–83 mA** — user `^-`/`^]`, biggest overall (default 10%).
