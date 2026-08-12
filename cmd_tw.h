@@ -37,7 +37,7 @@
 
 /* Panel backlight (see cmd_tw_video.c). It comes up full-bright on gru/kevin,
  * which dominates idle power; default lower and step it with ^- / ^=. */
-#define TW_BACKLIGHT_DEFAULT 35      /* percent set on startup */
+#define TW_BACKLIGHT_DEFAULT 10      /* percent set on startup */
 #define TW_BACKLIGHT_STEP    5       /* percent per ^- / ^= press */
 #define TW_BACKLIGHT_MIN     5       /* never dim below this - 0/OFF freezes it
 				      * (a low NONZERO % is safe; only literal
