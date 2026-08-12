@@ -13,6 +13,8 @@
  * wubi_embed.c).
  */
 #include <command.h>
+#include <console.h>      /* console_record_* : capture cmd output (^V :r !) */
+#include <cli.h>          /* run_command */
 #include <stdio.h>
 #include <vsprintf.h>
 #include <u-boot/schedule.h>
@@ -22,6 +24,7 @@
 #include <irq_func.h>
 #include <dm.h>
 #include <cros_ec.h>
+#include <i2c.h>          /* struct i2c_msg / I2C_M_RD : SBS current via EC tunnel */
 #include <power/regulator.h>  /* lower A53 core rail to its 408 MHz OPP voltage */
 #include <asm/system.h>
 #include <time.h>
@@ -343,9 +346,43 @@ static void tw_set_cpu_408(void)
 	}
 }
 
+/*
+ * Lower DDR from the boot default 928 MHz to 400 MHz at editor startup - the
+ * biggest always-on power block, and the one that draws WHILE you sit in the
+ * editor (unlike the CPU, which idles in WFI). This is a bl31 SIP call
+ * (RK_SIP_DDR_CFG / DRAM_SET_RATE) - bl31's M0 co-processor does the DRAM
+ * self-refresh + DPLL switch + PHY retrain safely; we must NOT poke the DPLL
+ * directly (that corrupts live DRAM). 400 MHz is Linux devfreq's idle bin,
+ * proven stable on this board; verified switchable from U-Boot via `twwfi ddr
+ * 400` (GET_RATE came back 400 MHz, board fine).
+ *
+ * CRITICAL: probe the PSCI driver first, else invoke_psci_fn short-circuits to
+ * PSCI_RET_DISABLED (-8) without issuing the SMC (U-Boot doesn't auto-probe it).
+ */
+#define TW_RK_SIP_DDR_CFG   0x82000008UL
+#define TW_DRAM_SET_RATE    1
+#define TW_DRAM_GET_RATE    5
+#define TW_DDR_TARGET_HZ    400000000UL
+static void tw_set_ddr_400(void)
+{
+	struct udevice *psci;
+	unsigned long got;
+
+	if (uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci))
+		return;                          /* no PSCI conduit: leave DDR as-is */
+
+	invoke_psci_fn(TW_RK_SIP_DDR_CFG, TW_DDR_TARGET_HZ, 0, TW_DRAM_SET_RATE);
+	got = invoke_psci_fn(TW_RK_SIP_DDR_CFG, 0, 0, TW_DRAM_GET_RATE);
+	/* If it didn't take (bl31 error / no-op), DDR simply stays at its prior
+	 * rate - harmless, just not lowered. No way to corrupt from here: bl31 owns
+	 * the whole DFS sequence; we only request a rate it validated (ROUND_RATE). */
+	(void)got;
+}
+
 #else   /* host / non-arm64: plain delay (WFE-equivalent) */
 static void tw_idle_nap(unsigned int ms) { udelay(ms * 1000); }
 static void tw_set_cpu_408(void) { }
+static void tw_set_ddr_400(void) { }
 void tw_idle_stats(unsigned long *count, unsigned long *instant,
 		   unsigned long *slept_us)
 {
@@ -585,6 +622,66 @@ static void tw_insert_newline(struct tw_state *s)
 	s->cur_row++;
 	s->cur_col = 0;
 	s->dirty = 1;
+}
+
+/*
+ * Run a U-Boot command and insert its console output at the cursor - vim's
+ * `:r !cmd`. Uses CONSOLE_RECORD to capture stdout: reset+enable the record
+ * buffer, run_command(), then read it back line by line and insert each as
+ * ASCII text. Output is capped (lines + bytes) so a chatty command can't blow
+ * the editor's fixed line/col buffers. This is how power-debug output gets into
+ * a file: `^V twwfi pmu` -> save to SD -> hand off. Needs CONFIG_CONSOLE_RECORD.
+ */
+#define TW_RUN_MAX_LINES  400     /* stop inserting after this many lines */
+static void tw_run_and_insert(struct tw_state *s, const char *cmd)
+{
+#if defined(CONFIG_CONSOLE_RECORD)
+	char line[256];
+	int nlines = 0, n, i;
+
+	if (!cmd || !cmd[0])
+		return;
+
+	console_record_reset_enable();   /* start capturing console output */
+	run_command(cmd, 0);             /* stdout -> record buffer (and screen) */
+
+	/* Insert a header line so the output is self-labeling in the saved file. */
+	{
+		const char *hdr = "--- ";
+		for (i = 0; hdr[i]; i++)
+			tw_insert_cp(s, (u32)hdr[i]);
+		for (i = 0; cmd[i] && i < TW_MAX_COLS - 8; i++)
+			tw_insert_cp(s, (u32)(unsigned char)cmd[i]);
+		tw_insert_newline(s);
+	}
+
+	while (nlines < TW_RUN_MAX_LINES &&
+	       (n = console_record_readline(line, sizeof(line))) >= 0) {
+		for (i = 0; i < n && i < TW_MAX_COLS - 1; i++) {
+			unsigned char c = (unsigned char)line[i];
+
+			/* keep printable ASCII; drop control/UTF junk so the codepoint
+			 * buffer + renderer stay well-formed. */
+			if (c >= 0x20 && c < 0x7f)
+				tw_insert_cp(s, (u32)c);
+		}
+		tw_insert_newline(s);
+		nlines++;
+	}
+	console_record_reset();          /* stop + clear the capture */
+
+	/*
+	 * run_command()'s output also went to the LIVE framebuffer console (the
+	 * vidconsole), scribbling over the editor anywhere on screen. Force a full
+	 * from-scratch repaint (same path as first_paint: whole-screen clear +
+	 * hints + title + bar + text) so the next tw_render() wipes all of it and
+	 * shows a clean editor with the inserted text. */
+	s->first_paint = 1;
+
+	tw_status(s, "[ ran '%s': %d lines ]", cmd, nlines);
+#else
+	tw_status(s, "[ ^V needs CONFIG_CONSOLE_RECORD ]");
+#endif
 }
 
 static void tw_backspace(struct tw_state *s)
@@ -1085,34 +1182,6 @@ static int tw_ec_command(struct udevice *ec, int cmd, int cmd_version,
 	return rs->data_len;
 }
 
-/*
- * Read the battery charge as a percentage (0..100) on success, or a negative
- * value on failure (TW_BATT_NO_EC = no EC, else a negative EC result code) -
- * the title bar hides any negative. Called on demand from Ctrl-T (one EC
- * transaction per press); there is no periodic battery poll (see POWERSAVE.md).
- */
-static int tw_read_battery(void)
-{
-	struct udevice *ec = tw_ec();
-	struct ec_response_charge_state resp;
-	uint8_t reqcmd = CHARGE_STATE_CMD_GET_STATE;
-	uint8_t *din = NULL;
-	int len;
-
-	if (!ec)
-		return TW_BATT_NO_EC;
-
-	len = tw_ec_command(ec, EC_CMD_CHARGE_STATE, 0,
-			    &reqcmd, sizeof(reqcmd),
-			    &din, sizeof(resp));
-	if (len < 0)
-		return len;                    /* -EC_RES_* : show the code */
-	if (!din || len < (int)sizeof(resp.get_state))
-		return -EC_RES_INVALID_RESPONSE;
-
-	memcpy(&resp, din, sizeof(resp.get_state));
-	return resp.get_state.batt_state_of_charge;
-}
 
 /*
  * Non-static: read the EC charge state for the `twwfi cpuinfo` diagnostic.
@@ -1148,6 +1217,40 @@ int tw_read_charge_state(int *pct, int *chg_ma, int *ac)
 		*chg_ma = resp.get_state.chg_current;
 	if (ac)
 		*ac = resp.get_state.ac;
+	return 0;
+}
+
+/*
+ * Non-static: read the SMART-BATTERY live current in mA (signed; negative =
+ * discharging, positive = charging into the battery). The EC charge-state
+ * chg_current field above is unreliable here (returned a stale ~3584 mA on both
+ * AC and battery), so we read the battery's own SBS Current() register instead.
+ *
+ * The battery is an SBS smart battery at I2C addr 0x0b, reached through the EC's
+ * I2C passthrough on remote port 4 (verified against the live Linux board:
+ * sbs-9-000b via cros-ec-i2c-tunnel, google,remote-bus=4; Linux read ~-455 mA
+ * discharging at idle). SBS register 0x0A = Current(), signed 16-bit LE mA.
+ * Returns 0 and fills *ma on success, <0 on error. Used by ^T and twwfi cpuinfo.
+ */
+int tw_read_batt_current(int *ma)
+{
+	struct udevice *ec = tw_ec();
+	uint8_t reg = 0x0a;                 /* SBS Current() */
+	uint8_t rd[2] = { 0, 0 };
+	struct i2c_msg msg[2];
+
+	if (!ec)
+		return -ENODEV;
+
+	/* SMBus word read: write the register index, then read 2 bytes. */
+	msg[0].addr = 0x0b;  msg[0].flags = 0;        msg[0].len = 1; msg[0].buf = &reg;
+	msg[1].addr = 0x0b;  msg[1].flags = I2C_M_RD; msg[1].len = 2; msg[1].buf = rd;
+
+	if (cros_ec_i2c_tunnel(ec, 4, msg, 2))
+		return -EIO;
+
+	if (ma)
+		*ma = (int)(int16_t)(rd[0] | (rd[1] << 8));
 	return 0;
 }
 
@@ -1203,7 +1306,6 @@ static int tw_poweroff_event_pending(void)
 	return 1;
 }
 #else
-static int tw_read_battery(void) { return TW_BATT_NO_EC; }
 static void tw_poweroff_events_clear(void) { }
 static int tw_poweroff_event_pending(void) { return 0; }
 #endif
@@ -1478,6 +1580,8 @@ static void tw_prompt_key(struct tw_state *s, int key)
 		} else if (which == TW_PROMPT_OPEN) {
 			if (s->prompt_ans[0])
 				tw_switch_file(s, s->prompt_ans);
+		} else if (which == TW_PROMPT_SHELL) {
+			tw_run_and_insert(s, s->prompt_ans);
 		}
 		return;
 	}
@@ -1508,7 +1612,7 @@ static void tw_prompt_key(struct tw_state *s, int key)
 struct tw_snap {
 	int num_lines, scroll_top, dirty, has_name;
 	int ime_mode, code_len, page, ncand;
-	int prompt, has_status, pick_sel;
+	int prompt, prompt_len, has_status, pick_sel;
 	int cur_row, cur_len;   /* to detect an in-line content edit */
 };
 
@@ -1523,6 +1627,7 @@ static void tw_snapshot(struct tw_state *s, struct tw_snap *o)
 	o->page = s->ime.page;
 	o->ncand = s->ime.ncand;
 	o->prompt = s->prompt;
+	o->prompt_len = s->prompt_len;
 	o->has_status = s->status_msg[0] != '\0';
 	o->pick_sel = s->pick_sel;
 	o->cur_row = s->cur_row;
@@ -1548,6 +1653,7 @@ static void tw_mark_dirty(struct tw_state *s, const struct tw_snap *o)
 	if (s->ime.mode != o->ime_mode || s->ime.code_len != o->code_len ||
 	    s->ime.page != o->page || s->ime.ncand != o->ncand ||
 	    s->prompt != o->prompt ||
+	    s->prompt_len != o->prompt_len ||   /* prompt text edited (type/bksp) */
 	    (s->status_msg[0] != '\0') != o->has_status ||
 	    s->status_msg[0] != '\0' ||
 	    s->pick_sel != o->pick_sel)         /* picker selection moved */
@@ -1608,19 +1714,30 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_CTRL_S:            /* save (one-handed) */
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;
-	case KEY_CTRL_T: {         /* battery % on demand (bottom status only) */
-		int b = tw_read_battery();
+	case KEY_CTRL_T: {         /* battery status: %, AC, live current (bottom bar) */
+		int pct = -1, chg = 0, ac = -1, ma = 0;
+		int have_cs = (tw_read_charge_state(&pct, &chg, &ac) == 0);
+		int have_ma = (tw_read_batt_current(&ma) == 0);
 
-		if (b == TW_BATT_NO_EC)
+		/* Raw signed current + AC flag (negative mA = discharging). The EC
+		 * charge-state % and AC are reliable; the current comes from the SBS
+		 * battery register (charge-state's own current field is garbage). */
+		if (!have_cs && !have_ma) {
 			tw_status(s, "[ Battery: no EC ]");
-		else if (b < 0)
-			tw_status(s, "[ Battery: read failed (%d) ]", b);
-		else
-			tw_status(s, "[ Battery: %d%% ]", b);
+		} else if (have_ma) {
+			tw_status(s, "[ BAT: %d%%  AC:%d  CUR: %d mA ]",
+				  have_cs ? pct : -1, have_cs ? ac : -1, ma);
+		} else {
+			tw_status(s, "[ BAT: %d%%  AC:%d  (current read failed) ]",
+				  pct, ac);
+		}
 		break;
 	}
 	case KEY_CTRL_R:            /* open a file: arrow-select picker */
 		tw_picker_open(s);
+		break;
+	case KEY_CTRL_V:            /* run a U-Boot cmd, insert output (vim :r !) */
+		tw_prompt_start(s, TW_PROMPT_SHELL);
 		break;
 	case KEY_CTRL_Q:            /* save + power off / boot OS (Y/B/N) */
 		tw_prompt_start(s, TW_PROMPT_POWEROFF);
@@ -1841,6 +1958,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	tw_bind_ime(s);
 	tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
 	tw_set_cpu_408();            /* A53 -> 408 MHz + 0.80 V OPP (cooler idle) */
+	tw_set_ddr_400();            /* DDR 928 -> 400 MHz (bl31 SIP; always-on draw) */
 	/* Show the exception level in the startup line: the event-stream WFE idle
 	 * (low power) only engages at EL>=2. EL2 = good; EL1 would mean the idle
 	 * loop is busy-spinning and power-saving isn't active. See POWERSAVE.md. */
@@ -1871,7 +1989,9 @@ U_BOOT_CMD(
 	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
 	"  ^S save  ^R open (pick)  ^X exit  ^Q power off / boot OS  ^G help\n"
-	"  ^T battery %  ^B/^F char  ^P/^N line  ^A/^E bol/eol  arrows move\n"
+	"  ^T battery %/AC/current  ^V run-cmd (insert output)  ^B/^F char\n"
+	"  ^P/^N line\n"
+	"  ^A/^E bol/eol  arrows move\n"
 	"  ^D del  ^W del-word-back  ^K kill-eol  ^Y yank\n"
 	"  ^- dim / ^] brighten backlight (20% steps)\n"
 	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"

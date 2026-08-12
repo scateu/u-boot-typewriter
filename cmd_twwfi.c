@@ -45,11 +45,15 @@ unsigned long invoke_psci_fn(unsigned long, unsigned long, unsigned long,
 
 /* Bump on every twwfi change so `twwfi` (no arg) proves the flashed binary is
  * current - a stale reflash was confounding suspend-hang diagnosis. */
-#define TW_BUILD_TAG "cpuall-5"
+#define TW_BUILD_TAG "sbs-ctrl-t-10"
 
 /* From cmd_tw.c: EC charge state (battery %, board charge current mA, on-AC).
  * Returns 0 on success, <0 on error/no-EC. This is BOARD current, not CPU. */
 int tw_read_charge_state(int *pct, int *chg_ma, int *ac);
+
+/* From cmd_tw.c: live smart-battery current (signed mA; neg=discharging) via the
+ * EC I2C tunnel to the SBS battery. The real whole-board draw. 0 ok, <0 error. */
+int tw_read_batt_current(int *ma);
 
 /* From cmd_tw.c: editor idle-nap instrumentation - total naps, how many WFIs
  * returned instantly (<1 ms = did NOT sleep), and total time spent in WFI. */
@@ -584,6 +588,76 @@ static int do_psci_query(void)
 	       "   EL2-vs-EL1 / SCR_EL3.HCE resume-target theory). If it's NOT\n"
 	       "   supported, bl31 simply lacks the state - EL1 won't help.\n",
 	       current_el());
+	return 0;
+}
+
+/*
+ * DDR frequency via bl31's RK_SIP_DDR_CFG (0x82000008) - the SAME safe path Linux
+ * uses. bl31's M0 co-processor does the self-refresh + DPLL switch + PHY retrain;
+ * we MUST NOT poke the DPLL directly (that corrupts running DRAM). U-Boot boots
+ * DDR at 928 MHz; Linux devfreq idles it at 400 MHz (proven stable on this board).
+ *
+ *   smc(0x82000008, x1=hz, x2=0, x3=subfn) -> invoke_psci_fn(fid, hz, 0, subfn)
+ *   subfn: 5=GET_RATE, 2=ROUND_RATE, 1=SET_RATE. Returns achieved/rounded Hz.
+ *
+ * `twwfi ddr`        - SAFE: GET_RATE + ROUND_RATE(400M) queries only.
+ * `twwfi ddr <mhz>`  - switch DDR to <mhz> via SET_RATE (bl31 does it safely).
+ *                      Linux runs 400/666/800/928; 400 is the idle bin.
+ */
+#define RK_SIP_DDR_CFG   0x82000008UL
+#define DRAM_SET_RATE    1
+#define DRAM_ROUND_RATE  2
+#define DRAM_GET_RATE    5
+
+static int do_ddr(int mhz)
+{
+	struct udevice *psci;
+	unsigned long cur, rounded, res;
+
+	/*
+	 * CRITICAL: probe the PSCI firmware driver FIRST. U-Boot does not auto-probe
+	 * it (CONFIG_SYSRESET_PSCI off), so until something binds it, psci_method is
+	 * unset and invoke_psci_fn() SHORT-CIRCUITS returning PSCI_RET_DISABLED (-8)
+	 * WITHOUT issuing any SMC. Every "-8" we saw (ddr/suspend/psci) was this, not
+	 * bl31 - the SMC never went out. Probing sets the smc conduit. (tw_poweroff
+	 * in cmd_tw.c does the same before its SYSTEM_OFF.)
+	 */
+	if (uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci)) {
+		printf("PSCI driver not found - can't reach the DDR SIP.\n");
+		return 1;
+	}
+
+	cur = invoke_psci_fn(RK_SIP_DDR_CFG, 0, 0, DRAM_GET_RATE);
+	printf("DDR current rate (bl31 GET_RATE) = %lu Hz (~%lu MHz).\n",
+	       cur, cur / 1000000);
+	printf("(DPLL read earlier said 928 MHz; these should agree.)\n");
+
+	if (mhz < 0) {
+		/* query-only: what would bl31 round common targets to? */
+		unsigned int probe[] = { 400, 666, 800, 928 };
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(probe); i++) {
+			rounded = invoke_psci_fn(RK_SIP_DDR_CFG,
+						 probe[i] * 1000000UL, 0,
+						 DRAM_ROUND_RATE);
+			printf("  ROUND_RATE(%u MHz) -> %lu Hz\n",
+			       probe[i], rounded);
+		}
+		printf("=> safe. To actually switch: `twwfi ddr 400` (bl31 does the DFS,\n"
+		       "   same as Linux devfreq; 400 MHz is Linux's idle bin).\n");
+		return 0;
+	}
+
+	printf("Switching DDR to %d MHz via bl31 SET_RATE (M0 self-refresh+retrain)...\n",
+	       mhz);
+	res = invoke_psci_fn(RK_SIP_DDR_CFG, (unsigned long)mhz * 1000000UL, 0,
+			     DRAM_SET_RATE);
+	printf("SET_RATE returned %lu Hz (~%lu MHz).\n", res, res / 1000000);
+	cur = invoke_psci_fn(RK_SIP_DDR_CFG, 0, 0, DRAM_GET_RATE);
+	printf("GET_RATE now = %lu Hz (~%lu MHz).\n", cur, cur / 1000000);
+	printf("=> If this returned and the shell still works, the DDR DFS path is\n"
+	       "   usable from U-Boot. If DRAM was corrupted the board likely crashed.\n");
 	return 0;
 }
 
@@ -1534,7 +1608,7 @@ static int do_cpuinfo(void)
 	int pm_en   = (pm >> CORE_PM_EN_BIT) & 1;
 	int pm_intw = (pm >> CORE_PM_INT_WAKE_BIT) & 1;
 	unsigned int cpul_mhz;
-	int pct = 0, chg_ma = 0, ac = 0, ret;
+	int pct = 0, chg_ma = 0, ac = 0;
 
 	printf("Current EL = %u, CNTFRQ = %lu Hz\n", current_el(), rd_cntfrq());
 
@@ -1568,21 +1642,44 @@ static int do_cpuinfo(void)
 	       cpu0_on ? "powered + clocked = WORKING" : "NOT powered", cpul_mhz);
 
 	/*
-	 * Current draw. There is NO on-die CPU power/current telemetry on RK3399
-	 * (no TSADC/SARADC in this build), so we cannot report CPU-specific draw.
-	 * The one real current reading is the EC's battery/charger current - a
-	 * WHOLE-BOARD figure (display + DDR + rails + CPU), useful only as a gross
-	 * idle-draw gauge, NOT as CPU power.
+	 * DDR frequency, decoded straight from the DPLL registers (CRU_BASE+0x40),
+	 * so a dump self-documents the DDR rate (boot default 928 MHz; the editor
+	 * lowers it to 400 via the bl31 SIP). Pure read - no PSCI/SIP needed here.
 	 */
-	printf("--- board current (EC; NOT CPU-specific) ---\n");
-	ret = tw_read_charge_state(&pct, &chg_ma, &ac);
-	if (ret < 0) {
-		printf("  EC charge state unavailable (%d)\n", ret);
-	} else {
-		printf("  battery %d%%, on-AC=%d, charge current = %d mA\n",
-		       pct, ac, chg_ma);
-		printf("  (whole-board via the battery/charger; on battery, |mA| ~ total\n"
-		       "   system draw. No register gives CPU-only current on this SoC.)\n");
+	{
+		unsigned int c0 = readl((void *)(CRU_BASE + 0x40));
+		unsigned int c1 = readl((void *)(CRU_BASE + 0x44));
+		unsigned int fb = c0 & 0xfff;
+		unsigned int rd = c1 & 0x3f;
+		unsigned int p1 = (c1 >> 8) & 0x7;
+		unsigned int p2 = (c1 >> 12) & 0x7;
+		unsigned int ddr = (rd && p1 && p2) ? 24u * fb / (rd * p1 * p2) : 0;
+
+		printf("--- DDR (DPLL) ---\n");
+		printf("  DPLL fbdiv=%u refdiv=%u pd1=%u pd2=%u -> DDR clk = %u MHz%s\n",
+		       fb, rd, p1, p2, ddr,
+		       ddr == 400 ? " (lowered)" : ddr == 928 ? " (boot default)" : "");
+	}
+
+	/*
+	 * Whole-board current from the SMART BATTERY (SBS reg 0x0A via the EC I2C
+	 * tunnel) - the REAL draw, signed (negative = discharging). NOT CPU-specific
+	 * (there is no per-CPU telemetry on RK3399), but on battery |mA| is the true
+	 * total system draw, so it's the gauge for before/after power comparisons.
+	 * Also print battery %/AC from the charge-state cmd (that % is fine; only its
+	 * chg_current field was garbage, which is why current now comes from SBS).
+	 */
+	printf("--- board current (smart battery; whole-board, not CPU) ---\n");
+	if (!tw_read_charge_state(&pct, &chg_ma, &ac))
+		printf("  battery %d%%, on-AC=%d\n", pct, ac);
+	{
+		int ma;
+
+		if (tw_read_batt_current(&ma) == 0)
+			printf("  battery current = %d mA (%s; |mA| ~ total draw on battery)\n",
+			       ma, ma < 0 ? "discharging" : "charging/idle");
+		else
+			printf("  battery current: SBS read failed\n");
 	}
 	printf("   `twwfi pmu` shows every powered domain.\n");
 	return 0;
@@ -1688,6 +1785,9 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		return do_coredown(ms);   /* power-gate CPU0 on WFI (timer-backstopped) */
 	if (!strcmp(argv[1], "cpuall"))
 		return do_cpuall();       /* CPU_ON each secondary -> self CPU_OFF */
+	if (!strcmp(argv[1], "ddr"))
+		return do_ddr(argc >= 3 ? (int)simple_strtoul(argv[2], NULL, 10)
+					: -1);   /* no arg = query only; else set MHz */
 	if (!strcmp(argv[1], "ecwake"))
 		return do_ecwake();
 	if (!strcmp(argv[1], "gpio"))
@@ -1707,8 +1807,8 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 	if (!strcmp(argv[1], "p"))
 		return do_wfi_test(0, ms);
 
-	printf("usage: twwfi [pmu|cpuinfo|napstats|psci|litvolt|gate|coredown|cpuall"
-	       "|keystroke|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV]\n");
+	printf("usage: twwfi [pmu|cpuinfo|napstats|psci|litvolt|ddr|gate|coredown|cpuall"
+	       "|keystroke|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV|MHz]\n");
 	return CMD_RET_USAGE;
 }
 
@@ -1720,6 +1820,8 @@ U_BOOT_CMD(
 	"twwfi cpuinfo      - SAFE: CPU freq (CRU) + power-domain status + EC board current\n"
 	"twwfi litvolt [uV] - lower A53 core rail ppvar_litcpu to uV (def 800000=0.80V,\n"
 	"                     Linux's 408MHz OPP), hold 10s to feel heat, then restore\n"
+	"twwfi ddr [MHz]    - DDR freq via bl31 SIP (0x82000008). No arg=query (safe);\n"
+	"                     MHz=SET_RATE (bl31 M0 self-refresh+retrain; boot 928, Linux idle 400)\n"
 	"twwfi napstats     - SAFE: did the editor's idle WFI actually sleep or busy-spin?\n"
 	"twwfi gate [N]     - RISKY: power-gate editor-unused domain N (0=GPU 1=VCODEC\n"
 	"                     2=VDU 3=RGA 4=IEP 5=ISP0 6=ISP1 7=HDCP 8=USB3 9=GMAC), or\n"
@@ -1742,5 +1844,6 @@ U_BOOT_CMD(
 	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
 	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"
 	"twwfi p|hp [ms]    - arm CNTP/CNTHP + one raw WFI (hangs - no IMO/handler)\n"
-	"  pmu/cpuinfo/napstats/psci/litvolt/probe/spi/gpio/dump never hang. gate/coredown/cpuall/suspend/p/hp may - power-cycle if so."
+	"  pmu/cpuinfo/napstats/psci/litvolt/probe/spi/gpio/dump + `ddr`(no arg) never hang.\n"
+	"  gate/coredown/cpuall/suspend/p/hp + `ddr <MHz>` may - power-cycle if so."
 );

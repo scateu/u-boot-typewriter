@@ -584,6 +584,7 @@ static void draw_bar(struct tw_state *s)
 			s->prompt == TW_PROMPT_SAVE   ? " File Name to Write: " :
 			s->prompt == TW_PROMPT_OPEN   ? " File to open: " :
 			s->prompt == TW_PROMPT_SEARCH ? " Search: " :
+			s->prompt == TW_PROMPT_SHELL  ? " Run cmd (output inserted): !" :
 			" Save modified buffer?  Y)es  N)o  C)ancel ";
 		x = draw_str(0, s->bar_y, label, C_BARTX, C_BAR);
 		x = draw_str(x, s->bar_y, s->prompt_ans, C_BARTX, C_BAR);

@@ -74,6 +74,7 @@
 #define KEY_CTRL_Q    0x11       /* power off (save+sync+EC hibernate), confirmed */
 #define KEY_CTRL_S    0x13       /* save (one-handed; replaced ^O write-out) */
 #define KEY_CTRL_T    0x14       /* show battery % on demand (no auto-poll) */
+#define KEY_CTRL_V    0x16       /* run a U-Boot cmd, insert output (vim :r !) */
 #define KEY_CTRL_R    0x12       /* open file (read into buffer) */
 #define KEY_CTRL_W    0x17       /* delete word backward */
 #define KEY_CTRL_X    0x18       /* exit */
@@ -163,6 +164,7 @@ struct tw_fs {
 #define TW_PROMPT_OPEN   4       /* "File to open: " (^R) - text entry */
 #define TW_PROMPT_PICK   5       /* ^R file picker: arrow-select from fatls */
 #define TW_PROMPT_POWEROFF 6     /* ^Q: "Save & power off? (Y/N)" */
+#define TW_PROMPT_SHELL  7       /* ^V: "!cmd:" run U-Boot cmd, insert output */
 
 /* Sentinel for tw_read_battery(): distinct from a real negative errno so the
  * popup can say "no EC" vs. "EC command failed with code N". */
