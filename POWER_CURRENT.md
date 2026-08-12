@@ -191,7 +191,34 @@ Rails enabled at Linux idle (for reference, from /sys/class/regulator): pp3300_d
 pp3300_wifi_bt, wlan_pd_n, ppvar_gpu 0.85V, ppvar_bigcpu 0.97V, ppvar_litcpu 0.80V,
 pp1200_lpddr, pp1500_ap_io, pp3000, pp900_ap.
 
-## USB3 domain gate — SHIPPED (~14 mA, measured 2026-08)
+## Peripheral domain gating — SHIPPED (all 10, ~23 mA, measured 2026-08)
+
+Gating ALL editor-unused domains together (GPU, VCODEC, VDU, RGA, IEP, ISP0,
+ISP1, HDCP, USB3, GMAC) = **~23 mA**, measured repeatably via `twwfi gate` (no
+arg). Now shipped in `tw_gate_unused_domains()` at editor startup (cmd_tw.c),
+using bl31's pmu_set_power_domain sequence per domain with bus-idle-abort so it
+can never wedge.
+
+Per-domain sweep (`twwfi gatesweep`, each gated alone ~4 s) gave -6..+2 mA each -
+i.e. every single domain is INSIDE the ±15 mA noise floor on its own; the ~23 mA
+only shows as a sum. So gate them as a group, not individually. `twwfi gate N`
+(single, ~8 s) read 4-8 mA each - also noise-floor, consistent.
+
+Plus TCPD0 + TCPD1 (external Type-C DisplayPort, ~4 mA each, tested safe): bl31
+gates these with PWRDN-only (NO bus-idle step - `case PD_TCPD0: break;` in ATF
+pmu.c), and bl31 itself powers them off in suspend, so gating them while the
+editor runs is safe (the internal panel is eDP = PD_EDP, a different domain).
+
+Plus USB2 host clock-gate (~4 mA, `twwfi usb2`): USB2 is NOT a PMU domain, so it
+is CLOCK-gated via CRU (clksel_con[20] bits 5-8 = HCLK_HOST0/1; clkgate_con[6]
+bits 5-6 = USB2PHY0/1_REF), same as Linux runtime-PM. All shipped in the same
+startup function. **Total gated ~35 mA** (23 domains + 8 TCPD + 4 USB2).
+
+EXCLUDED: SDIOAUDIO (PD 31 / bus 29) WEDGED the SoC when gated - removed from the
+table. (PERILP/PERIHP peripheral NoC domains are load-bearing - they carry the
+cros-ec keyboard, PWM backlight, and SD - never gated.)
+
+### (historical) USB3 alone — ~14 mA
 
 `twwfi gate 8` (USB3 = PWRDN bit 27 / bus-idle bit 12) self-metered:
 
@@ -220,6 +247,22 @@ gate (twwfi gate 0) showing ~0 earlier, the GPU is fully off the table — no
 shippable lever. (Reported voltage "9V" was a µV/display artifact; the rail is
 ~0.9 V / 900000 µV as the Linux dump confirmed — nothing is actually at 9 V.)
 
+## Peripheral rails — ALL refuse disable (tested 2026-08)
+
+`twwfi rail <name>` (disable any regulator, self-meter, restore) on every
+non-load-bearing candidate: `ppvar_gpu_pwm`, `pp1800_pcie`, `pp1800_audio`,
+`p3.3v_dig` — **all refused with ret=-114 (-EPERM)**: marked always-on / boot-on
+in the DM, not software-disableable. So there is NO reclaimable peripheral rail
+on this board; the only peripheral lever is PMU-domain + CRU-clock gating (the
+~27 mA already shipped). Rail-level gating is a closed dead end.
+
+## Secondary CPU cores — cycling them changes nothing (~4 mA, noise)
+
+`twwfi cpuall` now self-meters: [untouched] vs [after CPU_ON→CPU_OFF each of the
+5 secondaries] = **~4 mA, inside noise**. bl31/coreboot already parks the
+secondaries OFF (`twwfi pmu` confirms), and there is nothing deeper than off, so
+"initialize + deep-sleep the other cores" is not a lever. Measured, not assumed.
+
 ## Rail hunt: EXHAUSTED
 
 Every enabled rail on this board is now classified:
@@ -239,8 +282,17 @@ remaining ~450 mA is DDR + display/eDP link + core/logic rails — reachable onl
 by bl31 system-suspend / rail-sequencing (large effort, uncertain payoff), NOT by
 flipping a regulator or gating a domain from U-Boot.
 
-## Biggest reachable lever going forward
+## Status of the levers
 
-Backlight is the largest measured lever, now dimmable to 5%. Candidate feature:
-**auto-dim on idle** — drop to the floor after N s of no keystrokes, restore on
-next key (reuse the same idle hook that drives deep WFI).
+All the cheap, editor-reachable levers are now found and shipped:
+- **DDR 928→400** (~78 mA), **CPU 408 MHz + 0.80 V** (heat), **peripheral domain
+  gate + USB2 clock-gate** (~27 mA) — all at editor startup.
+- **Backlight** (~50–83 mA) — dimmable 5–100 % in 5 % steps via `^-`/`^]`,
+  default 10 %. Left under the writer's control.
+
+**Auto-dim on idle was considered and DECLINED** — dimming while the writer
+pauses to think rushes them; the backlight stays where the writer put it.
+
+Nothing cheaper remains. The residual ~3 %/hr vs Linux and the ~423 mA floor are
+bl31 system-suspend / rail-sequencing territory (see the sections above) — a
+large, uncertain effort, not an editor-side toggle.

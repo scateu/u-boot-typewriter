@@ -201,8 +201,6 @@ Opens an empty buffer if the file does not exist; `^S` creates it.
 
 ## Keys
 
-Modeless, like Nano — typing inserts text; Ctrl chords are commands.
-
 Modeless, readline-style — typing inserts text; Ctrl/Meta chords are commands.
 
 | Key | Action |
@@ -216,14 +214,22 @@ Modeless, readline-style — typing inserts text; Ctrl/Meta chords are commands.
 | `Tab` | insert spaces to the next 8-column stop |
 | `Backspace` | delete left (merges lines at column 0) |
 | `^D` / `Delete` | delete char under cursor |
-| `^W` | delete word backward |
+| `^W` | delete word backward (deleted text goes to the kill buffer) |
 | `^K` | kill from cursor to end of line |
-| `^Y` | yank (paste the kill buffer) |
+| `^Y` | yank (paste the kill buffer — from `^K` or `^W`) |
 | `^S` | save — prompts for filename |
 | `^R` | open a file — **picker**: lists files (`fatls`-style), `↑`/`↓` select, `Enter` open, `Esc` cancel (auto-saves current) |
+| `^V` | **run a U-Boot command, insert its output** at the cursor (like vim `:r !cmd`). Prompts for the command; output is captured via `CONSOLE_RECORD` and the screen is repainted clean. This is how to get shell output (e.g. `twwfi cpuinfo`) into a file to save to SD — U-Boot has no copy/paste. |
+| `^-` / `^]` | backlight **dim / brighten**, 5% steps (5–100%; starts at 10%) |
+| `^T` | show **battery** status on the bar: `BAT %`, on-AC flag, and signed `mA` (negative = discharging) read from the EC smart-battery gauge |
 | `^X` | exit — if modified & writable, asks Y/N/C |
 | `^Q` | save + sync, then **Y)** power off (PSCI), **B)** boot the OS, **N)** cancel — see [POWEROFF.md](POWEROFF.md) |
 | `Ctrl-Space` | toggle **Wubi ⇄ English** input |
+
+> **`^V` needs `CONFIG_CONSOLE_RECORD=y`** (see [INSTALL.md](INSTALL.md)). Without
+> it the command still runs but nothing is inserted. Note: on the cros-ec
+> keyboard, `Ctrl`+punctuation does not emit a control byte, which is why these
+> use letter-Ctrl chords (`^V`, `^]`) rather than e.g. `^;` or `^=`.
 
 Opening a file via `^R` **auto-saves** the current buffer first (if it's
 writable and modified) before loading the new one; on a read-only buffer (the

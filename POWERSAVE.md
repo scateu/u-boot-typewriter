@@ -279,22 +279,30 @@ Notes:
 
 ---
 
-## Unused-peripheral power-gating — tried, REMOVED (no benefit)
+## Unused-peripheral power-gating — SHIPPED (~27 mA, once we had a real meter)
 
-We tried gating the RK3399 peripheral domains a text editor never uses (GPU,
-VCODEC, VDU, RGA, IEP, ISP0, ISP1, HDCP, USB3, GMAC) at editor startup, using
-bl31's own sequence — request the domain's NoC bus idle (`PMU_BUS_IDLE_REQ` →
-wait `_ST` & `_ACK`), then set its `PMU_PWRDN_CON` bit (→ wait `PMU_PWRDN_ST`).
+We gate the RK3399 peripheral domains a text editor never uses (GPU, VCODEC, VDU,
+RGA, IEP, ISP0, ISP1, HDCP, USB3, GMAC) at editor startup, using bl31's own
+sequence — request the domain's NoC bus idle (`PMU_BUS_IDLE_REQ` → wait `_ST` &
+`_ACK`), then set its `PMU_PWRDN_CON` bit (→ wait `PMU_PWRDN_ST`), with a
+bus-idle **abort/back-out** so a busy domain is skipped, never forced (no wedge).
+Function: `tw_gate_unused_domains()` in cmd_tw.c.
 
-> **Measured result: NO CHANGE.** Idle drain stayed at ~14 %/hr, identical to
-> before. These domains were powered-but-idle *leakage*, negligible next to the
-> real draw. The startup gating was **removed** — it added risk/complexity for no
-> win. Don't re-chase PMU-domain gating for power on this board.
+> **Measured result (SBS current gauge, 2026-08): all ten together ≈ 23 mA**, plus
+> a **USB2 host clock-gate ≈ 4 mA** (USB2 isn't a PMU domain — it's clock-gated via
+> CRU, the runtime-PM equivalent). **Total ≈ 27 mA, shipped.**
+>
+> An EARLIER attempt was removed for "no benefit" — but that verdict was measured
+> only by battery **%/hr over ~30 min**, far too coarse to see ~23 mA on ~500 mA.
+> Once the on-board mA meter existed (EC smart battery, see [TWWFI.md](TWWFI.md)),
+> the gate showed a real, repeatable ~23 mA. Lesson: "0 delta" was a resolution
+> limit, not a true zero.
 
-The bench tool `twwfi gate [N]` was kept for future meter-based testing (gates
-one domain, holds ~15 s, restores; 0=GPU 1=VCODEC 2=VDU 3=RGA 4=IEP 5=ISP0
-6=ISP1 7=HDCP 8=USB3 9=GMAC). Verified safe there — all ten gate + restore with
-no hang — but with no measurable effect on drain.
+Per-domain, each is inside the ±15 mA noise floor alone (`twwfi gatesweep`: -6..+2
+mA each) — the ~23 mA only appears as the **group** sum, so gate them together.
+`SDIOAUDIO` **wedged** when gated (excluded); `TCPD0/TCPD1` have no bl31 bus-idle
+bit (excluded). Bench tools: `twwfi gate [N]` (self-metering; 0=GPU…9=GMAC),
+`twwfi gatesweep` (per-domain table), `twwfi usb2` (the USB2 clock-gate).
 
 ### WiFi — also ruled out
 
@@ -303,21 +311,39 @@ is neither always-on nor boot-on; `gpio status -a` shows both WiFi control pins
 (`regulator-pp3300-wifi-bt.gpio`, `regulator-wlan-pd-n.gpio`) at output 0 — i.e.
 WiFi/BT is already effectively off at idle. Not a contributor.
 
-## Where the remaining ~14 %/hr actually is
+## Where the power actually goes (now MEASURED, not estimated)
 
-After the WFI work (~20→14 %/hr), the leftover is **not** cheap unused blocks:
-CPU is minimal (1 core), peripheral PMU domains gate to **0 delta**, WiFi is off.
-By elimination it's the **load-bearing** draws:
-- **Display panel + backlight** — on at full brightness the entire session. Almost
-  certainly the biggest single item. Cheapest next experiment (no meter): dim to
-  minimum (`Ctrl--`) or blank the panel on idle and compare %/hr. If that moves
-  the needle, build "auto-dim/blank after N s idle."
-- **DDR self-refresh + always-on core/logic rails** (`pp1200_lpddr`, `ppvar_logic`,
-  `ppvar_centerlogic`, `pp900_ap`, …) — the machine doing its job; not disableable
-  without hanging, and tuning needs a **power meter**. Don't guess-tune rails blind.
+Once the on-board EC current meter existed, every lever got a real mA number (on
+battery; see [POWER_CURRENT.md](POWER_CURRENT.md) for the full table). Ranked:
 
-Bottom line: the kept win is the WFI idle work. Beyond it, the display is the one
-remaining cheap lever; everything else needs instrumentation.
+| Lever | mA | Status |
+|---|---|---|
+| **DDR 928→400 MHz** | ~78 | shipped (`tw_set_ddr_400`) |
+| **Backlight** (per step; ~50 for the LED at 40%) | ~50–83 | user `^-`/`^]`, default 10% |
+| **Peripheral domain gate (10) + USB2 clock-gate** | ~27 | shipped (`tw_gate_unused_domains`) |
+| A53 408 MHz + 0.80 V | ~few | shipped; done for HEAT, ≈0 for battery |
+| **WFI / CPU idle depth / PSCI cluster-sleep** | **~0** | proven a wash (both stacks) |
+| GPU rail / centerlogic / WiFi | 0 / parity / off | not levers |
+
+**WFI is NOT where the power goes** — `twwfi wfibench` and `benchmark/wfi_proof.sh`
+proved WFI vs busy-spin vs full PSCI cluster-sleep are all within ~15 mA (noise),
+because the A53 rail doesn't gate on WFI. The idle work is still worth keeping for
+responsiveness/cleanliness, just not for battery.
+
+The **irreducible floor** (~423 mA on Linux with backlight off) is DDR +
+display/eDP link + always-on core/logic rails (`pp1200_lpddr`, `ppvar_logic`,
+`ppvar_centerlogic`, `pp900_ap`) + PMIC/EC quiescent — reachable only by bl31
+system-suspend / rail-sequencing (large effort, uncertain payoff), NOT by any
+lever the editor can flip.
+
+A **~3 %/hr gap vs Linux** remains (typewriter ~9 %/hr, Linux ~6 %/hr on the same
+pack). Investigated hard (see POWER_CURRENT.md): it is NOT idle depth, peripheral
+gating, litcpu/centerlogic voltage, GPU, or WiFi — all ruled out by measurement,
+and Linux actually idles *worse* (constant timer wakeups) yet wins. The residual
+is most likely DDR self-refresh residency or a display-path difference that can't
+be isolated from sysfs headless — bl31/M0 territory. Auto-dim was explicitly
+**declined** (it rushes the writer). Bottom line: the shipped levers are DDR-400,
+backlight, and the ~27 mA domain/USB2 gate; the rest needs bl31-level work.
 
 ---
 

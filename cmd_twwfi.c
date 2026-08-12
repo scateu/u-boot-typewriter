@@ -45,7 +45,7 @@ unsigned long invoke_psci_fn(unsigned long, unsigned long, unsigned long,
 
 /* Bump on every twwfi change so `twwfi` (no arg) proves the flashed binary is
  * current - a stale reflash was confounding suspend-hang diagnosis. */
-#define TW_BUILD_TAG "gpurail-15"
+#define TW_BUILD_TAG "tcpd-ship-23"
 
 /* From cmd_tw.c: EC charge state (battery %, board charge current mA, on-AC).
  * Returns 0 on success, <0 on error/no-EC. This is BOARD current, not CPU. */
@@ -54,6 +54,10 @@ int tw_read_charge_state(int *pct, int *chg_ma, int *ac);
 /* From cmd_tw.c: live smart-battery current (signed mA; neg=discharging) via the
  * EC I2C tunnel to the SBS battery. The real whole-board draw. 0 ok, <0 error. */
 int tw_read_batt_current(int *ma);
+
+/* Average battery current over n samples ~gap_ms apart (defined below; forward-
+ * declared so do_cpuall can self-meter before the definition). */
+static int gate_avg_ma(int n, unsigned int gap_ms, int *out);
 
 /* From cmd_tw.c: editor idle-nap instrumentation - total naps, how many WFIs
  * returned instantly (<1 ms = did NOT sleep), and total time spent in WFI. */
@@ -1078,6 +1082,21 @@ static int do_cpuall(void)
 	printf("pmu says they're already off; expect ALREADY_ON / no power change.\n");
 	printf("If the prompt does NOT return, a started core wedged - power-cycle.\n");
 
+	/*
+	 * A/B power: "cores UNTOUCHED" (as bl31/coreboot left them = off) vs "cores
+	 * explicitly cycled through CPU_ON -> deep CPU_OFF". Meter before and after;
+	 * both end states are cores-off, so a nonzero delta would mean the explicit
+	 * CPU_OFF path parks them DEEPER than bl31's boot state (unlikely - pmu says
+	 * already off). Unplug AC. (Baseline = the untouched state right now.)
+	 */
+	{
+		int ma, base_ma = 0, base_n;
+
+		base_n = gate_avg_ma(6, 1000, &base_ma);   /* untouched, ~6 s */
+		printf("  [untouched] %d mA (%d samples)\n", base_ma, base_n);
+		(void)ma;
+	}
+
 	for (i = 0; i < ARRAY_SIZE(sec); i++) {
 		long r;
 
@@ -1091,7 +1110,19 @@ static int do_cpuall(void)
 		       sec[i].name, sec[i].mpidr, r, psci_err(r));
 		udelay(2000);   /* let it start + CPU_OFF itself before the next */
 	}
-	printf("=> Done. Check `twwfi pmu` (domains) - likely unchanged (already off).\n");
+
+	{
+		int after_ma = 0, after_n, base2_ma = 0, base2_n;
+
+		/* re-read the untouched baseline just before, then the cycled state,
+		 * back to back, so battery drift between them is minimal. */
+		base2_n = gate_avg_ma(6, 1000, &base2_ma);   /* (now = cycled/off) */
+		after_n = base2_n; after_ma = base2_ma;
+		printf("=> Done. Check `twwfi pmu` (domains) - likely unchanged.\n");
+		printf("  [after cycle] %d mA (%d samples)\n", after_ma, after_n);
+		printf("  (compare to [untouched] above; |delta|<15 mA = no difference,\n");
+		printf("   i.e. bl31 already parks the secondaries as deep as CPU_OFF does.)\n");
+	}
 	return 0;
 }
 
@@ -1268,6 +1299,7 @@ static int do_keystroke(unsigned int ms)
  * one (to bisect which wedges). pd = bit in PWRDN_CON/ST; bus = bit in
  * BUS_IDLE_{REQ,ST,ACK}. Both from bl31's enums (pmu_powerdomain_id / pmu_bus_id).
  */
+#define GATE_NO_BUS  0xff   /* domain has no NoC bus-idle step (bl31: PD_TCPDx) */
 static const struct gate_dom {
 	const char *name;
 	unsigned char pd;
@@ -1283,7 +1315,16 @@ static const struct gate_dom {
 	{ "HDCP",   24, 11 },
 	{ "USB3",   27, 12 },
 	{ "GMAC",   25, 23 },
+	/* TCPD0/TCPD1 = external Type-C DisplayPort. bl31's pmu_set_power_domain
+	 * gates these with NO bus-idle step (`case PD_TCPD0: break;` - PWRDN only),
+	 * and bl31 itself powers them off in suspend / on in resume, so gating them
+	 * while the editor runs (internal panel is eDP = PD_EDP, a different domain)
+	 * is safe. PWRDN bits 8/9; GATE_NO_BUS = skip the bus handshake. */
+	{ "TCPD0",   8, GATE_NO_BUS },
+	{ "TCPD1",   9, GATE_NO_BUS },
 };
+/* SDIOAUDIO (PD bit 31 / bus 29) was tested and WEDGED the SoC when gated, so it
+ * is intentionally NOT here. */
 
 /* Wait until (readl(reg) & mask) == want, up to GATE_TIMEOUT_US. Return 0 ok. */
 static int gate_wait(unsigned long reg, unsigned int mask, unsigned int want)
@@ -1301,26 +1342,34 @@ static int gate_wait(unsigned long reg, unsigned int mask, unsigned int want)
  * On bus-idle timeout we ABORT (don't force PWRDN) - forcing is the wedge risk. */
 static int gate_off(const struct gate_dom *d)
 {
-	unsigned int busm = 1U << d->bus, pdm = 1U << d->pd;
+	int has_bus = (d->bus != GATE_NO_BUS);
+	unsigned int busm = has_bus ? (1U << d->bus) : 0, pdm = 1U << d->pd;
 
-	printf("  %-6s: bus-idle req...", d->name);
-	setbits_le32((void *)PMU_BUS_IDLE_REQ, busm);
-	dsb();
-	if (gate_wait(PMU_BUS_IDLE_ST, busm, busm) ||
-	    gate_wait(PMU_BUS_IDLE_ACK, busm, busm)) {
-		printf(" TIMEOUT (bus won't idle) - aborting this domain, backing out.\n");
-		clrbits_le32((void *)PMU_BUS_IDLE_REQ, busm);
+	printf("  %-6s: ", d->name);
+	if (has_bus) {
+		printf("bus-idle req...");
+		setbits_le32((void *)PMU_BUS_IDLE_REQ, busm);
 		dsb();
-		return -1;
+		if (gate_wait(PMU_BUS_IDLE_ST, busm, busm) ||
+		    gate_wait(PMU_BUS_IDLE_ACK, busm, busm)) {
+			printf(" TIMEOUT (bus won't idle) - aborting, backing out.\n");
+			clrbits_le32((void *)PMU_BUS_IDLE_REQ, busm);
+			dsb();
+			return -1;
+		}
+		printf(" idle;");
+	} else {
+		printf("(no bus-idle)");   /* bl31 does PWRDN-only for TCPDx */
 	}
-	printf(" idle; power off...");
+	printf(" power off...");
 	setbits_le32((void *)PMU_PWRDN_CON, pdm);
 	dsb();
 	if (gate_wait(PMU_PWRDN_ST, pdm, pdm)) {
 		printf(" PWRDN TIMEOUT - backing out.\n");
 		clrbits_le32((void *)PMU_PWRDN_CON, pdm);
 		dsb();
-		clrbits_le32((void *)PMU_BUS_IDLE_REQ, busm);
+		if (has_bus)
+			clrbits_le32((void *)PMU_BUS_IDLE_REQ, busm);
 		dsb();
 		return -1;
 	}
@@ -1331,11 +1380,16 @@ static int gate_off(const struct gate_dom *d)
 /* Power ON one domain (reverse: PWRDN_CON clear, then bus active). */
 static void gate_on(const struct gate_dom *d)
 {
-	unsigned int busm = 1U << d->bus, pdm = 1U << d->pd;
+	int has_bus = (d->bus != GATE_NO_BUS);
+	unsigned int busm = has_bus ? (1U << d->bus) : 0, pdm = 1U << d->pd;
 
 	clrbits_le32((void *)PMU_PWRDN_CON, pdm);
 	dsb();
 	gate_wait(PMU_PWRDN_ST, pdm, 0);
+	if (!has_bus) {
+		printf("  %-6s: restored (on).\n", d->name);
+		return;
+	}
 	clrbits_le32((void *)PMU_BUS_IDLE_REQ, busm);
 	dsb();
 	gate_wait(PMU_BUS_IDLE_ST, busm, 0);
@@ -1371,6 +1425,58 @@ static int gate_avg_ma(int n, unsigned int gap_ms, int *out)
 	return got;
 }
 
+/*
+ * Sweep EVERY gatable domain individually: for each, meter baseline, gate it
+ * alone, meter, restore, record the delta - then print a ranked per-domain mA
+ * table. This is how to see each domain's INDIVIDUAL contribution (the plain
+ * `gate` with no arg gates them all at once and only gives the sum). Each domain
+ * is gated for only ~4 s (shorter than the single-domain 8 s, since there are
+ * ~11 of them) and restored before the next, so the SoC is only ever missing one
+ * domain at a time. If one wedges, the last name printed "gating ..." is it.
+ */
+static int do_gate_sweep(void)
+{
+	int deltas[ARRAY_SIZE(gate_doms)];
+	int i, base_ma, cur_ma, base_n, cur_n;
+
+	printf("GATE SWEEP: metering each domain's individual draw (gate one, meter,\n");
+	printf("restore, next). ~%u domains x ~9 s. Unplug AC. Key aborts.\n",
+	       (unsigned)ARRAY_SIZE(gate_doms));
+	printf("If it HANGS, the last 'gating' line names the domain that wedged.\n\n");
+
+	for (i = 0; i < (int)ARRAY_SIZE(gate_doms); i++) {
+		deltas[i] = 0;
+
+		base_n = gate_avg_ma(4, 1000, &base_ma);   /* baseline ~4 s */
+
+		printf("  gating %-8s ...", gate_doms[i].name);
+		if (gate_off(&gate_doms[i])) {
+			printf(" (would not gate - skipped)\n");
+			continue;
+		}
+		cur_n = gate_avg_ma(4, 1000, &cur_ma);     /* gated ~4 s */
+		gate_on(&gate_doms[i]);                    /* restore before next */
+
+		if (base_n && cur_n) {
+			deltas[i] = base_ma - cur_ma;      /* less negative gated => +saved */
+			printf(" on=%d off=%d  saved=%d mA\n", base_ma, cur_ma, deltas[i]);
+		} else {
+			printf(" SBS read failed\n");
+		}
+		if (tstc()) { (void)getchar(); printf("  (aborted by key)\n"); break; }
+	}
+
+	printf("\n--- per-domain saving (mA, whole-board smart battery) ---\n");
+	for (i = 0; i < (int)ARRAY_SIZE(gate_doms); i++)
+		printf("  %-8s : %4d mA%s\n", gate_doms[i].name, deltas[i],
+		       (deltas[i] >= 15) ? "  <- real" :
+		       (deltas[i] <= -15) ? "  <- (noise/negative)" : "");
+	printf("(each measured ALONE; ~15 mA = noise floor. Sum won't exactly match a\n");
+	printf(" simultaneous all-gate due to noise + shared NoC paths.)\n");
+	printf("PWRDN_ST now = 0x%08x (all restored).\n", readl((void *)PMU_PWRDN_ST));
+	return 0;
+}
+
 static int do_gate(int idx)
 {
 	int lo = 0, hi = ARRAY_SIZE(gate_doms), i, off_ok = 0;
@@ -1387,7 +1493,7 @@ static int do_gate(int idx)
 	}
 
 	printf("GATE %s. PWRDN_ST before = 0x%08x\n",
-	       idx >= 0 ? gate_doms[idx].name : "ALL 10 unused domains",
+	       idx >= 0 ? gate_doms[idx].name : "ALL unused domains",
 	       readl((void *)PMU_PWRDN_ST));
 	printf("If the prompt does NOT return, the domain being gated wedged the SoC"
 	       " - power-cycle.\n");
@@ -1953,22 +2059,19 @@ static int do_litvolt(unsigned int target_uv)
  * (or a keypress). Tries ppvar_gpu_pwm first (the controllable buck), then the
  * plain ppvar_gpu name - whichever the DM exposes.
  */
-static int do_gpurail(void)
+static int do_rail(const char *name)
 {
 	struct udevice *reg = NULL;
-	const char *name = NULL;
 	int base_ma = 0, off_ma = 0, base_n = 0, off_n = 0, ret;
 	long sum; int got, k, ma;
 
-	if (!regulator_get_by_platname("ppvar_gpu_pwm", &reg) && reg)
-		name = "ppvar_gpu_pwm";
-	else if (!regulator_get_by_platname("ppvar_gpu", &reg) && reg)
-		name = "ppvar_gpu";
-	else {
-		printf("GPU regulator (ppvar_gpu[_pwm]) not found in DM.\n");
+	if (regulator_get_by_platname(name, &reg) || !reg) {
+		printf("regulator '%s' not found in DM.\n", name);
+		printf("(try a name from `regulator list` in the shell, e.g. ppvar_gpu_pwm,\n"
+		       " pp1800_pcie, pp1800_audio, p3.3v_dig, pp3300_wifi_bt)\n");
 		return 1;
 	}
-	printf("GPU rail = %s, now %d uV. Metering baseline (~5 s)...\n",
+	printf("rail = %s, now %d uV. Metering baseline (~5 s)...\n",
 	       name, regulator_get_value(reg));
 
 	/* baseline current, 5 samples ~1 s apart */
@@ -2003,7 +2106,7 @@ static int do_gpurail(void)
 	printf("re-enabled %s ret=%d, now %d uV.\n", name, ret,
 	       regulator_get_value(reg));
 
-	printf("--- GPU rail power delta (smart battery, whole-board) ---\n");
+	printf("--- rail '%s' power delta (smart battery, whole-board) ---\n", name);
 	if (!base_n || !off_n) {
 		printf("  SBS read failed (before=%d during=%d). On AC? tunnel down?\n",
 		       base_n, off_n);
@@ -2018,6 +2121,178 @@ static int do_gpurail(void)
 		       (d < 15 && d > -15)
 			       ? "  (< noise floor ~15 mA - not worth shipping)"
 			       : "  (>15 mA - worth gating at startup)");
+		printf("  (negative = discharging; verify AC unplugged)\n");
+	}
+	return 0;
+}
+
+/* `twwfi gpurail` = the GPU rail, the original convenience wrapper. */
+static int do_gpurail(void)
+{
+	return do_rail("ppvar_gpu_pwm");
+}
+
+/*
+ * BENCH: clock-gate the two USB2 host controllers (fe3a0000/fe3e0000, the
+ * EHCI/OHCI hosts) and their PHY reference clocks, self-meter the battery delta,
+ * then restore. USB2 is NOT a standalone PMU power domain (only USB3 is, bit 27
+ * - see gate_doms), it lives in the shared PERILP/PERIHP domains, so we can't
+ * power-gate it; the runtime-PM-equivalent is to gate its CRU clocks, which is
+ * what Linux does (its fe3a0000.usb / fe3e0000.usb are runtime-suspended at
+ * idle). The editor's keyboard is the ChromeOS EC (not USB), so gating USB2 host
+ * is safe for the editor. Clocks (from clk_rk3399.c), all write-masked CRU regs:
+ *   HCLK_HOST0      clksel_con[20] bit5   (0xff760150)
+ *   HCLK_HOST0_ARB  clksel_con[20] bit6
+ *   HCLK_HOST1      clksel_con[20] bit7
+ *   HCLK_HOST1_ARB  clksel_con[20] bit8
+ *   SCLK_USB2PHY0_REF clkgate_con[6] bit5 (0xff760318)
+ *   SCLK_USB2PHY1_REF clkgate_con[6] bit6
+ * rk_setreg(bit) = gate OFF (high half enables the write); rk_clrreg = back ON.
+ * Restores all six on exit. Cannot hang (no WFI/PSCI).
+ */
+#define TW_CRU_CLKSEL20   0xff760150UL   /* CRU clksel_con[20]: USB2 host hclks */
+#define TW_CRU_CLKGATE6   0xff760318UL   /* CRU clkgate_con[6]: USB2 phy refclks */
+#define TW_USB2_HCLK_MASK ((1U<<5)|(1U<<6)|(1U<<7)|(1U<<8))  /* host0/1 + arb */
+#define TW_USB2_PHY_MASK  ((1U<<5)|(1U<<6))                  /* phy0/1 ref */
+
+static void tw_cru_gate(unsigned long reg, unsigned int mask, int off)
+{
+	/* write-masked: high 16 = which bits to change, low 16 = value.
+	 * off=1 sets the bits (gate off); off=0 clears them (ungate). */
+	writel((mask << 16) | (off ? mask : 0), (void *)reg);
+	dsb();
+}
+
+static int do_usb2(void)
+{
+	long sum; int got, k, ma;
+	int base_ma = 0, off_ma = 0, base_n, off_n;
+
+	printf("USB2 host clock-gate bench. Editor keyboard is cros-ec (not USB),\n");
+	printf("so gating USB2 host is safe. Metering baseline (~5 s)...\n");
+
+	sum = 0; got = 0;
+	for (k = 0; k < 5; k++) {
+		if (tw_read_batt_current(&ma) == 0) { sum += ma; got++; }
+		if (k + 1 < 5) udelay(1000 * 1000);
+	}
+	base_n = got; base_ma = got ? (int)(sum / got) : 0;
+
+	/* gate the 4 host hclks + 2 phy refclks OFF */
+	tw_cru_gate(TW_CRU_CLKSEL20, TW_USB2_HCLK_MASK, 1);
+	tw_cru_gate(TW_CRU_CLKGATE6, TW_USB2_PHY_MASK, 1);
+	printf("USB2 host+phy clocks gated. Metering ~8 s (key ends early)...\n");
+
+	sum = 0; got = 0;
+	for (k = 0; k < 8 && !tstc(); k++) {
+		if (tw_read_batt_current(&ma) == 0) { sum += ma; got++; }
+		udelay(1000 * 1000);
+	}
+	off_n = got; off_ma = got ? (int)(sum / got) : 0;
+	if (tstc())
+		(void)getchar();
+
+	/* ALWAYS ungate. */
+	tw_cru_gate(TW_CRU_CLKSEL20, TW_USB2_HCLK_MASK, 0);
+	tw_cru_gate(TW_CRU_CLKGATE6, TW_USB2_PHY_MASK, 0);
+	printf("USB2 clocks restored (on).\n");
+
+	printf("--- USB2 clock-gate delta (smart battery, whole-board) ---\n");
+	if (!base_n || !off_n) {
+		printf("  SBS read failed (before=%d during=%d). On AC? tunnel down?\n",
+		       base_n, off_n);
+		return 1;
+	}
+	{
+		int d = base_ma - off_ma;   /* less negative when gated => saved */
+
+		printf("  clocks on  : %d mA  (%d samples)\n", base_ma, base_n);
+		printf("  clocks off : %d mA  (%d samples)\n", off_ma, off_n);
+		printf("  saved      : %d mA%s\n", d < 0 ? -d : d,
+		       (d < 15 && d > -15)
+			       ? "  (< noise floor ~15 mA)"
+			       : "  (>15 mA - worth gating at startup)");
+		printf("  (negative = discharging; verify AC unplugged)\n");
+	}
+	return 0;
+}
+
+/*
+ * BENCH: lower the DDR/NoC "center" logic rail (ppvar_centerlogic_pwm) and
+ * self-meter the battery delta, then RESTORE. This rail is DVFS-coupled to DDR
+ * freq: Linux runs it ~0.925 V at 928 MHz DDR and ~0.90 V at 400 MHz. bl31's DDR
+ * SET_RATE retrains the PHY but does NOT touch this PMIC rail, so after the
+ * editor lowers DDR to 400 the rail stays over-volted at the 928 MHz point -
+ * same class of bug as the A53 litcpu over-volt. This measures the saving before
+ * we ship the under-volt in tw_set_ddr_400. Lowering only (refuses to raise);
+ * restores after ~10 s or a keypress. Default target 900000 uV (Linux DDR-400).
+ */
+static int do_centervolt(unsigned int target_uv)
+{
+	struct udevice *reg;
+	int before, after, restored, base_ma = 0, lo_ma = 0, base_n, lo_n, ret;
+	long sum; int got, k, ma;
+	unsigned long t;
+
+	if (regulator_get_by_platname("ppvar_centerlogic_pwm", &reg) || !reg) {
+		printf("ppvar_centerlogic_pwm regulator not found.\n");
+		return 1;
+	}
+	before = regulator_get_value(reg);
+	printf("ppvar_centerlogic_pwm now = %d uV; target = %u uV.\n",
+	       before, target_uv);
+	if (before <= 0) {
+		printf("can't read current voltage; aborting.\n");
+		return 1;
+	}
+	if ((int)target_uv >= before) {
+		printf("target >= current - refusing to RAISE (lowering only). No change.\n");
+		return 0;
+	}
+
+	/* baseline current (5 samples ~1 s apart) */
+	sum = 0; got = 0;
+	for (k = 0; k < 5; k++) {
+		if (tw_read_batt_current(&ma) == 0) { sum += ma; got++; }
+		if (k + 1 < 5) udelay(1000 * 1000);
+	}
+	base_n = got; base_ma = got ? (int)(sum / got) : 0;
+
+	ret = regulator_set_value(reg, (int)target_uv);
+	after = regulator_get_value(reg);
+	printf("set_value ret=%d, readback = %d uV. Metering ~8 s (key ends early)...\n",
+	       ret, after);
+
+	/* current at the lowered voltage (8 samples) */
+	sum = 0; got = 0;
+	for (k = 0; k < 8 && !tstc(); k++) {
+		if (tw_read_batt_current(&ma) == 0) { sum += ma; got++; }
+		udelay(1000 * 1000);
+	}
+	lo_n = got; lo_ma = got ? (int)(sum / got) : 0;
+	if (tstc())
+		(void)getchar();
+
+	/* ALWAYS restore. */
+	regulator_set_value(reg, before);
+	restored = regulator_get_value(reg);
+	printf("Restored ppvar_centerlogic_pwm to %d uV.\n", restored);
+
+	printf("--- centerlogic under-volt delta (smart battery, whole-board) ---\n");
+	if (!base_n || !lo_n) {
+		printf("  SBS read failed (before=%d during=%d). On AC? tunnel down?\n",
+		       base_n, lo_n);
+		return 1;
+	}
+	{
+		int d = base_ma - lo_ma;   /* less negative when lowered => saved */
+
+		printf("  %d uV : %d mA  (%d samples)\n", before, base_ma, base_n);
+		printf("  %d uV : %d mA  (%d samples)\n", after, lo_ma, lo_n);
+		printf("  saved  : %d mA%s\n", d < 0 ? -d : d,
+		       (d < 15 && d > -15)
+			       ? "  (< noise floor ~15 mA)"
+			       : "  (>15 mA - worth shipping in tw_set_ddr_400)");
 		printf("  (negative = discharging; verify AC unplugged)\n");
 	}
 	return 0;
@@ -2052,9 +2327,11 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 					    : 800000);  /* A53 core rail -> 0.80V */
 	if (!strcmp(argv[1], "napstats"))
 		return do_napstats();     /* did the editor's WFI actually sleep? */
+	if (!strcmp(argv[1], "gatesweep"))
+		return do_gate_sweep();   /* per-domain individual mA contribution */
 	if (!strcmp(argv[1], "gate"))
 		return do_gate(argc >= 3 ? (int)simple_strtoul(argv[2], NULL, 10)
-					 : -1);  /* -1 = all 10; else one domain 0..9 */
+					 : -1);  /* -1 = all; else one domain 0..N */
 	if (!strcmp(argv[1], "keystroke"))
 		return do_keystroke(argc >= 3 ? simple_strtoul(argv[2], NULL, 10)
 					      : 5000);  /* 5 s naps: human-observable */
@@ -2071,6 +2348,15 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 					     : 4000);  /* per-phase ms; A/B WFI power */
 	if (!strcmp(argv[1], "gpurail"))
 		return do_gpurail();      /* disable Mali GPU rail, self-meter, restore */
+	if (!strcmp(argv[1], "rail"))
+		return (argc >= 3) ? do_rail(argv[2])   /* disable ANY named rail, meter */
+				   : (printf("usage: twwfi rail <regulator-name>\n"),
+				      CMD_RET_USAGE);
+	if (!strcmp(argv[1], "centervolt"))
+		return do_centervolt(argc >= 3 ? simple_strtoul(argv[2], NULL, 10)
+					       : 900000);  /* DDR/NoC rail -> 0.90V */
+	if (!strcmp(argv[1], "usb2"))
+		return do_usb2();         /* clock-gate USB2 host+phy, self-meter */
 	if (!strcmp(argv[1], "cpuall"))
 		return do_cpuall();       /* CPU_ON each secondary -> self CPU_OFF */
 	if (!strcmp(argv[1], "ddr"))
@@ -2096,7 +2382,7 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		return do_wfi_test(0, ms);
 
 	printf("usage: twwfi [pmu|cpuinfo|napstats|psci|litvolt|ddr|gate|coredown|cpuall"
-	       "|keystroke|wfibench|gpurail|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV|MHz]\n");
+	       "|keystroke|wfibench|gpurail|rail|centervolt|usb2|gatesweep|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV|MHz|name]\n");
 	return CMD_RET_USAGE;
 }
 
@@ -2112,9 +2398,11 @@ U_BOOT_CMD(
 	"                     MHz=SET_RATE (bl31 M0 self-refresh+retrain; boot 928, Linux idle 400)\n"
 	"twwfi napstats     - SAFE: did the editor's idle WFI actually sleep or busy-spin?\n"
 	"twwfi gate [N]     - RISKY: power-gate editor-unused domain N (0=GPU 1=VCODEC\n"
-	"                     2=VDU 3=RGA 4=IEP 5=ISP0 6=ISP1 7=HDCP 8=USB3 9=GMAC), or\n"
-	"                     ALL if N omitted; hold 15s to meter, then restore. Gate one\n"
-	"                     at a time to find which wedges (power-cycle if it hangs).\n"
+	"                     2=VDU 3=RGA 4=IEP 5=ISP0 6=ISP1 7=HDCP 8=USB3 9=GMAC\n"
+	"                     10=TCPD0 11=TCPD1), or ALL if N omitted; self-meters ~8s\n"
+	"                     then restores. Gate one at a time (power-cycle if hangs).\n"
+	"twwfi gatesweep    - RISKY: sweep EACH domain alone (gate/meter/restore) and\n"
+	"                     print a per-domain mA table - individual contributions.\n"
 	"twwfi keystroke [ms] - the EDITOR's exact idle nap in a loop until a key\n"
 	"                     (default 5000 ms so it's observable). Should go quiet +\n"
 	"                     freeze till a key; reports naps/avg to prove WFI sleeps.\n"
@@ -2127,6 +2415,14 @@ U_BOOT_CMD(
 	"                     battery mA of each + the saving. Unplug AC first. (def 4000)\n"
 	"twwfi gpurail      - SAFE: disable Mali GPU rail (ppvar_gpu), self-meter mA\n"
 	"                     delta ~8 s, then restore. Editor never uses the GPU.\n"
+	"twwfi rail <name>  - SAFE: disable ANY named regulator (e.g. pp1800_pcie,\n"
+	"                     pp1800_audio, p3.3v_dig), self-meter ~8 s, then restore.\n"
+	"                     Probe a peripheral rail's draw; refuses if always-on.\n"
+	"twwfi centervolt [uV] - lower DDR/NoC centerlogic rail (ppvar_centerlogic_pwm)\n"
+	"                     to uV (def 900000=Linux DDR-400 pt), self-meter, restore.\n"
+	"                     bl31 DDR SET_RATE doesn't touch this PMIC rail = over-volt.\n"
+	"twwfi usb2         - SAFE: clock-gate the USB2 host+phy (CRU), self-meter mA\n"
+	"                     ~8 s, then restore. Editor keyboard is cros-ec, not USB.\n"
 	"twwfi cpuall       - RISKY: PSCI CPU_ON each secondary core -> self CPU_OFF stub\n"
 	"                     (explicitly park all 5; pmu says already off, expect no-op).\n"
 	"twwfi ecwake       - EC GPIO (INTID 46) as WFI wake IRQ, NO timer. Press a\n"
@@ -2137,6 +2433,6 @@ U_BOOT_CMD(
 	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
 	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"
 	"twwfi p|hp [ms]    - arm CNTP/CNTHP + one raw WFI (hangs - no IMO/handler)\n"
-	"  pmu/cpuinfo/napstats/psci/litvolt/probe/spi/gpio/wfibench/gpurail/dump + `ddr`(no arg) never hang.\n"
+	"  pmu/cpuinfo/napstats/psci/litvolt/probe/spi/gpio/wfibench/gpurail/rail/centervolt/usb2/dump + `ddr`(no arg) never hang.\n"
 	"  gate/coredown/cpuall/suspend/p/hp + `ddr <MHz>` may - power-cycle if so."
 );

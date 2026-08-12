@@ -363,6 +363,16 @@ static void tw_set_cpu_408(void)
 #define TW_DRAM_SET_RATE    1
 #define TW_DRAM_GET_RATE    5
 #define TW_DDR_TARGET_HZ    400000000UL
+/*
+ * The DDR/NoC "center" logic rail (ppvar_centerlogic_pwm) is DVFS-coupled to the
+ * DDR frequency: measured on the live Linux board, at 928 MHz it runs ~0.925 V
+ * and at 400 MHz it drops to ~0.90 V. bl31's DDR SET_RATE SIP retrains the PHY +
+ * DPLL but does NOT touch the board PMIC rail (it has no OPP table), so after we
+ * lower DDR to 400 the rail is left at the boot 928 MHz voltage - an over-volt,
+ * exactly like the A53 litcpu case. Lower it to match Linux's 400 MHz point.
+ * Only ever LOWER (never raise); if read/set fails, leave as-is (harmless).
+ */
+#define TW_CENTERLOGIC_OPP_UV 900000  /* Linux's DDR-400 centerlogic voltage */
 static void tw_set_ddr_400(void)
 {
 	struct udevice *psci;
@@ -375,8 +385,22 @@ static void tw_set_ddr_400(void)
 	got = invoke_psci_fn(TW_RK_SIP_DDR_CFG, 0, 0, TW_DRAM_GET_RATE);
 	/* If it didn't take (bl31 error / no-op), DDR simply stays at its prior
 	 * rate - harmless, just not lowered. No way to corrupt from here: bl31 owns
-	 * the whole DFS sequence; we only request a rate it validated (ROUND_RATE). */
-	(void)got;
+	 * the whole DFS sequence; we only request a rate it validated (ROUND_RATE).
+	 * `got` (the achieved rate in Hz) gates the centerlogic under-volt below. */
+
+	/* Match the centerlogic rail to the now-lowered DDR rate (see note above).
+	 * Only if the DDR actually came down to <= 400 MHz, so we never under-volt
+	 * a rail that's still clocking DRAM fast. */
+	if (got && got <= TW_DDR_TARGET_HZ) {
+		struct udevice *reg;
+		int cur;
+
+		if (!regulator_get_by_platname("ppvar_centerlogic_pwm", &reg) && reg) {
+			cur = regulator_get_value(reg);
+			if (cur > TW_CENTERLOGIC_OPP_UV)   /* only lower, never raise */
+				regulator_set_value(reg, TW_CENTERLOGIC_OPP_UV);
+		}
+	}
 }
 
 /*
@@ -385,15 +409,28 @@ static void tw_set_ddr_400(void)
  * the domain powered. Measured (twwfi gate 8): a consistent ~14 mA saving,
  * present with OR without a USB device attached - i.e. this reclaims the
  * controller/PHY domain itself, NOT any attached device's VBUS (that VBUS rides
- * on top and is not a PMU domain). Small but free and always-on.
+ * on top and is not a PMU domain).
  *
- * Sequence is bl31's pmu_set_power_domain (ATF pmu.c): request the NoC bus idle,
- * wait for BUS_IDLE_ST+ACK, then set PWRDN_CON and wait for PWRDN_ST. If the bus
- * won't idle (something mid-transaction) we ABORT and back out cleanly - never
- * force it - so this can only ever be a no-op, never a startup wedge. USB3 =
- * PWRDN/CON bit 27, bus-idle bit 12 (from the gate_doms table in cmd_twwfi.c).
+ * We gate ALL editor-unused peripheral domains: GPU, VCODEC, VDU, RGA, IEP,
+ * ISP0/1, HDCP, USB3, GMAC (~23 mA together via `twwfi gate`), plus TCPD0/TCPD1
+ * (external Type-C DisplayPort; the internal panel is eDP = a different domain,
+ * ~4 mA each, verified safe - bl31 itself powers TCPD off in suspend). The
+ * editor uses none of them (framebuffer text; keyboard is cros-ec). SDIOAUDIO is
+ * excluded - it WEDGED when gated (see cmd_twwfi.c). We ALSO clock-gate the USB2
+ * host (not a PMU domain; via CRU) - another ~4 mA. Total measured ~35 mA.
+ *
+ * TCPDx have NO NoC bus-idle step in bl31 (`case PD_TCPD0: break;` - PWRDN only);
+ * tw_gate_domain() handles that via TW_GATE_NO_BUS.
+ *
+ * Per-domain (pd bit, bus-idle bit) from bl31's pmu_bits.h enums; identical to
+ * the gate_doms[] table in cmd_twwfi.c. Sequence is bl31's pmu_set_power_domain
+ * (ATF pmu.c): request the NoC bus idle, wait BUS_IDLE_ST+ACK, set PWRDN_CON,
+ * wait PWRDN_ST. If a bus won't idle we ABORT that domain and back out cleanly -
+ * never force it - so this can only ever gate what's safely idle, never a wedge.
+ * Gated for the whole editor session (no restore).
  */
-static void tw_gate_usb3(void)
+#define TW_GATE_NO_BUS 0xff   /* domain has no NoC bus-idle step (bl31: PD_TCPDx) */
+static void tw_gate_domain(unsigned int pd, unsigned int bus)
 {
 	const unsigned long PMU = 0xff310000UL;
 	void *pwrdn_con = (void *)(PMU + 0x14);
@@ -401,20 +438,26 @@ static void tw_gate_usb3(void)
 	void *bus_st    = (void *)(PMU + 0x64);
 	void *bus_ack   = (void *)(PMU + 0x68);
 	void *pwrdn_st  = (void *)(PMU + 0x18);
-	unsigned int busm = 1U << 12, pdm = 1U << 27;
+	int has_bus = (bus != TW_GATE_NO_BUS);
+	unsigned int busm = has_bus ? (1U << bus) : 0, pdm = 1U << pd;
 	int us;
 
-	/* 1. ask the USB3 NoC branch to go idle, wait ST+ACK (~1 ms budget). */
-	setbits_le32(bus_req, busm);
-	dsb();
-	for (us = 0; us < 1000 &&
-	     ((readl(bus_st) & busm) != busm || (readl(bus_ack) & busm) != busm);
-	     us++)
-		udelay(1);
-	if ((readl(bus_st) & busm) != busm || (readl(bus_ack) & busm) != busm) {
-		clrbits_le32(bus_req, busm);       /* bus won't idle: back out */
+	/* 1. ask the NoC branch to go idle, wait ST+ACK (~1 ms budget). TCPDx have
+	 *    no bus-idle step in bl31 (`case PD_TCPD0: break;`) - skip it. */
+	if (has_bus) {
+		setbits_le32(bus_req, busm);
 		dsb();
-		return;
+		for (us = 0; us < 1000 &&
+		     ((readl(bus_st) & busm) != busm ||
+		      (readl(bus_ack) & busm) != busm);
+		     us++)
+			udelay(1);
+		if ((readl(bus_st) & busm) != busm ||
+		    (readl(bus_ack) & busm) != busm) {
+			clrbits_le32(bus_req, busm);   /* bus won't idle: back out */
+			dsb();
+			return;
+		}
 	}
 
 	/* 2. power the domain off, wait PWRDN_ST (1 = off). */
@@ -424,17 +467,59 @@ static void tw_gate_usb3(void)
 		udelay(1);
 	if (!(readl(pwrdn_st) & pdm)) {        /* didn't gate: undo, leave as-was */
 		clrbits_le32(pwrdn_con, pdm);
-		clrbits_le32(bus_req, busm);
+		if (has_bus)
+			clrbits_le32(bus_req, busm);
 		dsb();
 	}
-	/* On success we leave it gated for the whole editor session (no restore). */
+}
+
+static void tw_gate_unused_domains(void)
+{
+	/* {pd, bus} per bl31 pmu_bits.h; mirrors gate_doms[] in cmd_twwfi.c. */
+	static const struct { unsigned char pd, bus; } doms[] = {
+		{ 15,  0 },   /* GPU    */
+		{ 16,  3 },   /* VCODEC */
+		{ 17,  4 },   /* VDU    */
+		{ 18,  5 },   /* RGA    */
+		{ 19,  6 },   /* IEP    */
+		{ 22,  9 },   /* ISP0   */
+		{ 23, 10 },   /* ISP1   */
+		{ 24, 11 },   /* HDCP   */
+		{ 27, 12 },   /* USB3   */
+		{ 25, 23 },   /* GMAC   */
+		{  8, TW_GATE_NO_BUS },   /* TCPD0 (ext Type-C DP; PWRDN-only) */
+		{  9, TW_GATE_NO_BUS },   /* TCPD1 */
+	};
+	unsigned int i;
+
+	for (i = 0; i < sizeof(doms) / sizeof(doms[0]); i++)
+		tw_gate_domain(doms[i].pd, doms[i].bus);
+
+	/*
+	 * USB2 host is NOT a PMU power domain (only USB3 is), so it can't be
+	 * power-gated - the equivalent is CLOCK-gating via CRU, like Linux does at
+	 * idle (~4 mA measured, `twwfi usb2`). The editor's keyboard is the cros-ec,
+	 * not USB, so gating the USB2 host + PHY refclks is safe. Write-masked CRU
+	 * regs (high 16 = which bits to change): gate OFF = set the bit.
+	 *   HCLK_HOST0/0_ARB/1/1_ARB = clksel_con[20] bits 5..8  (0xff760150)
+	 *   SCLK_USB2PHY0/1_REF      = clkgate_con[6] bits 5..6  (0xff760318)
+	 * From clk_rk3399.c; identical to the `twwfi usb2` bench.
+	 */
+	{
+		const unsigned int hclk = (1U<<5)|(1U<<6)|(1U<<7)|(1U<<8);
+		const unsigned int phy  = (1U<<5)|(1U<<6);
+
+		writel((hclk << 16) | hclk, (void *)0xff760150UL);  /* host hclks off */
+		writel((phy  << 16) | phy,  (void *)0xff760318UL);  /* phy refclks off */
+		dsb();
+	}
 }
 
 #else   /* host / non-arm64: plain delay (WFE-equivalent) */
 static void tw_idle_nap(unsigned int ms) { udelay(ms * 1000); }
 static void tw_set_cpu_408(void) { }
 static void tw_set_ddr_400(void) { }
-static void tw_gate_usb3(void) { }
+static void tw_gate_unused_domains(void) { }
 void tw_idle_stats(unsigned long *count, unsigned long *instant,
 		   unsigned long *slept_us)
 {
@@ -2021,7 +2106,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
 	tw_set_cpu_408();            /* A53 -> 408 MHz + 0.80 V OPP (cooler idle) */
 	tw_set_ddr_400();            /* DDR 928 -> 400 MHz (bl31 SIP; always-on draw) */
-	tw_gate_usb3();              /* power-gate unused USB3 domain (~14 mA, free) */
+	tw_gate_unused_domains();    /* gate GPU/codec/USB3/GMAC/TCPD + USB2 (~35 mA) */
 	/* Show the exception level in the startup line: the event-stream WFE idle
 	 * (low power) only engages at EL>=2. EL2 = good; EL1 would mean the idle
 	 * loop is busy-spinning and power-saving isn't active. See POWERSAVE.md. */

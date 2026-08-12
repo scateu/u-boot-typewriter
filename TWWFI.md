@@ -25,8 +25,15 @@ Every subcommand is one of two kinds. **Know which before you run it.**
 
 | Class | Meaning | Subcommands |
 |---|---|---|
-| **SAFE** | Reads only (or polls / self-restores, never sleeps). Cannot hang. Re-runnable freely. | `dump` (no arg, prints build tag), `pmu`, `cpuinfo`, `napstats`, `psci`, `litvolt`, `probe`, `spi`, `gpio` |
-| **MAY HANG** | Does a real WFI or powers off the running core. If a path is broken the prompt never returns — **power-cycle** to recover (you lose the shell, not an editing session). | `gate`, `coredown`, `keystroke`, `irq`, `ecwake`, `suspend`, `p`, `hp` |
+| **SAFE** | Reads only (or polls / self-restores, never sleeps). Cannot hang. Re-runnable freely. | `dump` (no arg, prints build tag), `pmu`, `cpuinfo`, `napstats`, `psci`, `litvolt`, `centervolt`, `gpurail`, `usb2`, `wfibench`, `probe`, `spi`, `gpio` |
+| **MAY HANG** | Does a real WFI, powers off the running core, or power-gates a domain. If a path is broken the prompt never returns — **power-cycle** to recover (you lose the shell, not an editing session). | `gate`, `gatesweep`, `coredown`, `keystroke`, `irq`, `ecwake`, `suspend`, `p`, `hp` |
+
+The **metering** commands (`wfibench`, `gpurail`, `centervolt`, `usb2`, and the
+self-metering `gate`/`gatesweep`) read the EC smart-battery current before/after
+a change and print the mA delta — so you can measure a power lever from inside
+the editor via `^V twwfi …` without a bench meter, then save the result to SD.
+Unplug AC first (the gauge must read *discharging* current for the delta to mean
+anything).
 
 The `keystroke`/`irq`/`ecwake` paths are the *working* WFI recipe (the same one
 the editor uses) and return normally; `p`/`hp`/`suspend`/`coredown` are broken or
@@ -47,7 +54,12 @@ twwfi cpuinfo         - CPU freq (CRU) + power-domain status + EC board current 
 twwfi napstats        - did the editor's idle WFI actually sleep or busy-spin? (SAFE)
 twwfi psci            - query PSCI version/features/affinity from EL2 (SAFE)
 twwfi litvolt [uV]    - lower A53 core rail ppvar_litcpu_pwm (def 800000), hold 10s, restore (SAFE)
-twwfi gate [N]        - power-gate editor-unused domain N (or all); MAY HANG
+twwfi centervolt [uV] - lower DDR/NoC centerlogic rail (def 900000), self-meter, restore (SAFE)
+twwfi gpurail         - disable Mali GPU rail, self-meter mA, restore (SAFE)
+twwfi usb2            - clock-gate USB2 host+phy (CRU), self-meter mA, restore (SAFE)
+twwfi wfibench [ms]   - A/B busy-spin vs deep WFI, self-meter both (SAFE, def 4000)
+twwfi gate [N]        - power-gate editor-unused domain N (or all); self-meters; MAY HANG
+twwfi gatesweep       - gate EACH domain alone, print per-domain mA table; MAY HANG
 twwfi coredown [ms]   - PMU auto-power-gate CPU0 on WFI + timer backstop; MAY HANG
 twwfi keystroke [ms]  - the editor's real idle-nap loop until a key (works)
 twwfi irq [ms]        - take a timer IRQ at EL2 + WFI (works)
@@ -203,18 +215,62 @@ omitted:
 Uses bl31's own sequence per domain: request the NoC bus idle
 (`PMU_BUS_IDLE_REQ` → wait `_ST` **and** `_ACK`), then power off (`PMU_PWRDN_CON`
 → wait `PMU_PWRDN_ST`). If a bus won't idle it **aborts that domain** (backs the
-request out) rather than forcing it — forcing is the wedge risk. Then it holds
-~15 s ("read the meter now"; press a key to end early) and **restores** in
-reverse. Gate **one at a time** to bisect which domain wedges (the last name
-printed before a hang is the culprit; power-cycle to recover).
+request out) rather than forcing it — forcing is the wedge risk. It **self-meters**
+(averages EC battery current before, and while gated ~8 s; press a key to end
+early), then **restores**, and prints the mA delta — no `^T` race needed. Gate
+**one at a time** to bisect which domain wedges (the last name printed before a
+hang is the culprit; power-cycle to recover).
 
-> Verified on gru/kevin: all ten gate + restore with no hang. But gating them at
-> editor startup gave **zero measured change** to idle drain — these domains are
-> powered-but-idle leakage. Kept as a bench tool only. See POWERSAVE.md.
+> **Measured on gru/kevin (SBS gauge, 2026-08):** gating **all ten together = ~23
+> mA**. Per-domain each is inside the ±15 mA noise floor (see `gatesweep`), so
+> they only add up as a group. Now **shipped** at editor startup
+> (`tw_gate_unused_domains()` in cmd_tw.c), plus a USB2 host clock-gate (~4 mA,
+> see `usb2`) — total ~27 mA. The earlier "zero change" was a %/hr-resolution
+> limit, not a true zero. See POWER_CURRENT.md.
+
+> **Excluded:** `SDIOAUDIO` (PD 31 / bus 29) **WEDGED** when gated and was removed
+> from the table. `TCPD0/TCPD1` (Type-C) have no bus-idle bit in bl31's enum, so
+> the handshake has no correct bit — never added.
 
 `bl31` normally does this during suspend with clocks quiesced; doing it live is
-what makes it risky. USB3 is only safe to gate when input is the built-in cros_ec
-keyboard (SPI) and storage is mmc/SD — **not** if booting/reading over USB.
+what makes it risky. Domains are only safe to gate because the editor uses none
+of them: input is the built-in cros_ec keyboard (SPI), storage is mmc/SD — gating
+USB3/USB2 would matter only if booting/reading over USB.
+
+### `twwfi gatesweep` — per-domain contribution
+
+Walks every gatable domain **individually**: meter baseline → gate that one alone
+(~4 s) → meter → restore → next, then prints a ranked per-domain mA table. Use it
+to see which domains actually carry the ~23 mA vs which are ~0. Same wedge risk as
+`gate` (one domain missing at a time); the last "gating …" line names a culprit if
+it hangs. On gru/kevin every domain read -6..+2 mA alone — all noise-floor, which
+is why they're gated as a group, not cherry-picked.
+
+## The metering commands (measure a lever from inside the editor)
+
+Each reads the EC smart battery (reg 0x0A via the I2C tunnel; signed mA) before
+and after a change, then restores and prints the delta. **Unplug AC first.**
+
+### `twwfi wfibench [ms]` — WFI on/off A/B (SAFE)
+Two phases at identical brightness/DDR/freq: busy-spin, then CNTP-woken deep WFI.
+Reports avg mA of each + the saving. Proved WFI saves only ~8–11 mA (noise) — the
+A53 rail doesn't gate on WFI. Disables the EC line (INTID 46) during the WFI
+phase so it can't hang when run from inside the editor. Default 4000 ms/phase.
+
+### `twwfi gpurail` — Mali GPU rail (SAFE)
+Tries `regulator_disable(ppvar_gpu_pwm)`, self-meters ~8 s, restores. On gru/kevin
+the DM **refuses** the disable (rail is always-on) → GPU not gateable this way.
+
+### `twwfi centervolt [uV]` — DDR/NoC centerlogic rail (SAFE)
+Lowers `ppvar_centerlogic_pwm` (default 0.90 V = Linux's DDR-400 point), self-
+meters, restores. Lower-only. Tested: U-Boot already runs it at 0.90 V, so it's at
+parity — no over-volt. (A defensive under-volt guard is in `tw_set_ddr_400`.)
+
+### `twwfi usb2` — USB2 host clock-gate (SAFE)
+USB2 is **not** a PMU power domain, so it's **clock-gated** via CRU
+(`HCLK_HOST0/1` in `clksel_con[20]` bits 5–8; `SCLK_USB2PHY0/1_REF` in
+`clkgate_con[6]` bits 5–6), the runtime-PM equivalent of what Linux does. Self-
+meters ~8 s, restores. ~4 mA on gru/kevin; now shipped at startup.
 
 ### `twwfi suspend [ms]` — PSCI CPU_SUSPEND
 
@@ -241,9 +297,17 @@ twwfi probe p         # (safe) does the CNTP IRQ reach the PE?
 twwfi irq             # (works) confirm a taken timer IRQ wakes WFI
 twwfi ecwake          # (works) confirm a keypress alone wakes WFI
 twwfi keystroke       # (works) run the editor's real idle nap
-# only if chasing peripheral power, one at a time, meter attached:
-twwfi gate 8          # gate USB3, hold 15 s, restore
+# measuring power levers (AC UNPLUGGED so the gauge reads discharge current):
+twwfi wfibench        # A/B WFI vs busy-spin (self-metered) -> WFI ~= 0
+twwfi gate            # gate all unused domains, self-metered  -> ~23 mA
+twwfi gatesweep       # per-domain breakdown
+twwfi usb2            # USB2 host clock-gate, self-metered      -> ~4 mA
 ```
+
+Because the gauge read prints into the editor buffer, the intended flow on the
+target (no copy/paste in U-Boot) is: `^V twwfi <cmd>` → the mA result lands in
+the buffer → `^S` to SD → move the card to read it. That is exactly what `^V`
+(`CONFIG_CONSOLE_RECORD`) exists for.
 
 ## Provenance
 

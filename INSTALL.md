@@ -94,15 +94,30 @@ Add (or confirm) these lines there:
 CONFIG_CMD_TYPEWRITER=y
 CONFIG_VIDEO=y
 CONFIG_FS_FAT=y
+
+# Required for the ^V "run command, insert output" feature (see README).
+# ^V captures a U-Boot command's console output into the editor buffer; that
+# capture needs the console recorder. Without these two, ^V still runs the
+# command but inserts nothing (falls back to a status message).
+CONFIG_CONSOLE_RECORD=y
+CONFIG_CONSOLE_RECORD_OUT_SIZE=0x20000
 ```
 (`VIDEO` is needed because typewriter draws to the framebuffer — U-Boot's
-console font is ASCII-only and can't show hanzi. `FS_FAT` for the FAT card.)
+console font is ASCII-only and can't show hanzi. `FS_FAT` for the FAT card.
+`CONSOLE_RECORD` backs `^V`; `0x20000` = 128 KiB is plenty for command output.)
+
+The power tooling (`twwfi`, and the editor's DDR/CPU/domain power-saving at
+startup) uses the DM regulator, PSCI firmware, and cros-ec drivers — on the
+gru/kevin defconfig these are already enabled (`CONFIG_DM_REGULATOR`,
+`CONFIG_PWM_REGULATOR`, `CONFIG_CROS_EC`, `CONFIG_SYSRESET`), so no extra config
+is normally needed. See TWWFI.md and POWER_CURRENT.md for what each lever does.
 
 For a quick one-off test you can instead edit the live config after a
 configure step:
 ```sh
 cd $LB/src/u-boot/default
-./scripts/config -e CMD_TYPEWRITER -e VIDEO -e FS_FAT
+./scripts/config -e CMD_TYPEWRITER -e VIDEO -e FS_FAT \
+                 -e CONSOLE_RECORD --set-val CONSOLE_RECORD_OUT_SIZE 0x20000
 make olddefconfig
 grep CMD_TYPEWRITER .config      # -> CONFIG_CMD_TYPEWRITER=y
 ```
