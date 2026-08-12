@@ -44,6 +44,7 @@ int tw_file_load(struct tw_state *s, const char *path);
 int tw_file_save(struct tw_state *s);
 int tw_list_files(struct tw_state *s);
 int tw_fs_unlink_name(struct tw_state *s, const char *name);
+int tw_fs_copy_name(struct tw_state *s, const char *oldn, const char *newn);
 
 /* --- from cmd_tw_video.c --- */
 int  tw_video_init(struct tw_state *s);
@@ -1715,12 +1716,21 @@ static void tw_prompt_key(struct tw_state *s, int key)
 			tw_status(s, "[ Cancelled ]");
 			break;
 		/* Pine/alpine-style file ops. Bare letters (the picker isn't a
-		 * text-entry mode): n=New, d=Delete. (No rename: this U-Boot's fs
-		 * layer has no fs_rename, and FAT has no rename primitive here.) */
+		 * text-entry mode): n=New, r=Rename, d=Delete. Rename is copy+delete
+		 * (this U-Boot has no fs_rename). */
 		case 'n': case 'N':
 			s->prompt = TW_PROMPT_NEW;
 			s->prompt_ans[0] = '\0';
 			s->prompt_len = 0;
+			s->dirty_hints = 1;
+			break;
+		case 'r': case 'R':
+			/* prefill with the selected name so the user edits it */
+			strncpy(s->prompt_ans, s->pick_name[s->pick_sel],
+				TW_CMD_BUF - 1);
+			s->prompt_ans[TW_CMD_BUF - 1] = '\0';
+			s->prompt_len = strlen(s->prompt_ans);
+			s->prompt = TW_PROMPT_RENAME;
 			s->dirty_hints = 1;
 			break;
 		case 'd': case 'D':
@@ -1824,13 +1834,55 @@ static void tw_prompt_key(struct tw_state *s, int key)
 			} else {
 				s->prompt = TW_PROMPT_PICK;   /* empty: back to list */
 			}
+		} else if (which == TW_PROMPT_RENAME) {
+			char oldn[TW_PICK_NAMELEN];
+			int i, exists = 0;
+
+			s->dirty_hints = 1;
+			s->prompt = TW_PROMPT_PICK;
+			strncpy(oldn, s->pick_name[s->pick_sel], sizeof(oldn) - 1);
+			oldn[sizeof(oldn) - 1] = '\0';
+
+			if (!s->prompt_ans[0] || !strcmp(oldn, s->prompt_ans)) {
+				/* no change */
+			} else {
+				/* refuse to clobber an existing file in the list */
+				for (i = 0; i < s->pick_count; i++)
+					if (!strcmp(s->pick_name[i], s->prompt_ans))
+						exists = 1;
+				if (exists) {
+					tw_status(s, "[ %s already exists ]",
+						  s->prompt_ans);
+				} else if (tw_fs_copy_name(s, oldn,
+							   s->prompt_ans) != 0) {
+					tw_status(s, "[ Rename failed (copy) ]");
+				} else if (tw_fs_unlink_name(s, oldn) != 0) {
+					/* copy made it; old delete failed -> both
+					 * exist. Report honestly rather than lie. */
+					tw_list_files(s);
+					tw_status(s, "[ Copied to %s; old %s remains ]",
+						  s->prompt_ans, oldn);
+				} else {
+					/* if we renamed the file we're editing,
+					 * follow it so ^S still writes the buffer. */
+					if (!strcmp(s->filename, oldn)) {
+						strncpy(s->filename, s->prompt_ans,
+							TW_MAX_FILENAME - 1);
+						s->filename[TW_MAX_FILENAME-1] = '\0';
+						s->dirty_title = 1;
+					}
+					tw_list_files(s);
+					tw_status(s, "[ Renamed to %s ]",
+						  s->prompt_ans);
+				}
+			}
 		}
 		return;
 	}
 	if (key == KEY_ESC) {
-		/* From New, Esc returns to the picker if there's a list to return
-		 * to; otherwise (empty dir) back to the editor. */
-		if (s->prompt == TW_PROMPT_NEW) {
+		/* From New/Rename, Esc returns to the picker if there's a list to
+		 * return to; otherwise (empty dir) back to the editor. */
+		if (s->prompt == TW_PROMPT_NEW || s->prompt == TW_PROMPT_RENAME) {
 			s->prompt = (s->pick_count > 0) ? TW_PROMPT_PICK
 						        : TW_PROMPT_NONE;
 			s->dirty_hints = 1;

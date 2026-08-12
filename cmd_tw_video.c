@@ -598,6 +598,7 @@ static void draw_bar(struct tw_state *s)
 			s->prompt == TW_PROMPT_SEARCH ? " Search: " :
 			s->prompt == TW_PROMPT_SHELL  ? " Run cmd (output inserted): !" :
 			s->prompt == TW_PROMPT_NEW    ? " New file name: " :
+			s->prompt == TW_PROMPT_RENAME ? " Rename to: " :
 			" Save modified buffer?  Y)es  N)o  C)ancel ";
 		x = draw_str(0, s->bar_y, label, C_BARTX, C_BAR);
 		x = draw_str(x, s->bar_y, s->prompt_ans, C_BARTX, C_BAR);
@@ -698,8 +699,8 @@ static void draw_hint_rows(struct tw_state *s, const struct hint *row1,
 }
 
 /*
- * Context-aware bottom hint bar. In the ^R file picker (and its New/Delete
- * sub-prompts) the editing chords (Save/Wubi/Run cmd/...) don't apply, so
+ * Context-aware bottom hint bar. In the ^R file picker (and its New/Rename/
+ * Delete sub-prompts) the editing chords (Save/Wubi/Run cmd/...) don't apply, so
  * we swap the whole bar for a picker-specific set, Pine/alpine style. Otherwise
  * the normal editing bar. Redrawn whenever s->dirty_hints is set (picker enter/
  * exit); the static editing bar is otherwise painted once on first_paint.
@@ -718,8 +719,8 @@ static void draw_hints(struct tw_state *s)
 	};
 	/* Picker bar: only what works in the file browser. */
 	static const struct hint pick1[TW_HINT_COLS] = {
-		{"Enter", "Open"}, {"n", "New"},    {"d", "Delete"},
-		{NULL, NULL},      {NULL, NULL},    {NULL, NULL}, {NULL, NULL},
+		{"Enter", "Open"}, {"n", "New"},    {"r", "Rename"},
+		{"d", "Delete"},   {NULL, NULL},    {NULL, NULL}, {NULL, NULL},
 	};
 	static const struct hint pick2[TW_HINT_COLS] = {
 		{"\x18\x19", "Move"}, {"^P/^N", "Move"}, {"Esc", "Cancel"},
@@ -727,6 +728,7 @@ static void draw_hints(struct tw_state *s)
 	};
 	int in_picker = (s->prompt == TW_PROMPT_PICK ||
 			 s->prompt == TW_PROMPT_NEW ||
+			 s->prompt == TW_PROMPT_RENAME ||
 			 s->prompt == TW_PROMPT_PICKDEL);
 
 	if (in_picker)
@@ -809,10 +811,10 @@ void tw_render(struct tw_state *s)
 	}
 
 	/* The ^R picker takes over the text area with its file list. Its New/
-	 * Delete sub-prompts keep the list visible underneath (the prompt shows
-	 * in the bar), so draw the picker for the whole family. */
+	 * Rename/Delete sub-prompts keep the list visible underneath (the prompt
+	 * shows in the bar), so draw the picker for the whole family. */
 	if (s->prompt == TW_PROMPT_PICK || s->prompt == TW_PROMPT_NEW ||
-	    s->prompt == TW_PROMPT_PICKDEL) {
+	    s->prompt == TW_PROMPT_RENAME || s->prompt == TW_PROMPT_PICKDEL) {
 		draw_picker(s);
 		s->dirty_all = 1;    /* force a text repaint when the picker exits */
 	} else {

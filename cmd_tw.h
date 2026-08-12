@@ -168,6 +168,7 @@ struct tw_fs {
 #define TW_PROMPT_POWEROFF 6     /* ^Q: "Save & power off? (Y/N)" */
 #define TW_PROMPT_SHELL  7       /* ^V: "!cmd:" run U-Boot cmd, insert output */
 #define TW_PROMPT_NEW    8       /* picker 'n': "New file name: " */
+#define TW_PROMPT_RENAME 9       /* picker 'r': "Rename <x> to: " (copy+del) */
 #define TW_PROMPT_PICKDEL 10     /* picker 'd': "Delete <x>? (y/N)" confirm */
 
 /* Sentinel for tw_read_battery(): distinct from a real negative errno so the

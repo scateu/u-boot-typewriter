@@ -45,7 +45,7 @@ unsigned long invoke_psci_fn(unsigned long, unsigned long, unsigned long,
 
 /* Bump on every twwfi change so `twwfi` (no arg) proves the flashed binary is
  * current - a stale reflash was confounding suspend-hang diagnosis. */
-#define TW_BUILD_TAG "picker-newdel-26"
+#define TW_BUILD_TAG "picker-rename-27"
 
 /* From cmd_tw.c: EC charge state (battery %, board charge current mA, on-AC).
  * Returns 0 on success, <0 on error/no-EC. This is BOARD current, not CPU. */

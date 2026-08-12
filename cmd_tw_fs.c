@@ -138,6 +138,54 @@ int tw_fs_unlink_name(struct tw_state *s, const char *name)
 	return fs_unlink(path);
 }
 
+/*
+ * Copy oldn -> newn in the root of the current device (raw byte copy, used to
+ * implement Rename as copy+delete since this U-Boot has no fs_rename). Reads the
+ * whole old file into a malloc'd buffer, writes it out under the new name. Does
+ * NOT touch the editor buffer, so it's safe regardless of what's being edited.
+ * Uses bare names (no leading '/'), matching tw_file_load/save. Re-asserts the
+ * device before each fs op (each clears the active blk dev). Same tight-buffer
+ * heap hygiene as load/save (a big outstanding alloc across the FAT writer can
+ * corrupt the on-disk directory). Returns 0 ok, nonzero on failure.
+ */
+int tw_fs_copy_name(struct tw_state *s, const char *oldn, const char *newn)
+{
+	loff_t fsize = 0, got = 0, wrote = 0;
+	char  *buf;
+	ulong  addr;
+	int    ret;
+
+	if (!oldn || !oldn[0] || !newn || !newn[0])
+		return -1;
+
+	if (tw_fs_set(&s->fs) != 0)
+		return -1;
+	ret = fs_size(oldn, &fsize);
+	if (ret < 0)
+		return -1;
+	if (fsize > TW_FILE_BUF_SIZE)
+		fsize = TW_FILE_BUF_SIZE;
+
+	/* Zero-length file: write an empty file under the new name. */
+	buf = malloc((size_t)fsize + 1);
+	if (!buf)
+		return -1;
+	addr = map_to_sysmem(buf);
+
+	if (fsize > 0) {
+		if (tw_fs_set(&s->fs) != 0) { free(buf); return -1; }
+		ret = fs_read(oldn, addr, 0, fsize, &got);
+		if (ret < 0 || got != fsize) { free(buf); return -1; }
+	}
+
+	if (tw_fs_set(&s->fs) != 0) { free(buf); return -1; }
+	ret = fs_write(newn, addr, 0, fsize, &wrote);
+	free(buf);
+	if (ret < 0 || wrote != fsize)
+		return -1;
+	return 0;
+}
+
 
 /* Decode one UTF-8 codepoint from s (len bytes available). Returns bytes
  * consumed and sets *cp. Malformed input consumes 1 byte and yields U+FFFD. */
