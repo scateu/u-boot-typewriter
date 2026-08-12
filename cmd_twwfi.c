@@ -45,7 +45,7 @@ unsigned long invoke_psci_fn(unsigned long, unsigned long, unsigned long,
 
 /* Bump on every twwfi change so `twwfi` (no arg) proves the flashed binary is
  * current - a stale reflash was confounding suspend-hang diagnosis. */
-#define TW_BUILD_TAG "sbs-ctrl-t-10"
+#define TW_BUILD_TAG "gpurail-15"
 
 /* From cmd_tw.c: EC charge state (battery %, board charge current mA, on-AC).
  * Returns 0 on success, <0 on error/no-EC. This is BOARD current, not CPU. */
@@ -76,6 +76,7 @@ void tw_idle_stats(unsigned long *count, unsigned long *instant,
 #define TW_GICD_CTLR         (TW_GICD_BASE + 0x0000)
 #define TW_GICD_IGROUPR      (TW_GICD_BASE + 0x0080)
 #define TW_GICD_ISENABLER    (TW_GICD_BASE + 0x0100)
+#define TW_GICD_ICENABLER    (TW_GICD_BASE + 0x0180)   /* 1 bit/INTID, clear-enable */
 #define TW_GICD_IPRIORITYR   (TW_GICD_BASE + 0x0400)
 #define TW_GICD_IROUTER      (TW_GICD_BASE + 0x6000)   /* 64-bit/INTID, affinity route */
 #define TW_GICD_IGRPMODR     (TW_GICD_BASE + 0x0D00)
@@ -1348,10 +1349,32 @@ static void gate_on(const struct gate_dom *d)
  * Gate one at a time to bisect which domain hangs. USB safe here (built-in kbd
  * + mmc). If the prompt does not return after "holding", that domain froze it.
  */
+/*
+ * Average the smart-battery current over `n` samples spaced ~`gap_ms` apart
+ * (the SBS gauge updates ~1 Hz, so gap >= 1000 ms gets independent readings).
+ * Returns mA in *out and the number of good samples; 0 samples => read failed.
+ */
+static int gate_avg_ma(int n, unsigned int gap_ms, int *out)
+{
+	long sum = 0;
+	int got = 0, k, ma;
+
+	for (k = 0; k < n; k++) {
+		if (tw_read_batt_current(&ma) == 0) {
+			sum += ma;
+			got++;
+		}
+		if (k + 1 < n)
+			udelay(gap_ms * 1000);
+	}
+	*out = got ? (int)(sum / got) : 0;
+	return got;
+}
+
 static int do_gate(int idx)
 {
 	int lo = 0, hi = ARRAY_SIZE(gate_doms), i, off_ok = 0;
-	unsigned long t;
+	int base_ma = 0, gated_ma = 0, base_n, gated_n;
 
 	if (idx >= 0) {
 		if (idx >= (int)ARRAY_SIZE(gate_doms)) {
@@ -1369,18 +1392,34 @@ static int do_gate(int idx)
 	printf("If the prompt does NOT return, the domain being gated wedged the SoC"
 	       " - power-cycle.\n");
 
+	/* Baseline current BEFORE gating (5 samples, ~1 s apart, ~5 s). */
+	base_n = gate_avg_ma(5, 1000, &base_ma);
+
 	for (i = lo; i < hi; i++)
 		if (!gate_off(&gate_doms[i]))
 			off_ok++;
 
 	printf("PWRDN_ST after  = 0x%08x  (%d domain(s) gated off)\n",
 	       readl((void *)PMU_PWRDN_ST), off_ok);
-	printf(">>> Holding ~15 s - READ THE POWER METER NOW. Press a key to end"
-	       " early.\n");
+	printf(">>> Gated - sampling current for ~8 s (self-metering, no ^T needed)."
+	       " Press a key to end early.\n");
 
-	t = rd_cntpct() + rd_cntfrq() * 15;
-	while (rd_cntpct() < t && !tstc())
-		udelay(1000);
+	/* Current WHILE gated (8 samples, ~1 s apart). tstc between samples so a
+	 * keypress can still cut it short. */
+	{
+		long sum = 0;
+		int got = 0, k, ma;
+
+		for (k = 0; k < 8 && !tstc(); k++) {
+			if (tw_read_batt_current(&ma) == 0) {
+				sum += ma;
+				got++;
+			}
+			udelay(1000 * 1000);
+		}
+		gated_n = got;
+		gated_ma = got ? (int)(sum / got) : 0;
+	}
 	if (tstc())
 		(void)getchar();
 
@@ -1389,8 +1428,25 @@ static int do_gate(int idx)
 		gate_on(&gate_doms[i]);
 
 	printf("PWRDN_ST restored = 0x%08x\n", readl((void *)PMU_PWRDN_ST));
-	printf("=> Compare the meter delta while gated. If a domain froze the board,"
-	       " it's the last one printed before the hang.\n");
+
+	/* Self-reported delta - the whole point, so no live ^T race is needed. */
+	printf("--- gate power delta (smart battery, whole-board) ---\n");
+	if (!base_n || !gated_n) {
+		printf("  SBS read failed (before=%d during=%d samples). On AC? tunnel down?\n",
+		       base_n, gated_n);
+	} else {
+		int d = base_ma - gated_ma;   /* both negative; less negative gated => saved */
+
+		printf("  before gate : %d mA  (%d samples)\n", base_ma, base_n);
+		printf("  while gated : %d mA  (%d samples)\n", gated_ma, gated_n);
+		printf("  saved       : %d mA%s\n", d < 0 ? -d : d,
+		       (d < 15 && d > -15)
+			       ? "  (< noise floor ~15 mA - effectively none)"
+			       : "");
+		printf("  (negative = discharging; verify AC unplugged)\n");
+	}
+	printf("=> If a domain froze the board, it's the last one printed before the"
+	       " hang.\n");
 	return 0;
 }
 
@@ -1686,6 +1742,150 @@ static int do_cpuinfo(void)
 }
 
 /*
+ * WFI on/off A/B power bench. Runs two ~equal-length phases at the SAME
+ * brightness/DDR/freq (the only variable is WFI vs busy-spin) and reports the
+ * average smart-battery current in each, so `busy - wfi` is the pure cost of
+ * NOT sleeping the core.
+ *
+ *   Phase BUSY: tight CNTPCT spin loop, core never idles.
+ *   Phase WFI : repeated (arm CNTP timer + take IRQ at EL2 + WFI) slices - the
+ *               exact idiom `twwfi irq`/the editor idle nap uses (HCR_EL2.IMO=1
+ *               + our vector table + CNTP as the wake source).
+ *
+ * Each phase samples SBS current (reg 0x0A via EC tunnel) a few times and
+ * averages. The gauge updates ~1 Hz and is noisy (+-10..20 mA), so a delta
+ * below ~15 mA is in the noise - reported honestly. The current read itself
+ * runs the core briefly in BOTH phases (identical overhead), so it does not
+ * bias the comparison. No timer-less/blind WFI here: every WFI is CNTP-armed,
+ * so this cannot hang.
+ */
+static int wfibench_sample_ma(long *accum, int *n)
+{
+	int ma;
+
+	if (tw_read_batt_current(&ma) == 0) {
+		*accum += ma;
+		(*n)++;
+		return ma;
+	}
+	return 0;
+}
+
+static int do_wfibench(unsigned int ms)
+{
+	unsigned long rate = rd_cntfrq();
+	unsigned long slice_ticks = (rate / 1000) * 250;  /* 250 ms per WFI slice */
+	unsigned long phase_ticks;                        /* per-phase wall time */
+	unsigned long vbar_save, hcr_save, tend;
+	long busy_sum = 0, wfi_sum = 0;
+	int busy_n = 0, wfi_n = 0;
+
+	if (ms < 1000)
+		ms = 1000;
+	phase_ticks = (rate / 1000) * ms;
+
+	printf("WFI on/off bench: two %u ms phases, same brightness/DDR/freq.\n", ms);
+	printf("Unplug AC (need discharging current). Keep the screen static.\n");
+
+	/* ---- Phase BUSY: spin the core, never idle, sample current ---- */
+	tend = rd_cntpct() + phase_ticks;
+	{
+		unsigned long next = rd_cntpct() + slice_ticks;
+
+		while (rd_cntpct() < tend) {
+			if (rd_cntpct() >= next) {
+				wfibench_sample_ma(&busy_sum, &busy_n);
+				next = rd_cntpct() + slice_ticks;
+			}
+			/* burn cycles - no WFI */
+		}
+	}
+
+	/* ---- Phase WFI: CNTP-timed IRQ-woken WFI slices, sample between ---- */
+	/* GIC + IMO + vector setup, exactly like do_irq_wfi. */
+	setbits_le32((void *)TW_GICD_CTLR, (1U << 1));   /* EnableGrp1NS */
+	dsb();
+	writel(1U << 30, (void *)GICR_ISENABLER0);       /* INTID 30 = CNTP PPI */
+	dsb();
+	asm volatile("msr " STR(ICC_PMR_EL1) ", %0" : : "r" (0xffUL));
+	asm volatile("msr " STR(ICC_IGRPEN1_EL1) ", %0" : : "r" (1UL));
+	isb();
+	asm volatile("mrs %0, vbar_el2" : "=r" (vbar_save));
+	asm volatile("mrs %0, hcr_el2"  : "=r" (hcr_save));
+	asm volatile("msr vbar_el2, %0" : : "r" ((unsigned long)tw_irq_vectors));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save | (1UL << 4)));
+	isb();
+
+	/*
+	 * CRITICAL when run from INSIDE the editor: the editor leaves the EC line
+	 * (INTID 46) enabled in the distributor so its idle-nap can wake on a key.
+	 * Our vector table here only acks the CNTP timer, NOT INTID 46 - so a live
+	 * EC assert would fire into a handler that never EOIs it and we'd hang (the
+	 * "hangs after Keep the screen static" symptom). DISABLE INTID 46 for the
+	 * WFI phase (CNTP timer is our only wake source), then RE-ENABLE it after so
+	 * the editor's key wake keeps working. From the raw shell 46 is off anyway,
+	 * so this is a harmless no-op there.
+	 */
+	{
+		unsigned int w = EC_GPIO_INTID / 32, b = EC_GPIO_INTID % 32;
+
+		writel(1U << b, (void *)(TW_GICD_ICENABLER + w * 4));  /* disable 46 */
+		dsb();
+	}
+
+	tend = rd_cntpct() + phase_ticks;
+	while (rd_cntpct() < tend) {
+		/* Arm CNTP for one slice, take IRQs, WFI until it fires. */
+		asm volatile("msr cntp_tval_el0, %0" : : "r" (slice_ticks));
+		asm volatile("msr cntp_ctl_el0, %0" : : "r" (1UL));
+		isb();
+		asm volatile("msr daifclr, #2");
+		wfi();
+		asm volatile("msr daifset, #2");
+		asm volatile("msr cntp_ctl_el0, %0" : : "r" (0UL));
+		isb();
+		/* core is awake here - sample (same read overhead as busy phase) */
+		wfibench_sample_ma(&wfi_sum, &wfi_n);
+	}
+
+	/* Re-enable INTID 46 + clear any pending, so the editor's key/lid/power
+	 * wake path is exactly as it was before the bench. */
+	{
+		unsigned int w = EC_GPIO_INTID / 32, b = EC_GPIO_INTID % 32;
+
+		writel(1U << b, (void *)(TW_GICD_ICPENDR + w * 4));
+		writel(1U << b, (void *)(TW_GICD_ISENABLER + w * 4)); /* re-enable 46 */
+		dsb();
+	}
+
+	/* Restore VBAR/HCR. */
+	asm volatile("msr vbar_el2, %0" : : "r" (vbar_save));
+	asm volatile("msr hcr_el2, %0"  : : "r" (hcr_save));
+	isb();
+
+	{
+		int busy = busy_n ? (int)(busy_sum / busy_n) : 0;
+		int wfi  = wfi_n  ? (int)(wfi_sum  / wfi_n)  : 0;
+		int delta = busy - wfi;   /* both negative; busy more negative => delta<0 */
+
+		printf("--- WFI on/off bench (smart-battery, whole-board) ---\n");
+		if (!busy_n || !wfi_n) {
+			printf("  SBS read failed (busy=%d wfi=%d samples). On AC? tunnel down?\n",
+			       busy_n, wfi_n);
+			return 1;
+		}
+		printf("  busy-spin : %d mA  (%d samples)\n", busy, busy_n);
+		printf("  deep WFI  : %d mA  (%d samples)\n", wfi, wfi_n);
+		printf("  WFI saves : %d mA%s\n", delta < 0 ? -delta : delta,
+		       (delta < 15 && delta > -15)
+			       ? "  (< noise floor ~15 mA - effectively none)"
+			       : "");
+		printf("  (negative currents = discharging; verify AC unplugged)\n");
+	}
+	return 0;
+}
+
+/*
  * Lower the A53 little-cluster core voltage (ppvar_litcpu_pwm) to match the 408
  * MHz OPP. Found via the live Linux board: at 408 MHz Linux DVFS runs it at
  * 0.80 V, but U-Boot leaves it at 0.90 V (the ~1008 MHz OPP voltage) - the
@@ -1740,6 +1940,89 @@ static int do_litvolt(unsigned int target_uv)
 	return 0;
 }
 
+/*
+ * BENCH: disable the Mali GPU rail (ppvar_gpu / ppvar_gpu_pwm) and self-meter
+ * the battery-current delta, then RESTORE. A framebuffer text editor never
+ * touches the GPU, yet the rail sits enabled ~0.85 V. We already saw the GPU
+ * PMU *domain* gate (twwfi gate 0) do ~nothing, but the external PMIC buck can
+ * keep supplying the rail even with the domain gated - so disabling the
+ * REGULATOR is a different, deeper test. If it saves >15 mA it's worth shipping
+ * at startup (like tw_gate_usb3); if it's noise, the rail hunt is exhausted.
+ *
+ * Safe: nothing in the editor uses the GPU, and we restore the rail after ~8 s
+ * (or a keypress). Tries ppvar_gpu_pwm first (the controllable buck), then the
+ * plain ppvar_gpu name - whichever the DM exposes.
+ */
+static int do_gpurail(void)
+{
+	struct udevice *reg = NULL;
+	const char *name = NULL;
+	int base_ma = 0, off_ma = 0, base_n = 0, off_n = 0, ret;
+	long sum; int got, k, ma;
+
+	if (!regulator_get_by_platname("ppvar_gpu_pwm", &reg) && reg)
+		name = "ppvar_gpu_pwm";
+	else if (!regulator_get_by_platname("ppvar_gpu", &reg) && reg)
+		name = "ppvar_gpu";
+	else {
+		printf("GPU regulator (ppvar_gpu[_pwm]) not found in DM.\n");
+		return 1;
+	}
+	printf("GPU rail = %s, now %d uV. Metering baseline (~5 s)...\n",
+	       name, regulator_get_value(reg));
+
+	/* baseline current, 5 samples ~1 s apart */
+	sum = 0; got = 0;
+	for (k = 0; k < 5; k++) {
+		if (tw_read_batt_current(&ma) == 0) { sum += ma; got++; }
+		if (k + 1 < 5) udelay(1000 * 1000);
+	}
+	base_n = got; base_ma = got ? (int)(sum / got) : 0;
+
+	ret = regulator_set_enable(reg, false);
+	printf("disable %s ret=%d. Metering gated (~8 s, key ends early)...\n",
+	       name, ret);
+	if (ret) {
+		printf("regulator refused disable (ret=%d) - likely always-on or has\n"
+		       "   other consumers. Nothing gated; done.\n", ret);
+		return 0;
+	}
+
+	/* current while disabled, 8 samples ~1 s apart */
+	sum = 0; got = 0;
+	for (k = 0; k < 8 && !tstc(); k++) {
+		if (tw_read_batt_current(&ma) == 0) { sum += ma; got++; }
+		udelay(1000 * 1000);
+	}
+	off_n = got; off_ma = got ? (int)(sum / got) : 0;
+	if (tstc())
+		(void)getchar();
+
+	/* ALWAYS restore the rail. */
+	ret = regulator_set_enable(reg, true);
+	printf("re-enabled %s ret=%d, now %d uV.\n", name, ret,
+	       regulator_get_value(reg));
+
+	printf("--- GPU rail power delta (smart battery, whole-board) ---\n");
+	if (!base_n || !off_n) {
+		printf("  SBS read failed (before=%d during=%d). On AC? tunnel down?\n",
+		       base_n, off_n);
+		return 1;
+	}
+	{
+		int d = base_ma - off_ma;   /* less negative when off => saved */
+
+		printf("  rail on  : %d mA  (%d samples)\n", base_ma, base_n);
+		printf("  rail off : %d mA  (%d samples)\n", off_ma, off_n);
+		printf("  saved    : %d mA%s\n", d < 0 ? -d : d,
+		       (d < 15 && d > -15)
+			       ? "  (< noise floor ~15 mA - not worth shipping)"
+			       : "  (>15 mA - worth gating at startup)");
+		printf("  (negative = discharging; verify AC unplugged)\n");
+	}
+	return 0;
+}
+
 static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		    char *const argv[])
 {
@@ -1783,6 +2066,11 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		return do_irq_wfi(ms);
 	if (!strcmp(argv[1], "coredown"))
 		return do_coredown(ms);   /* power-gate CPU0 on WFI (timer-backstopped) */
+	if (!strcmp(argv[1], "wfibench"))
+		return do_wfibench(argc >= 3 ? simple_strtoul(argv[2], NULL, 10)
+					     : 4000);  /* per-phase ms; A/B WFI power */
+	if (!strcmp(argv[1], "gpurail"))
+		return do_gpurail();      /* disable Mali GPU rail, self-meter, restore */
 	if (!strcmp(argv[1], "cpuall"))
 		return do_cpuall();       /* CPU_ON each secondary -> self CPU_OFF */
 	if (!strcmp(argv[1], "ddr"))
@@ -1808,7 +2096,7 @@ static int do_twwfi(struct cmd_tbl *cmdtp, int flag, int argc,
 		return do_wfi_test(0, ms);
 
 	printf("usage: twwfi [pmu|cpuinfo|napstats|psci|litvolt|ddr|gate|coredown|cpuall"
-	       "|keystroke|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV|MHz]\n");
+	       "|keystroke|wfibench|gpurail|irq|ecwake|suspend|probe|gpio|spi|p|hp] [ms|N|uV|MHz]\n");
 	return CMD_RET_USAGE;
 }
 
@@ -1834,6 +2122,11 @@ U_BOOT_CMD(
 	"                     this is what the editor's idle nap does.\n"
 	"twwfi coredown [ms]- RISKY: PMU auto-power-gate CPU0 on WFI (CORE_PM_CON0=0x3)\n"
 	"                     + CNTP backstop. Returns => core gates+wakes (cooler idle).\n"
+	"twwfi wfibench [ms]- SAFE: A/B the cost of WFI. Two phases (busy-spin vs\n"
+	"                     CNTP-woken deep WFI), same brightness/DDR; reports avg\n"
+	"                     battery mA of each + the saving. Unplug AC first. (def 4000)\n"
+	"twwfi gpurail      - SAFE: disable Mali GPU rail (ppvar_gpu), self-meter mA\n"
+	"                     delta ~8 s, then restore. Editor never uses the GPU.\n"
 	"twwfi cpuall       - RISKY: PSCI CPU_ON each secondary core -> self CPU_OFF stub\n"
 	"                     (explicitly park all 5; pmu says already off, expect no-op).\n"
 	"twwfi ecwake       - EC GPIO (INTID 46) as WFI wake IRQ, NO timer. Press a\n"
@@ -1844,6 +2137,6 @@ U_BOOT_CMD(
 	"twwfi spi [n]      - SAFE: read an SPI's group/prio in GICD (default 46)\n"
 	"twwfi gpio         - SAFE: EC GPIO IRQ (INTID 46) poll ~5 s, press keys\n"
 	"twwfi p|hp [ms]    - arm CNTP/CNTHP + one raw WFI (hangs - no IMO/handler)\n"
-	"  pmu/cpuinfo/napstats/psci/litvolt/probe/spi/gpio/dump + `ddr`(no arg) never hang.\n"
+	"  pmu/cpuinfo/napstats/psci/litvolt/probe/spi/gpio/wfibench/gpurail/dump + `ddr`(no arg) never hang.\n"
 	"  gate/coredown/cpuall/suspend/p/hp + `ddr <MHz>` may - power-cycle if so."
 );

@@ -37,9 +37,11 @@
 
 /* Panel backlight (see cmd_tw_video.c). It comes up full-bright on gru/kevin,
  * which dominates idle power; default lower and step it with ^- / ^=. */
-#define TW_BACKLIGHT_DEFAULT 40      /* percent set on startup */
-#define TW_BACKLIGHT_STEP    20      /* percent per ^- / ^= press */
-#define TW_BACKLIGHT_MIN     20      /* never dim below this - 0/OFF freezes it */
+#define TW_BACKLIGHT_DEFAULT 35      /* percent set on startup */
+#define TW_BACKLIGHT_STEP    5       /* percent per ^- / ^= press */
+#define TW_BACKLIGHT_MIN     5       /* never dim below this - 0/OFF freezes it
+				      * (a low NONZERO % is safe; only literal
+				      * 0/BACKLIGHT_OFF froze the panel/PWM). */
 
 /* File I/O scratch is malloc()'d at runtime (see cmd_tw_fs.c) - NOT staged at
  * a fixed CONFIG_SYS_LOAD_ADDR, which on this board overlaps U-Boot's own DRAM

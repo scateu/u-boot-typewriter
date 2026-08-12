@@ -667,7 +667,7 @@ static void draw_hints(struct tw_state *s)
 	static const struct hint row2[TW_HINT_COLS] = {
 		{"^X", "Exit"},  {"^R", "Open"},       {"^P/^N", "prev/next"},
 		{"^D", "Del"},   {"^-/^]", "Bright"},  {"^Q", "PowerOff"},
-		{"", ""},        /* 7th slot: ^T is in row1; leave this blank */
+		{"^V", "Run cmd"},  /* 7th slot: directly below ^T Battery */
 	};
 	const struct hint *rows[2] = { row1, row2 };
 	int r, c;

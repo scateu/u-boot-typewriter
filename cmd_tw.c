@@ -379,10 +379,62 @@ static void tw_set_ddr_400(void)
 	(void)got;
 }
 
+/*
+ * Power-gate the USB3 domain (DWC3/xHCI controller + USB3 PHY) - the editor
+ * never uses USB3 (its keyboard is the ChromeOS EC, not USB), yet U-Boot leaves
+ * the domain powered. Measured (twwfi gate 8): a consistent ~14 mA saving,
+ * present with OR without a USB device attached - i.e. this reclaims the
+ * controller/PHY domain itself, NOT any attached device's VBUS (that VBUS rides
+ * on top and is not a PMU domain). Small but free and always-on.
+ *
+ * Sequence is bl31's pmu_set_power_domain (ATF pmu.c): request the NoC bus idle,
+ * wait for BUS_IDLE_ST+ACK, then set PWRDN_CON and wait for PWRDN_ST. If the bus
+ * won't idle (something mid-transaction) we ABORT and back out cleanly - never
+ * force it - so this can only ever be a no-op, never a startup wedge. USB3 =
+ * PWRDN/CON bit 27, bus-idle bit 12 (from the gate_doms table in cmd_twwfi.c).
+ */
+static void tw_gate_usb3(void)
+{
+	const unsigned long PMU = 0xff310000UL;
+	void *pwrdn_con = (void *)(PMU + 0x14);
+	void *bus_req   = (void *)(PMU + 0x60);
+	void *bus_st    = (void *)(PMU + 0x64);
+	void *bus_ack   = (void *)(PMU + 0x68);
+	void *pwrdn_st  = (void *)(PMU + 0x18);
+	unsigned int busm = 1U << 12, pdm = 1U << 27;
+	int us;
+
+	/* 1. ask the USB3 NoC branch to go idle, wait ST+ACK (~1 ms budget). */
+	setbits_le32(bus_req, busm);
+	dsb();
+	for (us = 0; us < 1000 &&
+	     ((readl(bus_st) & busm) != busm || (readl(bus_ack) & busm) != busm);
+	     us++)
+		udelay(1);
+	if ((readl(bus_st) & busm) != busm || (readl(bus_ack) & busm) != busm) {
+		clrbits_le32(bus_req, busm);       /* bus won't idle: back out */
+		dsb();
+		return;
+	}
+
+	/* 2. power the domain off, wait PWRDN_ST (1 = off). */
+	setbits_le32(pwrdn_con, pdm);
+	dsb();
+	for (us = 0; us < 1000 && !(readl(pwrdn_st) & pdm); us++)
+		udelay(1);
+	if (!(readl(pwrdn_st) & pdm)) {        /* didn't gate: undo, leave as-was */
+		clrbits_le32(pwrdn_con, pdm);
+		clrbits_le32(bus_req, busm);
+		dsb();
+	}
+	/* On success we leave it gated for the whole editor session (no restore). */
+}
+
 #else   /* host / non-arm64: plain delay (WFE-equivalent) */
 static void tw_idle_nap(unsigned int ms) { udelay(ms * 1000); }
 static void tw_set_cpu_408(void) { }
 static void tw_set_ddr_400(void) { }
+static void tw_gate_usb3(void) { }
 void tw_idle_stats(unsigned long *count, unsigned long *instant,
 		   unsigned long *slept_us)
 {
@@ -827,13 +879,19 @@ static int tw_next_word_col(struct tw_state *s)
 }
 
 /* Delete the [from,to) range on the current line (from < to), leaving the
- * cursor at `from`. Used by C-w (delete word back) and M-d (kill word fwd). */
+ * cursor at `from`. Used by C-w (delete word back) and M-d (kill word fwd).
+ * Like readline/nano, the deleted text goes to the kill buffer so C-y can yank
+ * it back. (n <= line_len < TW_MAX_COLS, so it always fits in s->cut.) */
 static void tw_delete_range(struct tw_state *s, int from, int to)
 {
 	int row = s->cur_row, i, n = to - from;
 
 	if (n <= 0)
 		return;
+	for (i = 0; i < n; i++)
+		s->cut[i] = s->lines[row][from + i];
+	s->cut_len = n;
+	s->cut_valid = 1;
 	for (i = to; i < s->line_len[row]; i++)
 		s->lines[row][i - n] = s->lines[row][i];
 	s->line_len[row] -= n;
@@ -1308,6 +1366,10 @@ static int tw_poweroff_event_pending(void)
 #else
 static void tw_poweroff_events_clear(void) { }
 static int tw_poweroff_event_pending(void) { return 0; }
+/* Non-arm64 (TPL/host): no EC access. tw_handle_key (Ctrl-T) is compiled
+ * outside the arm64 guard, so it needs these to link; report "unavailable". */
+int tw_read_charge_state(int *pct, int *chg_ma, int *ac) { return -ENODEV; }
+int tw_read_batt_current(int *ma) { return -ENODEV; }
 #endif
 
 static int tw_save_before_exit(struct tw_state *s)
@@ -1959,6 +2021,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
 	tw_set_cpu_408();            /* A53 -> 408 MHz + 0.80 V OPP (cooler idle) */
 	tw_set_ddr_400();            /* DDR 928 -> 400 MHz (bl31 SIP; always-on draw) */
+	tw_gate_usb3();              /* power-gate unused USB3 domain (~14 mA, free) */
 	/* Show the exception level in the startup line: the event-stream WFE idle
 	 * (low power) only engages at EL>=2. EL2 = good; EL1 would mean the idle
 	 * loop is busy-spinning and power-saving isn't active. See POWERSAVE.md. */
@@ -1993,7 +2056,7 @@ U_BOOT_CMD(
 	"  ^P/^N line\n"
 	"  ^A/^E bol/eol  arrows move\n"
 	"  ^D del  ^W del-word-back  ^K kill-eol  ^Y yank\n"
-	"  ^- dim / ^] brighten backlight (20% steps)\n"
+	"  ^- dim / ^] brighten backlight (5% steps)\n"
 	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"
 	"  1-9/Space commit, =/- page, Esc cancel"
 );
