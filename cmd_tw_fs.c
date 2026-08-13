@@ -163,8 +163,10 @@ int tw_fs_copy_name(struct tw_state *s, const char *oldn, const char *newn)
 	ret = fs_size(oldn, &fsize);
 	if (ret < 0)
 		return -1;
+	/* Rename must be lossless. If the source is bigger than our scratch cap,
+	 * refuse rather than copy a truncated file. (-2 = too big to copy.) */
 	if (fsize > TW_FILE_BUF_SIZE)
-		fsize = TW_FILE_BUF_SIZE;
+		return -2;
 
 	/* Zero-length file: write an empty file under the new name. */
 	buf = malloc((size_t)fsize + 1);
@@ -249,7 +251,9 @@ static void tw_empty_buffer(struct tw_state *s)
 	s->line_len[0] = 0;
 }
 
-/* Append codepoint cp to the current last line, splitting lines on '\n'. */
+/* Append codepoint cp to the current last line, splitting lines on '\n'.
+ * Sets s->load_truncated if the buffer geometry (TW_MAX_LINES / TW_MAX_COLS)
+ * forces data to be dropped, so the caller can warn and suppress auto-save. */
 static void tw_load_cp(struct tw_state *s, u32 cp)
 {
 	int row = s->num_lines - 1;
@@ -258,6 +262,8 @@ static void tw_load_cp(struct tw_state *s, u32 cp)
 		if (s->num_lines < TW_MAX_LINES) {
 			s->line_len[s->num_lines] = 0;
 			s->num_lines++;
+		} else {
+			s->load_truncated = 1;   /* out of lines: dropping this + rest */
 		}
 		return;
 	}
@@ -265,7 +271,8 @@ static void tw_load_cp(struct tw_state *s, u32 cp)
 		return;                 /* drop CR of CRLF */
 	if (s->line_len[row] < TW_MAX_COLS - 1)
 		s->lines[row][s->line_len[row]++] = cp;
-	/* else: line full, silently truncate the rest of this line */
+	else
+		s->load_truncated = 1;  /* line full: rest of this line dropped */
 }
 
 int tw_file_load(struct tw_state *s, const char *path)
@@ -280,6 +287,7 @@ int tw_file_load(struct tw_state *s, const char *path)
 	 * a fixed multi-MB buffer held across fs_read() - same heap-hygiene
 	 * reason as tw_file_save(): keep the pool clean for the FS layer's own
 	 * allocations. A missing file -> empty buffer. */
+	s->load_truncated = 0;               /* cleared per load; set below if we drop data */
 	if (tw_fs_set(&s->fs) != 0)
 		return -1;
 	ret = fs_size(path, &fsize);
@@ -287,8 +295,10 @@ int tw_file_load(struct tw_state *s, const char *path)
 		tw_empty_buffer(s);              /* new/empty file */
 		return 0;
 	}
-	if (fsize > TW_FILE_BUF_SIZE)        /* clamp pathologically large files */
+	if (fsize > TW_FILE_BUF_SIZE) {      /* clamp pathologically large files */
 		fsize = TW_FILE_BUF_SIZE;
+		s->load_truncated = 1;           /* only read the first ~4 MB */
+	}
 
 	cap = (size_t)fsize + 1;
 	buf = malloc(cap);

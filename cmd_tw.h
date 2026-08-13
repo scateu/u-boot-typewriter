@@ -193,6 +193,11 @@ struct tw_state {
 	int   quit;
 	int   writable;    /* 0 = read-only (default); saving is refused */
 	int   last_write_bytes;  /* bytes written by the last successful save */
+	int   load_truncated;    /* last load dropped data (file bigger than the
+				  * 2048-line / 511-col buffer, or byte-clamped) -
+				  * the buffer is a PARTIAL view; saving would
+				  * overwrite the original with less. Auto-save is
+				  * suppressed and ^S warns while this is set. */
 
 	char  filename[TW_MAX_FILENAME];
 	char  status_msg[128];

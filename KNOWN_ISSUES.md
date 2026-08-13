@@ -111,7 +111,38 @@ U-Boot's `fs/`/`mmc/` untouched.
 
 ---
 
-## 4. High CPU while the editor is open (fixed)
+## 4. Maximum file size — buffer geometry, and the truncation guard
+
+**Limits (smallest wins):**
+- **Editor buffer (binding):** `TW_MAX_LINES` 2048 × `TW_MAX_COLS` 511 usable
+  codepoints/line ≈ 1.05 M codepoints. In bytes that's **~1 MB ASCII** (1 B/cp)
+  up to **~3 MB Chinese** (3 B/cp). The buffer is a static `u32
+  lines[2048][512]` (~4 MiB in BSS, always reserved).
+- **Load scratch / clamp:** `TW_FILE_BUF_SIZE` ≈ 4.2 MB; a load never allocates
+  or reads more. Larger than the buffer can hold, so the buffer cap bites first.
+- **FAT:** FAT32's 4 GiB file limit is irrelevant here.
+
+**Guard behavior (added; silent truncation is prevented):**
+- **Load:** if a file exceeds the buffer (too many lines, an over-long line, or
+  bigger than the ~4 MB clamp), `s->load_truncated` is set. The editor then:
+  (a) shows `TRUNCATED ... too big; READ-ONLY` on the status line, (b) forces the
+  buffer **read-only**, and (c) **refuses to save** (`tw_do_save`) and **skips all
+  auto-saves** (file-switch / New / poweroff). This makes it impossible to
+  overwrite the original file with the partial view.
+- **Keyboard:** insert / newline / yank / paste all bound-check
+  `TW_MAX_LINES`/`TW_MAX_COLS`, so you cannot grow the buffer past the limit by
+  typing (extra input is simply ignored at the boundary).
+- **Rename (copy):** `tw_fs_copy_name` **refuses** a source larger than
+  `TW_FILE_BUF_SIZE` (returns -2 → "Too big to rename") rather than copy a
+  truncated file.
+
+**To raise the limit:** bump `TW_MAX_LINES` / `TW_MAX_COLS` in `cmd_tw.h`. Each
+increase grows the always-on BSS array by `Δ × 4 bytes/codepoint`, trading RAM/ROM
+footprint directly — so raise only as far as needed.
+
+---
+
+## 5. High CPU while the editor is open (fixed)
 
 Earlier the key-wait loop was a tight `while (!tstc()) schedule();` busy-spin,
 pegging the CPU at 100 % while idle. It now polls with a 10 ms `udelay` between

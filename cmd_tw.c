@@ -1212,6 +1212,14 @@ static void tw_do_save(struct tw_state *s)
 		tw_status(s, "[ Read-only (eMMC is locked; save on mmc 1) ]");
 		return;
 	}
+	if (s->load_truncated) {
+		/* The file was too big for the buffer (2048 lines / 511 cols) and
+		 * was only partially loaded. Writing now would REPLACE the original
+		 * with this partial view - silent data loss. Refuse. (There is no
+		 * safe in-editor fix; the file simply exceeds the buffer.) */
+		tw_status(s, "[ NOT saved: file was truncated on load - would lose data ]");
+		return;
+	}
 	if (!s->filename[0]) {
 		tw_status(s, "[ No file name ]");
 		return;
@@ -1461,7 +1469,7 @@ int tw_read_batt_current(int *ma) { return -ENODEV; }
 
 static int tw_save_before_exit(struct tw_state *s)
 {
-	if (s->writable && s->dirty && s->filename[0]) {
+	if (s->writable && s->dirty && s->filename[0] && !s->load_truncated) {
 		if (tw_file_save(s) != 0) {
 			tw_status(s, "[ Save failed - aborted ]");
 			return -1;
@@ -1573,7 +1581,7 @@ static void tw_switch_file(struct tw_state *s, const char *name)
 		return;
 
 	/* auto-save the outgoing buffer if we can and it changed */
-	if (s->writable && s->dirty && s->filename[0]) {
+	if (s->writable && s->dirty && s->filename[0] && !s->load_truncated) {
 		if (tw_file_save(s) != 0) {
 			tw_status(s, "[ Save of %s failed - not switching ]",
 				  s->filename);
@@ -1599,8 +1607,13 @@ static void tw_switch_file(struct tw_state *s, const char *name)
 	s->dirty = 0;
 	s->first_paint = 1;             /* full repaint for the new content */
 
-	tw_status(s, "[ %s%s - %d line%s ]", saved ? "Saved & opened " : "Opened ",
-		  s->filename, s->num_lines, s->num_lines == 1 ? "" : "s");
+	if (s->load_truncated)
+		tw_status(s, "[ %s TRUNCATED to %d lines - too big; READ-ONLY, do not save ]",
+			  s->filename, s->num_lines);
+	else
+		tw_status(s, "[ %s%s - %d line%s ]",
+			  saved ? "Saved & opened " : "Opened ",
+			  s->filename, s->num_lines, s->num_lines == 1 ? "" : "s");
 }
 
 /*
@@ -1614,7 +1627,7 @@ static void tw_new_named(struct tw_state *s, const char *name)
 	if (!name || !name[0])
 		return;
 
-	if (s->writable && s->dirty && s->filename[0]) {
+	if (s->writable && s->dirty && s->filename[0] && !s->load_truncated) {
 		if (tw_file_save(s) != 0) {
 			tw_status(s, "[ Save of %s failed - not switching ]",
 				  s->filename);
@@ -1632,6 +1645,7 @@ static void tw_new_named(struct tw_state *s, const char *name)
 	s->scroll_top = 0;
 	s->dirty = 0;
 	s->writable = 1;                /* a new file is writable */
+	s->load_truncated = 0;          /* fresh empty buffer, not a partial load */
 	s->prompt = TW_PROMPT_NONE;     /* into the editor */
 	s->first_paint = 1;
 	tw_status(s, "[ New file: %s (^S to write) ]", s->filename);
@@ -1838,7 +1852,7 @@ static void tw_prompt_key(struct tw_state *s, int key)
 			}
 		} else if (which == TW_PROMPT_RENAME) {
 			char oldn[TW_PICK_NAMELEN];
-			int i, exists = 0;
+			int i, exists = 0, cr;
 
 			s->dirty_hints = 1;
 			s->prompt = TW_PROMPT_PICK;
@@ -1852,11 +1866,15 @@ static void tw_prompt_key(struct tw_state *s, int key)
 				for (i = 0; i < s->pick_count; i++)
 					if (!strcmp(s->pick_name[i], s->prompt_ans))
 						exists = 1;
+
 				if (exists) {
 					tw_status(s, "[ %s already exists ]",
 						  s->prompt_ans);
-				} else if (tw_fs_copy_name(s, oldn,
-							   s->prompt_ans) != 0) {
+				} else if ((cr = tw_fs_copy_name(s, oldn,
+							s->prompt_ans)) == -2) {
+					tw_status(s, "[ Too big to rename (> %d MB) ]",
+						  TW_FILE_BUF_SIZE / (1024 * 1024));
+				} else if (cr != 0) {
 					tw_status(s, "[ Rename failed (copy) ]");
 				} else if (tw_fs_unlink_name(s, oldn) != 0) {
 					/* copy made it; old delete failed -> both
@@ -2272,6 +2290,11 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 		s->num_lines = 1;
 		s->line_len[0] = 0;
 	}
+	/* If the file was too big for the buffer and only partially loaded, force
+	 * read-only so a save can never overwrite the original with this partial
+	 * view (belt-and-suspenders on top of tw_do_save's own truncation guard). */
+	if (s->load_truncated)
+		s->writable = 0;
 
 	tw_bind_ime(s);
 	tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
@@ -2281,9 +2304,13 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	/* Show the exception level in the startup line: the event-stream WFE idle
 	 * (low power) only engages at EL>=2. EL2 = good; EL1 would mean the idle
 	 * loop is busy-spinning and power-saving isn't active. See POWERSAVE.md. */
-	tw_status(s, "[ Read %d line%s%s - EL%d ]", s->num_lines,
-		  s->num_lines == 1 ? "" : "s",
-		  s->writable ? "" : " - read-only", current_el());
+	if (s->load_truncated)
+		tw_status(s, "[ %s TRUNCATED to %d lines - too big; READ-ONLY ]",
+			  s->filename, s->num_lines);
+	else
+		tw_status(s, "[ Read %d line%s%s - EL%d ]", s->num_lines,
+			  s->num_lines == 1 ? "" : "s",
+			  s->writable ? "" : " - read-only", current_el());
 
 	while (!s->quit) {
 		tw_render(s);
