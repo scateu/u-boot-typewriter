@@ -140,6 +140,9 @@ U-Boot's `fs/`/`mmc/` untouched.
 increase grows the always-on BSS array by `Δ × 4 bytes/codepoint`, trading RAM/ROM
 footprint directly — so raise only as far as needed.
 
+See **[FILE_TOO_BIG.md](FILE_TOO_BIG.md)** for the full rationale (why read-only
+rather than a confirm dialog, why a fixed buffer, the exact guard points).
+
 ---
 
 ## 5. High CPU while the editor is open (fixed)
