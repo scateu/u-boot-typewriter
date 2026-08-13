@@ -80,7 +80,38 @@ off. Lower it if you need to save more space. Rebuild the embedded data with
 
 ---
 
-## 3. High CPU while the editor is open (fixed)
+## 3. Filenames are ASCII-only — the FAT driver can't round-trip Chinese (U-Boot FAT, NOT typewriter)
+
+**Symptom.** A file whose name contains hanzi does not survive a round-trip:
+- A Chinese name **created in typewriter** (or via `fatwrite`) reads back as
+  garble — each hanzi becomes several Latin-1 chars (e.g. `文` → `æ–‡`-style).
+- A Chinese name **created in Linux** shows in the `^R` picker as a single wrong
+  glyph (e.g. a stray `K`).
+File **content** is unaffected — hanzi *inside* a file save and load correctly
+(the body is opaque UTF-8 bytes). This is purely about the **filename**.
+
+**Root cause: U-Boot's FAT long-name codec is Latin-1/UCS-2, not UTF-8.** In
+`fs/fat/` the LFN converters move one byte per UTF-16 code unit:
+- write (`str2slot`, fat_write.c): `slot->name[j] = name[i]`, high byte left 0 —
+  so a UTF-8 byte becomes a UTF-16 unit; the 3 bytes of a hanzi become 3 junk
+  chars.
+- read (`slot2str`, fat.c): `l_name[i] = slot->name[j]` (low byte only) — so a
+  real UTF-16 hanzi (`U+6587`) is truncated to its low byte (`0x87`) → one wrong
+  char.
+There is no `utf8_to_utf16`/`utf16_to_utf8` in the driver and no config to enable
+one. So CJK filenames fundamentally cannot round-trip on this U-Boot, regardless
+of what the editor does.
+
+**Decision.** typewriter keeps **filenames ASCII-only**: the `^R` picker's New
+and Rename prompts do NOT route through the Wubi IME (they accept ASCII only, and
+the prompt label says "(ASCII)"). Chinese in file *bodies* works as always. A
+Wubi-capable filename would require patching U-Boot's `fs/fat/` LFN codec to do
+real UTF-8↔UTF-16 — deliberately not done, per project preference to leave
+U-Boot's `fs/`/`mmc/` untouched.
+
+---
+
+## 4. High CPU while the editor is open (fixed)
 
 Earlier the key-wait loop was a tight `while (!tstc()) schedule();` busy-spin,
 pegging the CPU at 100 % while idle. It now polls with a 10 ms `udelay` between

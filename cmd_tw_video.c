@@ -555,32 +555,66 @@ static void draw_cursor(struct tw_state *s, int row, int col, int on)
 	}
 }
 
+/* Draw the Wubi candidate list starting at pixel-x `x` on the bar row: numbered
+ * candidates for the current page, plus a (page/total) indicator at the right.
+ * Shared by the normal composing bar and the New/Rename filename prompt. */
+static void draw_ime_candidates(struct tw_state *s, int x)
+{
+	struct tw_ime *im = &s->ime;
+	int shown, i;
+
+	for (shown = 0, i = im->page; i < im->ncand && shown < TW_PAGE;
+	     i++, shown++) {
+		char num[4];
+
+		num[0] = '1' + shown;
+		num[1] = '.';
+		num[2] = '\0';
+		x = draw_str(x, s->bar_y, num, C_BARTX, C_BAR);
+		x = draw_word(x, s->bar_y, im->cand[i].word,
+			      im->cand[i].word_len, C_BARTX, C_BAR);
+		x += TW_CELL_PX;
+		if (x > s->fb_w - 4 * TW_CELL_PX)
+			break;
+	}
+
+	if (im->ncand > TW_PAGE) {
+		char ind[16];
+		int pages = (im->ncand + TW_PAGE - 1) / TW_PAGE;
+
+		snprintf(ind, sizeof(ind), "(%d/%d)",
+			 im->page / TW_PAGE + 1, pages);
+		draw_str(s->fb_w - 8 * TW_CELL_PX, s->bar_y, ind, C_BARTX, C_BAR);
+	}
+}
+
 static void draw_bar(struct tw_state *s)
 {
 	struct tw_ime *im = &s->ime;
-	int x, shown, i;
+	int x;
 
 	fill_rect(0, s->bar_y, s->fb_w, TW_ROW_PX, C_BAR);   /* gray bar */
 
 	if (s->prompt == TW_PROMPT_PICK) {
-		char hint[96];
+		char hint[48];
+		const char *nm = s->pick_count ? s->pick_name[s->pick_sel] : "";
 
-		snprintf(hint, sizeof(hint),
-			 " Files  [%d/%d]  %s ",
-			 s->pick_count ? s->pick_sel + 1 : 0, s->pick_count,
-			 s->pick_count ? s->pick_name[s->pick_sel] : "");
-		draw_str(0, s->bar_y, hint, C_BARTX, C_BAR);
+		snprintf(hint, sizeof(hint), " Files  [%d/%d]  ",
+			 s->pick_count ? s->pick_sel + 1 : 0, s->pick_count);
+		x = draw_str(0, s->bar_y, hint, C_BARTX, C_BAR);
+		/* UTF-8 aware (names are ASCII, but a non-ASCII name created
+		 * elsewhere at least renders per-codepoint, not per-byte garbage). */
+		draw_word(x, s->bar_y, nm, (int)strlen(nm), C_BARTX, C_BAR);
 		return;
 	}
 
 	/* Delete confirm names the selected file (destructive - be explicit). */
 	if (s->prompt == TW_PROMPT_PICKDEL) {
-		char hint[96];
+		const char *nm = s->pick_count ? s->pick_name[s->pick_sel] : "";
 
-		snprintf(hint, sizeof(hint),
-			 " Delete \"%s\"?  y)es  N)o ",
-			 s->pick_count ? s->pick_name[s->pick_sel] : "");
-		draw_str(0, s->bar_y, hint, C_BARTX, C_BAR);
+		x = draw_str(0, s->bar_y, " Delete \"", C_BARTX, C_BAR);
+		x = draw_word(x, s->bar_y, nm, (int)strlen(nm), C_BARTX, C_BAR);
+		draw_str(x, s->bar_y, "\"?  y)es  N)o ", C_BARTX, C_BAR);
 		return;
 	}
 
@@ -597,11 +631,12 @@ static void draw_bar(struct tw_state *s)
 			s->prompt == TW_PROMPT_OPEN   ? " File to open: " :
 			s->prompt == TW_PROMPT_SEARCH ? " Search: " :
 			s->prompt == TW_PROMPT_SHELL  ? " Run cmd (output inserted): !" :
-			s->prompt == TW_PROMPT_NEW    ? " New file name: " :
-			s->prompt == TW_PROMPT_RENAME ? " Rename to: " :
+			s->prompt == TW_PROMPT_NEW    ? " New file name (ASCII): " :
+			s->prompt == TW_PROMPT_RENAME ? " Rename to (ASCII): " :
 			" Save modified buffer?  Y)es  N)o  C)ancel ";
 		x = draw_str(0, s->bar_y, label, C_BARTX, C_BAR);
 		x = draw_str(x, s->bar_y, s->prompt_ans, C_BARTX, C_BAR);
+		/* caret */
 		if (s->prompt != TW_PROMPT_EXIT)
 			fill_rect(x, s->bar_y, 2 * TW_SCALE, TW_ROW_PX, C_BARTX);
 		return;
@@ -631,30 +666,7 @@ static void draw_bar(struct tw_state *s)
 
 	x = draw_str(x, s->bar_y, im->code, C_BARTX, C_BAR);
 	x += TW_CELL_PX;
-
-	for (shown = 0, i = im->page; i < im->ncand && shown < TW_PAGE;
-	     i++, shown++) {
-		char num[4];
-
-		num[0] = '1' + shown;
-		num[1] = '.';
-		num[2] = '\0';
-		x = draw_str(x, s->bar_y, num, C_BARTX, C_BAR);
-		x = draw_word(x, s->bar_y, im->cand[i].word,
-			      im->cand[i].word_len, C_BARTX, C_BAR);
-		x += TW_CELL_PX;
-		if (x > s->fb_w - 4 * TW_CELL_PX)
-			break;
-	}
-
-	if (im->ncand > TW_PAGE) {
-		char ind[16];
-		int pages = (im->ncand + TW_PAGE - 1) / TW_PAGE;
-
-		snprintf(ind, sizeof(ind), "(%d/%d)",
-			 im->page / TW_PAGE + 1, pages);
-		draw_str(s->fb_w - 8 * TW_CELL_PX, s->bar_y, ind, C_BARTX, C_BAR);
-	}
+	draw_ime_candidates(s, x);
 }
 
 /*
@@ -772,7 +784,11 @@ static void draw_picker(struct tw_state *s)
 			fill_rect(s->text_x0, py,
 				  s->fb_w - 2 * s->text_x0, TW_ROW_PX, C_FG);
 		}
-		draw_str(s->text_x0 + TW_CELL_PX, py, s->pick_name[idx], fg, bg);
+		/* UTF-8 aware: filenames may contain hanzi (draw_str is byte-wise
+		 * and would render each UTF-8 byte as a garbage glyph, e.g. a stray
+		 * 'K'). draw_word decodes codepoints. */
+		draw_word(s->text_x0 + TW_CELL_PX, py, s->pick_name[idx],
+			  (int)strlen(s->pick_name[idx]), fg, bg);
 	}
 }
 

@@ -1713,6 +1713,7 @@ static void tw_prompt_key(struct tw_state *s, int key)
 		case KEY_CTRL_X:
 			s->prompt = TW_PROMPT_NONE;
 			s->dirty_hints = 1;
+			s->first_paint = 1;   /* full repaint: wipe the picker list */
 			tw_status(s, "[ Cancelled ]");
 			break;
 		/* Pine/alpine-style file ops. Bare letters (the picker isn't a
@@ -1754,6 +1755,7 @@ static void tw_prompt_key(struct tw_state *s, int key)
 				tw_list_files(s);           /* refresh the list */
 				if (s->pick_count == 0) {
 					s->prompt = TW_PROMPT_NONE;
+					s->first_paint = 1;   /* wipe picker list */
 					tw_status(s, "[ Deleted %s - no files left ]",
 						  name);
 				} else {
@@ -1886,6 +1888,8 @@ static void tw_prompt_key(struct tw_state *s, int key)
 			s->prompt = (s->pick_count > 0) ? TW_PROMPT_PICK
 						        : TW_PROMPT_NONE;
 			s->dirty_hints = 1;
+			if (s->prompt == TW_PROMPT_NONE)
+				s->first_paint = 1;   /* empty dir -> editor: wipe */
 			tw_status(s, "[ Cancelled ]");
 			return;
 		}
@@ -1895,7 +1899,13 @@ static void tw_prompt_key(struct tw_state *s, int key)
 		return;
 	}
 	if ((key == KEY_BACKSPACE || key == KEY_BS) && s->prompt_len > 0) {
-		s->prompt_ans[--s->prompt_len] = '\0';
+		/* Delete a whole UTF-8 char, not one byte, so backspacing over a
+		 * hanzi (multibyte) doesn't leave a truncated sequence. */
+		s->prompt_len--;
+		while (s->prompt_len > 0 &&
+		       ((unsigned char)s->prompt_ans[s->prompt_len] & 0xC0) == 0x80)
+			s->prompt_len--;               /* skip continuation bytes */
+		s->prompt_ans[s->prompt_len] = '\0';
 		return;
 	}
 	if (key >= 0x20 && key < 0x7f && s->prompt_len < TW_CMD_BUF - 1) {
@@ -1980,6 +1990,10 @@ static void tw_handle_key(struct tw_state *s, int key)
 	}
 
 	if (s->prompt != TW_PROMPT_NONE) {
+		/* Filenames are ASCII-only: this U-Boot's FAT driver stores long
+		 * names as Latin-1/UCS-2 (1 byte per char, str2slot/slot2str), so
+		 * hanzi can't round-trip - see KNOWN_ISSUES.md. So the New/Rename
+		 * prompts do NOT route through the Wubi IME (only ASCII entry). */
 		tw_prompt_key(s, key);
 		tw_mark_dirty(s, &snap);
 		return;
@@ -2275,6 +2289,11 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 		tw_render(s);
 		tw_handle_key(s, tw_read_key());
 	}
+
+	/* Clear the framebuffer on the way out (^X exit) so the editor's screen
+	 * isn't left behind the returning U-Boot shell prompt - a clean handoff,
+	 * same as the boot path above. */
+	run_command("cls", 0);
 
 	return CMD_RET_SUCCESS;
 }
