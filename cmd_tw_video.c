@@ -723,7 +723,7 @@ static void draw_hints(struct tw_state *s)
 		{"d", "Delete"},   {NULL, NULL},    {NULL, NULL}, {NULL, NULL},
 	};
 	static const struct hint pick2[TW_HINT_COLS] = {
-		{"\x18\x19", "Move"}, {"^P/^N", "Move"}, {"Esc", "Cancel"},
+		{"Arrow", "Move"}, {"^P/^N", "Move"}, {"Esc", "Cancel"},
 		{NULL, NULL}, {NULL, NULL}, {NULL, NULL}, {NULL, NULL},
 	};
 	int in_picker = (s->prompt == TW_PROMPT_PICK ||
