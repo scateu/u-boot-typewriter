@@ -1,7 +1,31 @@
 config CMD_TYPEWRITER
 	bool "typewriter - Nano-like editor with Wubi Chinese input"
-	depends on VIDEO
-	depends on FS_FAT || FS_EXT4
+	# --- HARD dependencies: the command cannot build/work without these ---
+	depends on CMDLINE        # it IS a U-Boot command, and uses run_command
+				  # for cls-on-exit and the ^Q "boot OS" handoff
+	depends on VIDEO          # draws to the framebuffer; U-Boot's console font
+				  # is ASCII-only and cannot render hanzi
+	depends on FS_FAT || FS_EXT4   # loads/saves UTF-8 files on FAT or ext4
+	# --- SOFT dependencies: each ADDS a feature, and the code degrades
+	#     gracefully (guarded by #if / best-effort) when absent, so these are
+	#     `imply`, not `depends on`. See the per-item notes. ---
+	imply CONSOLE_RECORD      # ^V "run cmd, insert output" captures console
+				  # output; without it ^V runs the cmd but inserts
+				  # nothing (says "^V needs CONFIG_CONSOLE_RECORD")
+	imply CROS_EC             # Ctrl-T battery %/current + EC key/lid/power wake;
+				  # without it those report "no EC" (Chromebook only)
+	imply DM_REGULATOR        # lowers A53/centerlogic core rails at startup for
+				  # power/heat; regulator_get_by_platname() stubs to a
+				  # no-op without it (rails stay at boot voltage)
+	imply REGULATOR_PWM       # the gru/kevin core rails are pwm-regulators
+	imply ARM_PSCI_FW         # DDR 928->400MHz DFS SIP + PSCI power-off;
+				  # invoke_psci_fn() stubs out without it (DDR scaling
+				  # and PSCI poweroff simply don't engage)
+	imply CMD_BOOTFLOW        # ^Q offers "boot the OS" via `bootflow scan`;
+				  # without it that option just fails gracefully
+	imply BACKLIGHT           # ^-/^] brightness + dim-at-startup power save;
+				  # no controllable backlight => brightness keys no-op
+	imply PANEL               # some boards expose the backlight via the panel
 	help
 	  A full-screen, GNU Nano-style text editor that runs directly on
 	  U-Boot's video framebuffer, with a built-in Wubi 86 (五笔) Chinese
@@ -10,8 +34,30 @@ config CMD_TYPEWRITER
 	  needed at runtime (this adds roughly 3 MB of read-only data to the
 	  image, plus a few MB of BSS for the line buffer).
 
-	  Requires a video display (CONFIG_VIDEO and a display driver) because
-	  U-Boot's built-in console font is ASCII-only and cannot render hanzi.
-	  Reads and writes UTF-8 files on FAT or ext4.
+	  HARD requirements (enforced by `depends on`):
+	    - CMDLINE   : it is a U-Boot command.
+	    - VIDEO     : draws hanzi to the framebuffer (console font is ASCII).
+	    - FS_FAT or FS_EXT4 : reads/writes UTF-8 files.
+
+	  OPTIONAL, auto-enabled via `imply` (each degrades gracefully if off):
+	    - CONSOLE_RECORD : the ^V "run command, insert output" feature.
+	    - CROS_EC        : Ctrl-T battery/current and key/lid/power IRQ wake.
+	    - DM_REGULATOR / REGULATOR_PWM : CPU/DDR-rail undervolt (power/heat).
+	    - ARM_PSCI_FW    : DDR frequency scaling + PSCI power-off.
+	    - CMD_BOOTFLOW   : the ^Q "boot the OS" option.
+	    - BACKLIGHT / PANEL : ^-/^] brightness and dim-on-startup power save.
+
+	  `imply` (not `select`) so a board can still turn any of these off; the
+	  editor then loses just that feature, not the build. The twwfi debug/
+	  metering command is built alongside typewriter (see the Makefile) and
+	  uses the same optional subsystems.
+
+	  Notes:
+	    - Filenames are ASCII-only (U-Boot's FAT long-name codec can't
+	      round-trip hanzi); Chinese *content* inside files works. See
+	      KNOWN_ISSUES.md / FILE_TOO_BIG.md.
+	    - Save on the microSD (mmc 1), not the eMMC (mmc 0, hard-locked
+	      read-only - its FAT writes corrupt the card on RK3399). See
+	      KNOWN_ISSUES.md.
 
 	  Use: typewriter <iftype> <dev:part> <filename> [fstype]
