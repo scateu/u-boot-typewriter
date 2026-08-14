@@ -212,6 +212,32 @@ static void tw_idle_nap(unsigned int ms)
 	unsigned long vbar_save, hcr_save;
 	unsigned long t_in, t_out, us, hz = get_tbclk();
 
+#if !defined(CONFIG_TW_WFI_IDLE)
+	/*
+	 * WFI deep-sleep disabled (default). WFI buys little measured power here
+	 * (the always-on blocks - DDR/rails/backlight - dominate, and those are
+	 * lowered separately), yet the no-timer WFI has occasionally FROZEN the
+	 * board: if the EC IRQ is ever missed/not-taken, nothing re-enters this
+	 * loop to poll, so the CPU sleeps forever. Instead, just poll: a short
+	 * delay keeps the key-wait loop (tstc + power/lid check) ticking, so a
+	 * missed IRQ can never wedge us. Set CONFIG_TW_WFI_IDLE=y to restore the
+	 * real WFI nap (see POWERSAVE.md). No GIC/vector/WFI state is touched. */
+	(void)ticks; (void)vbar_save; (void)hcr_save;
+	(void)t_in; (void)t_out; (void)us; (void)hz;
+	/*
+	 * Sleep one idle tick's worth (TW_IDLE_POLL_MS), not the tight active-
+	 * window interval: after this returns the key-wait loop does a slow EC
+	 * SPI power/lid poll, so a too-short delay would hammer the EC. ~200 ms
+	 * keeps lid/power response snappy while the EC poll stays gentle (the
+	 * same cadence the WFI-era code used for that poll - see POWERSAVE.md #4).
+	 */
+	schedule();
+	udelay(TW_IDLE_POLL_MS * 1000);
+	tw_nap_count++;            /* count polls so napstats still shows activity */
+	tw_nap_instant++;          /* a poll is, by definition, a non-sleeping nap */
+	return;
+#endif
+
 	tw_wfi_setup();
 
 	/* Point VBAR_EL2 at our minimal IRQ vector and route phys IRQ to EL2

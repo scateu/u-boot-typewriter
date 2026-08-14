@@ -127,6 +127,9 @@
 				  * input layer keeps being polled while a key is
 				  * down; deep WFI only after real idle */
 #define TW_ACTIVE_POLL_MS   25   /* poll interval within the active window (ms) */
+#define TW_IDLE_POLL_MS     200  /* idle poll interval when WFI deep-sleep is off
+				  * (!CONFIG_TW_WFI_IDLE): one tick between EC
+				  * power/lid polls - snappy but gentle on the EC */
 
 #define KEY_META_F      0x210    /* M-f: forward one word */
 #define KEY_META_B      0x211    /* M-b: backward one word */

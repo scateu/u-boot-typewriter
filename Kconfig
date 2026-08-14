@@ -61,3 +61,25 @@ config CMD_TYPEWRITER
 	      KNOWN_ISSUES.md.
 
 	  Use: typewriter <iftype> <dev:part> <filename> [fstype]
+
+config TW_WFI_IDLE
+	bool "typewriter: deep-sleep the CPU with WFI when idle"
+	depends on CMD_TYPEWRITER && ARM64
+	default n
+	help
+	  When idle (no keypress for ~2 s), execute a real WFI that sleeps the
+	  A53 until the ChromeOS-EC interrupt (key / power button / lid) fires,
+	  with no backstop timer armed. See POWERSAVE.md and the `twwfi` command
+	  for the long investigation behind it.
+
+	  This is OFF by default. In practice WFI saves little measured power on
+	  this board - the always-on blocks (DDR, core rails, backlight) dominate
+	  idle draw and are lowered by other means - and the no-timer WFI has
+	  occasionally FROZEN the board: if the EC interrupt is ever missed or not
+	  taken, nothing re-enters the key-wait loop to poll, so the CPU sleeps
+	  forever and even the power button appears dead.
+
+	  With this off, the idle loop simply polls at a low rate (a short delay
+	  per iteration) instead of sleeping - the loop keeps ticking, so a missed
+	  interrupt can never wedge it. Enable this only if you have verified the
+	  WFI wake path is reliable on your board and want the marginal saving.

@@ -12,10 +12,21 @@ vs ~6 %/hr, warm CPU). This note describes the changes that fix it.
 
 ## TL;DR — the levers that work
 
-1. **Real WFI deep idle** *(the big one)*. The editor's idle nap is a true `WFI`
-   that clock-gates the core until an interrupt, exactly how Linux idles this
-   board. Woken by the NonSecure arch-timer (CNTP) tick and, early, by any
-   cros_ec keypress / power button / lid. In `cmd_tw.c` (`tw_idle_nap`).
+1. **Real WFI deep idle** — the editor's idle nap *can* be a true `WFI` that
+   clock-gates the core until an interrupt, exactly how Linux idles this board.
+   Woken by the NonSecure arch-timer (CNTP) tick and, early, by any cros_ec
+   keypress / power button / lid. In `cmd_tw.c` (`tw_idle_nap`).
+
+   > **DISABLED BY DEFAULT** (`CONFIG_TW_WFI_IDLE`, default `n`). In practice WFI
+   > buys little measured power here — the always-on blocks below (DDR, core
+   > rails, backlight) dominate idle draw and are lowered separately — and the
+   > no-timer WFI has occasionally **frozen** the board: if the EC interrupt is
+   > ever missed or not taken, nothing re-enters the key-wait loop to poll, so
+   > the CPU sleeps forever and even the power button appears dead. With the
+   > option off, the idle loop just polls at a low rate (short `udelay` per
+   > iteration), which keeps ticking and can't wedge. Set `CONFIG_TW_WFI_IDLE=y`
+   > to restore the WFI nap described in *Fix 1* below, only if you've verified
+   > the wake path is reliable on your board.
 2. **CPU frequency 600 → 408 MHz** — U-Boot's fixed clock lowered to Linux's
    idle OPP. Less active power/heat. (U-Boot core change, `clk_rk3399.c`.)
 3. **Dim the backlight** (`^-` / `^]`, default 40 %) — the panel is a big share
