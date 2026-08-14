@@ -32,6 +32,7 @@
 static u32 C_FG, C_BG;      /* text area: white on black */
 static u32 C_BAR, C_BARTX;  /* title/candidate bar: light-gray text on gray */
 static u32 C_HINT;          /* bottom hint bar bg: plain black (transparent) */
+static u32 C_DIV;           /* two-panel vertical divider: dim gray */
 
 static struct udevice    *g_vdev;
 static struct video_priv *g_vp;
@@ -177,6 +178,64 @@ int tw_cp_cols(u32 cp)
 	const struct tw_glyph *g = find_glyph(cp);
 
 	return (g && g->width == 16) ? 2 : 1;
+}
+
+/* Gutter (blank px) between the two panels in two-panel mode; also the width of
+ * the vertical divider band drawn in it. A couple of narrow cells keeps the two
+ * columns visually separated without wasting much width. */
+#define TW_PANEL_GUTTER_PX (2 * TW_CELL_PX)
+
+/*
+ * Recompute text_cols + panel origins for the current s->two_panel setting.
+ * Single panel: text_cols spans the whole usable width; only panel_x0[0] is
+ * used. Two panel: the usable width is split into two equal columns separated
+ * by TW_PANEL_GUTTER_PX, text_cols becomes the PER-PANEL width (so every wrap
+ * calculation - tw_line_rows/tw_wrap_pos/draw_text_from - naturally wraps to a
+ * single panel), and panel_x0[0]/[1] are the two text origins. text_rows (the
+ * per-panel height) is set by the caller and is unchanged by the mode.
+ */
+void tw_recalc_geometry(struct tw_state *s)
+{
+	int usable = s->fb_w - 2 * s->text_x0;
+
+	s->panel_x0[0] = s->text_x0;
+	if (s->two_panel) {
+		int half = (usable - TW_PANEL_GUTTER_PX) / 2;
+
+		s->text_cols = half / TW_CELL_PX;
+		if (s->text_cols < 1)
+			s->text_cols = 1;
+		s->panel_x0[1] = s->text_x0 + s->text_cols * TW_CELL_PX +
+				 TW_PANEL_GUTTER_PX;
+	} else {
+		s->text_cols = usable / TW_CELL_PX;
+		if (s->text_cols < 1)
+			s->text_cols = 1;
+		s->panel_x0[1] = s->text_x0;   /* unused, but keep it sane */
+	}
+}
+
+/* Visible screen-row capacity: one panel high, or two panels stacked
+ * left-then-right in two-panel mode. */
+int tw_panel_capacity(struct tw_state *s)
+{
+	return s->two_panel ? 2 * s->text_rows : s->text_rows;
+}
+
+/* Map a visible screen-row index v (0..tw_panel_capacity-1) to its pixel
+ * origin: the panel x-origin *px0 and the top pixel *py. Rows 0..text_rows-1 go
+ * in the left panel; text_rows..2*text_rows-1 in the right panel (at panel row
+ * v - text_rows). In single-panel mode this is just the left column. */
+static void tw_vrow_to_px(struct tw_state *s, int v, int *px0, int *py)
+{
+	int panel = 0, pr = v;
+
+	if (s->two_panel && v >= s->text_rows) {
+		panel = 1;
+		pr = v - s->text_rows;
+	}
+	*px0 = s->panel_x0[panel];
+	*py  = s->text_y0 + pr * TW_ROW_PX;
 }
 
 /*
@@ -342,6 +401,7 @@ int tw_video_init(struct tw_state *s)
 	C_BAR   = tw_pack_rgb(0x60, 0x60, 0x60);  /* title/candidate bar: gray */
 	C_BARTX = tw_pack_rgb(0xd0, 0xd0, 0xd0);  /* light-gray text on bars */
 	C_HINT  = tw_pack_bw(0);                  /* hint bar bg: plain black */
+	C_DIV   = tw_pack_rgb(0x40, 0x40, 0x40);  /* two-panel divider: dim gray */
 
 	/* Geometry (all in scaled px): title (1 row) + text area + candidate
 	 * bar (1) + hints (2). Text area fills the screen edge to edge. */
@@ -349,14 +409,12 @@ int tw_video_init(struct tw_state *s)
 	s->text_y0 = TW_ROW_PX;                    /* below the title row */
 	s->hint_y  = s->fb_h - 2 * TW_ROW_PX;      /* two hint rows */
 	s->bar_y   = s->hint_y - TW_ROW_PX;        /* candidate bar */
-	s->text_cols = (s->fb_w - 2 * s->text_x0) / TW_CELL_PX;
 	s->text_rows = (s->bar_y - s->text_y0) / TW_ROW_PX;
-	if (s->text_cols < 1)
-		s->text_cols = 1;
 	if (s->text_rows < 1)
 		s->text_rows = 1;
 	if (s->text_rows > TW_MAX_LINES)
 		s->text_rows = TW_MAX_LINES;
+	tw_recalc_geometry(s);                     /* text_cols + panel origins */
 
 	s->first_paint = 1;
 	s->dirty_all = 1;
@@ -444,31 +502,38 @@ static void draw_title(struct tw_state *s)
 	}
 }
 
-/* Clear one screen row's band to background. */
-static void clear_row(struct tw_state *s, int sr)
+/* Clear one visible screen row's band to background - just that row's panel
+ * (full width in single-panel mode, one panel's width in two-panel mode). */
+static void clear_row(struct tw_state *s, int v)
 {
-	fill_rect(s->text_x0, s->text_y0 + sr * TW_ROW_PX,
-		  s->fb_w - 2 * s->text_x0, TW_ROW_PX, C_BG);
+	int px0, py;
+
+	tw_vrow_to_px(s, v, &px0, &py);
+	fill_rect(px0, py, s->text_cols * TW_CELL_PX, TW_ROW_PX, C_BG);
 }
 
 /*
- * Draw the wrapped text starting at screen row `sr0` from logical line `fr0`,
- * down to the bottom of the text area. Each screen row is cleared to bg just
- * before it's drawn (a thin per-row clear, NOT an area-wide clear - that
- * area-wide clear was the source of the per-keystroke black flash). Rows past
- * the last content line are cleared too. Rows above sr0 are left untouched, so
- * a typed character only repaints its own line (and, on reflow, the lines
- * below it) - no flicker.
+ * Draw the wrapped text starting at VISIBLE screen row `sr0` from logical line
+ * `fr0`, down to the bottom of the visible area. "Visible row" is a continuous
+ * index 0..capacity-1 that, in two-panel mode, spills from the left panel into
+ * the right (see tw_vrow_to_px) - so the same logical flow fills both panels.
+ *
+ * Each screen row is cleared to bg just before it's drawn (a thin per-row
+ * clear, NOT an area-wide clear - that area-wide clear was the source of the
+ * per-keystroke black flash). Rows past the last content line are cleared too.
+ * Rows above sr0 are left untouched, so a typed character only repaints its own
+ * line (and, on reflow, the lines below it) - no flicker.
  */
 static void draw_text_from(struct tw_state *s, int sr0, int fr0)
 {
+	int cap = tw_panel_capacity(s);
 	int sr = sr0;
 	int fr = fr0;
 
-	while (sr < s->text_rows && fr < s->num_lines) {
-		int col = 0, i;
-		int py = s->text_y0 + sr * TW_ROW_PX;
+	while (sr < cap && fr < s->num_lines) {
+		int col = 0, i, px0, py;
 
+		tw_vrow_to_px(s, sr, &px0, &py);
 		clear_row(s, sr);
 		for (i = 0; i < s->line_len[fr]; i++) {
 			u32 cp = s->lines[fr][i];
@@ -476,28 +541,44 @@ static void draw_text_from(struct tw_state *s, int sr0, int fr0)
 
 			if (col + cw > s->text_cols) {   /* wrap to next row */
 				sr++;
-				if (sr >= s->text_rows)
+				if (sr >= cap)
 					break;
 				col = 0;
-				py = s->text_y0 + sr * TW_ROW_PX;
+				tw_vrow_to_px(s, sr, &px0, &py);
 				clear_row(s, sr);
 			}
-			draw_glyph(s->text_x0 + col * TW_CELL_PX, py, cp,
-				   C_FG, C_BG);
+			draw_glyph(px0 + col * TW_CELL_PX, py, cp, C_FG, C_BG);
 			col += cw;
 		}
 		sr++;                   /* next logical line starts a new row */
 		fr++;
 	}
 	/* clear any leftover rows below the last content line */
-	while (sr < s->text_rows)
+	while (sr < cap)
 		clear_row(s, sr++);
+}
+
+/* In two-panel mode, paint the thin vertical divider centered in the gutter
+ * between the panels, spanning the full text area height. No-op otherwise.
+ * Drawn on whole-area repaints (first paint / scroll / mode toggle). */
+static void draw_divider(struct tw_state *s)
+{
+	int x, h;
+
+	if (!s->two_panel)
+		return;
+	/* center a 2px band in the gutter between panel 0's right edge and
+	 * panel 1's left edge. */
+	x = s->panel_x0[0] + s->text_cols * TW_CELL_PX + TW_PANEL_GUTTER_PX / 2 - 1;
+	h = s->text_rows * TW_ROW_PX;
+	fill_rect(x, s->text_y0, 2, h, C_DIV);
 }
 
 /* Repaint the whole text area (used on scroll / first paint / picker exit). */
 static void draw_text(struct tw_state *s)
 {
 	draw_text_from(s, 0, s->scroll_top);
+	draw_divider(s);
 }
 
 /* Screen row where logical line `fr` starts, relative to scroll_top (wrap-
@@ -515,7 +596,7 @@ static int tw_line_screen_row(struct tw_state *s, int fr)
  * Returns 0 and fills px/py if on-screen, -1 if off-screen. */
 static int tw_screen_xy(struct tw_state *s, int row, int col, int *px, int *py)
 {
-	int base = 0, fr, wr, wc, sr;
+	int base = 0, fr, wr, wc, sr, px0, rpy;
 
 	if (row < s->scroll_top)
 		return -1;
@@ -523,10 +604,13 @@ static int tw_screen_xy(struct tw_state *s, int row, int col, int *px, int *py)
 		base += tw_line_rows(s, fr);
 	tw_wrap_pos(s, row, col, &wr, &wc);
 	sr = base + wr;
-	if (sr < 0 || sr >= s->text_rows)
+	if (sr < 0 || sr >= tw_panel_capacity(s))
 		return -1;
-	*px = s->text_x0 + wc * TW_CELL_PX;
-	*py = s->text_y0 + sr * TW_ROW_PX;
+	/* Map the visible row to its panel origin (left/right), then add the
+	 * intra-line wrap column. */
+	tw_vrow_to_px(s, sr, &px0, &rpy);
+	*px = px0 + wc * TW_CELL_PX;
+	*py = rpy;
 	return 0;
 }
 
@@ -743,10 +827,33 @@ static void draw_hints(struct tw_state *s)
 			 s->prompt == TW_PROMPT_RENAME ||
 			 s->prompt == TW_PROMPT_PICKDEL);
 
-	if (in_picker)
+	if (in_picker) {
 		draw_hint_rows(s, pick1, pick2);
-	else
-		draw_hint_rows(s, edit1, edit2);
+		return;
+	}
+
+	draw_hint_rows(s, edit1, edit2);
+
+	/*
+	 * The two-column toggle (^\) doesn't fit the 7-column grid stride, but
+	 * there's free space at the right edge past the last cell. Draw it there
+	 * as its own key/desc pair on the second row, and reflect the current
+	 * mode in the label. Only on the editing bar (^\ is a no-op in the
+	 * picker). Key is inverse-video like the grid keys.
+	 */
+	{
+		int kx = TW_CELL_PX + 7 * TW_HINT_COL * TW_CELL_PX;  /* 8th column */
+		int py = s->hint_y + TW_ROW_PX;                      /* second row */
+		int dx = kx + 3 * TW_CELL_PX;                        /* short gap */
+		const char *desc = s->two_panel ? "1-col" : "2-col";
+		/* end of the label (key gap + 5-char desc), in px */
+		int end = dx + (int)strlen(desc) * TW_CELL_PX;
+
+		if (end <= s->fb_w) {   /* only draw if the whole cell fits */
+			draw_str(kx, py, "^\\", C_HINT, C_BARTX);
+			draw_str(dx, py, desc, C_BARTX, C_HINT);
+		}
+	}
 }
 
 /*
@@ -802,9 +909,17 @@ static void draw_picker(struct tw_state *s)
  */
 void tw_render(struct tw_state *s)
 {
-	int first = s->first_paint;
+	int first;
 
 	d_any = 0;   /* reset per-frame damage */
+
+	/* A one/two-panel toggle changes the whole text layout: force a full
+	 * repaint (belt-and-suspenders with the ^\ handler's first_paint). */
+	if (s->two_panel != s->last_two_panel) {
+		s->first_paint = 1;
+		s->last_two_panel = s->two_panel;
+	}
+	first = s->first_paint;
 
 	if (s->first_paint) {
 		fill_rect(0, 0, s->fb_w, s->fb_h, C_BG);

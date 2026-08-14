@@ -69,7 +69,7 @@
 #define KEY_CTRL_D    0x04       /* delete char under cursor */
 #define KEY_CTRL_E    0x05       /* end of line */
 #define KEY_CTRL_F    0x06       /* forward one char */
-#define KEY_CTRL_G    0x07       /* help */
+#define KEY_CTRL_G    0x07       /* unused: emits as Backspace on this keyboard */
 #define KEY_CTRL_K    0x0B       /* kill to end of line */
 #define KEY_CTRL_N    0x0E       /* next line */
 #define KEY_CTRL_P    0x10       /* previous line */
@@ -82,6 +82,7 @@
 #define KEY_CTRL_X    0x18       /* exit */
 #define KEY_CTRL_Y    0x19       /* yank (paste kill buffer) */
 #define KEY_CTRL_SPACE 0x00      /* Ctrl-Space (a.k.a. Ctrl-@): toggle Wubi/En */
+#define KEY_CTRL_BACKSLASH 0x1C  /* Ctrl-'\' : toggle one/two-column (panel) view */
 
 /* Brightness. Ctrl chording punctuation is keymap-dependent. On this board's
  * cros_ec keyboard, VERIFIED: Ctrl-'-' emits 0x1F (= Ctrl-'_') and Ctrl-']'
@@ -189,6 +190,13 @@ struct tw_state {
 	int   cur_col;      /* cursor column in codepoints */
 	int   scroll_top;   /* first visible file line */
 
+	/* Two-column ("panel") view: the document flows continuously - screen
+	 * rows fill the LEFT panel top-to-bottom, then continue into the RIGHT
+	 * panel (like two facing pages). Toggled by Ctrl-'\', default OFF,
+	 * session-only. Text still soft-wraps, but to the narrower per-panel
+	 * width. See tw_recalc_geometry() / the renderer in cmd_tw_video.c. */
+	int   two_panel;    /* 0 = single column (default), 1 = two panels */
+
 	int   dirty;
 	int   quit;
 	int   writable;    /* 0 = read-only (default); saving is refused */
@@ -229,10 +237,19 @@ struct tw_state {
 	/* framebuffer-derived geometry (pixels + derived cols/rows) */
 	int   fb_w, fb_h;       /* screen pixels */
 	int   text_x0, text_y0; /* top-left px of the text area */
-	int   text_cols;        /* usable screen columns (of TW_CELL_PX px) */
-	int   text_rows;        /* usable text rows (of TW_ROW_PX px) */
+	int   text_cols;        /* usable screen columns (of TW_CELL_PX px);
+				 * in two-panel mode this is the PER-PANEL width,
+				 * so all wrap math wraps to one panel. */
+	int   text_rows;        /* usable text rows per panel (of TW_ROW_PX px) */
 	int   bar_y;            /* top px of the candidate bar */
 	int   hint_y;           /* top px of the shortcut-hint bar */
+
+	/* Derived two-panel geometry (recomputed by tw_recalc_geometry on init
+	 * and on every Ctrl-'\' toggle). panel_x0[0]/[1] are the left/right
+	 * panel text origins in px; in single-panel mode only [0] is used and
+	 * equals text_x0. A screen row 0..2*text_rows-1 maps into these. */
+	int   panel_x0[2];      /* left / right panel text x-origin (px) */
+	int   last_two_panel;   /* to force a full repaint when the mode flips */
 
 	/* Dirty tracking: the renderer repaints only what changed since the
 	 * last frame, which is the key to typing latency (a full-screen repaint

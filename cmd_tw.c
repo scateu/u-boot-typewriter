@@ -51,6 +51,8 @@ int  tw_video_init(struct tw_state *s);
 void tw_render(struct tw_state *s);
 int  tw_cp_cols(u32 cp);
 int  tw_line_rows(struct tw_state *s, int fr);
+void tw_recalc_geometry(struct tw_state *s);  /* re-split text area on ^\ toggle */
+int  tw_panel_capacity(struct tw_state *s);   /* visible screen-row capacity */
 int  tw_backlight_set(int pct);   /* set brightness 0..100, returns applied */
 int  tw_backlight_step(int delta);/* step by delta (+/-), returns applied */
 
@@ -689,12 +691,18 @@ static void tw_clear_status(struct tw_state *s)
 /*
  * Keep the cursor's logical line visible, counting SCREEN rows (soft-wrapped),
  * not logical lines - a wrapped long line can occupy several rows, so a
- * screenful holds fewer lines than text_rows. If the cursor line is above the
- * viewport, snap scroll_top to it; if the rows from scroll_top through the
- * cursor line exceed the screen, advance scroll_top until they fit.
+ * screenful holds fewer lines than the row capacity. The capacity is one panel
+ * high in single-column mode and TWO panels high in two-panel mode (the flow
+ * spills from the left panel into the right), so the cursor walks down the left
+ * panel, then the right, and only once it passes the last row of the right
+ * panel does scroll_top advance - one logical line at a time, the minimal
+ * amount, so both panels scroll together smoothly. If the cursor line is above
+ * the viewport, snap scroll_top up to it.
  */
 static void tw_scroll_adjust(struct tw_state *s)
 {
+	int cap = tw_panel_capacity(s);
+
 	if (s->cur_row < s->scroll_top)
 		s->scroll_top = s->cur_row;
 	if (s->scroll_top < 0)
@@ -705,7 +713,7 @@ static void tw_scroll_adjust(struct tw_state *s)
 
 		for (fr = s->scroll_top; fr <= s->cur_row; fr++)
 			rows += tw_line_rows(s, fr);
-		if (rows <= s->text_rows || s->scroll_top >= s->cur_row)
+		if (rows <= cap || s->scroll_top >= s->cur_row)
 			break;
 		s->scroll_top++;        /* cursor line overflows: scroll down */
 	}
@@ -2039,6 +2047,21 @@ static void tw_handle_key(struct tw_state *s, int key)
 		return;
 	}
 
+	/* Ctrl-'\' toggles the two-column (panel) view in any state (before the
+	 * composer, like ^Space). Re-split the text area, keep the cursor valid,
+	 * re-fit the viewport, and force a full repaint into the new layout. */
+	if (key == KEY_CTRL_BACKSLASH) {
+		s->two_panel = !s->two_panel;
+		tw_recalc_geometry(s);
+		tw_clamp_col(s);
+		tw_scroll_adjust(s);
+		s->first_paint = 1;             /* full repaint into new layout */
+		tw_status(s, "[ %s-column view ]",
+			  s->two_panel ? "Two" : "One");
+		tw_mark_dirty(s, &snap);
+		return;
+	}
+
 	/* Let the Wubi composer consume the key first (a-z, digits, space,
 	 * paging, backspace-while-composing, ...). */
 	if (tw_ime_key(s, key)) {
@@ -2130,16 +2153,16 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_META_F:      s->cur_col = tw_next_word_col(s); break;
 
 	case KEY_PAGE_UP: {
-		int i;
+		int i, n = tw_panel_capacity(s);   /* a full (two-panel) screen */
 
-		for (i = 0; i < s->text_rows; i++)
+		for (i = 0; i < n; i++)
 			tw_move_up(s);
 		break;
 	}
 	case KEY_PAGE_DOWN: {
-		int i;
+		int i, n = tw_panel_capacity(s);
 
-		for (i = 0; i < s->text_rows; i++)
+		for (i = 0; i < n; i++)
 			tw_move_down(s);
 		break;
 	}
@@ -2339,12 +2362,13 @@ U_BOOT_CMD(
 	"  NOTE: mmc 0 (eMMC) is ALWAYS read-only - its FAT writes\n"
 	"        corrupt the card; save on mmc 1 (microSD) instead.\n"
 	"Keys (readline-style):\n"
-	"  ^S save  ^R open (pick)  ^X exit  ^Q power off / boot OS  ^G help\n"
+	"  ^S save  ^R open (pick)  ^X exit  ^Q power off / boot OS\n"
 	"  ^T battery %/AC/current  ^V run-cmd (insert output)  ^B/^F char\n"
 	"  ^P/^N line\n"
 	"  ^A/^E bol/eol  arrows move\n"
 	"  ^D del  ^W del-word-back  ^K kill-eol  ^Y yank\n"
 	"  ^- dim / ^] brighten backlight (5% steps)\n"
+	"  ^\\ toggle two-column (panel) view (default off)\n"
 	"  ^Space toggle Wubi/English; in Wubi: a-z code,\n"
 	"  1-9/Space commit, =/- page, Esc cancel"
 );
