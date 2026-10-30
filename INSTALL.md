@@ -29,6 +29,7 @@ cp *.c *.h $LB/src/u-boot/default/cmd/
 
 # 3. build U-Boot then coreboot
 cd $LB
+./mk -m u-boot gru_kevin          # tinkering u-boot configs
 ./mk -c u-boot gru_kevin          # clean, so the config change is picked up
 rm -f elf/u-boot/default/gru_kevin/default/*   # force coreboot to re-pull u-boot
 ./mk -b u-boot gru_kevin
