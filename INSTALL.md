@@ -30,8 +30,8 @@ cp *.c *.h $LB/src/u-boot/default/cmd/
 # 3. build U-Boot then coreboot
 cd $LB
 ./mk -c u-boot gru_kevin          # clean, so the config change is picked up
-./mk -b u-boot gru_kevin
 rm -f elf/u-boot/default/gru_kevin/default/*   # force coreboot to re-pull u-boot
+./mk -b u-boot gru_kevin
 ./mk -b coreboot gru_kevin
 
 # 4. flash bin/gru_kevin/uboot_gru_kevin_libgfxinit_corebootfb.rom
