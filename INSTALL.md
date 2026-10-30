@@ -18,6 +18,7 @@ board-specific companion to the generic integration notes in
 ```sh
 # in the libreboot source tree:
 LB=~/repo/libreboot/libreboot-26.01rev1_src
+export XBMK_THREADS=40  #parallel compiling
 
 # 1. put the typewriter sources in U-Boot's cmd/ (once)
 cp *.c *.h $LB/src/u-boot/default/cmd/
