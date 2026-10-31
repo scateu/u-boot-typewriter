@@ -94,8 +94,9 @@ You need two inputs next to these sources:
 - `unifont.hex` — the GNU Unifont glyph source. Fetch it once:
 
   ```sh
-  curl -fL -o unifont.hex \
-    https://unifoundry.com/pub/unifont/unifont-15.1.05/font-builds/unifont-15.1.05.hex
+  curl -fL -o unifont.hex.gz \
+    https://unifoundry.com/pub/unifont/unifont-15.1.05/font-builds/unifont-15.1.05.hex.gz
+  gunzip unifont.hex.gz
   # or on Debian/Ubuntu: apt install unifont; cp /usr/share/unifont/unifont.hex .
   ```
 
