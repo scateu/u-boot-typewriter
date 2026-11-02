@@ -1482,32 +1482,9 @@ static int tw_poweroff_event_pending(void)
 {
 	struct udevice *ec = tw_ec();
 	uint32_t events = 0;
-	int dummy_pct, dummy_chg, dummy_ac, charge_state_ret; // Probe if the lid is closed.
 
 	if (!ec)
 		return 0;
-
-	/*
-	 * DESIGN PRINCIPLE: Tactical Protocol v3 Event Pump & Bus Hang Interception
-	 *
-	 * Before parsing single-shot host events, invoke a heavy battery state query.
-	 * Under standard conditions (lid open), this flushes out the persistent
-	 * cold-boot power button artifact registered during initial board staging.
-	 *
-	 * Crucially, if the machine was accidentally powered on inside a bag while
-	 * flat-closed, the ChromeOS EC firmware restricts or completely suspends
-	 * the SPI/I2C tunnel interface. This active-query will reliably drop out with
-	 * a negative error code (e.g., -EIO, -ETIMEDOUT, or -ENODEV). We capture
-	 * this bus exception directly as an absolute indicator of a closed-lid hazard.
-	 */
-	charge_state_ret = tw_read_charge_state(&dummy_pct, &dummy_chg, &dummy_ac);
-	if (charge_state_ret < 0) {
-		/*
-		 * Bus transaction failed due to lid-induced interface suspension.
-		 * Treat this transmission anomaly as a valid shutdown trigger.
-		 */
-		return 1;
-	}
 
 	if (cros_ec_get_host_events(ec, &events))
 		return 0;
@@ -2371,19 +2348,6 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 
 	tw_bind_ime(s);
 	//tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
-	/* 
-	 * Post-Boot Staging Shield & Protocol-v3 Flush Barrier
-	 * 
-	 * Give the hardware a tiny 100ms settling time, then active-call the 
-	 * packet pump. If the system was launched with the lid shut, this either 
-	 * hits an immediate bus timeout or a sustained host-event bitmask, 
-	 * successfully aborting editor staging to execute PSCI poweroff.
-	 */
-	mdelay(100);
-	if (tw_poweroff_event_pending()) {
-		tw_poweroff(s);
-		return CMD_RET_SUCCESS; /* Instantly kill the system */
-	}
 	tw_set_cpu_408();            /* A53 -> 408 MHz + 0.80 V OPP (cooler idle) */
 	tw_set_ddr_400();            /* DDR 928 -> 400 MHz (bl31 SIP; always-on draw) */
 	tw_gate_unused_domains();    /* gate GPU/codec/USB3/GMAC/TCPD + USB2 (~35 mA) */
