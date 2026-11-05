@@ -2355,7 +2355,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 		s->writable = 0;
 
 	tw_bind_ime(s);
-	//tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
+	tw_poweroff_events_clear();  /* drop any power-btn/lid latch from launch */
 	tw_set_cpu_408();            /* A53 -> 408 MHz + 0.80 V OPP (cooler idle) */
 	tw_set_ddr_400();            /* DDR 928 -> 400 MHz (bl31 SIP; always-on draw) */
 	tw_gate_unused_domains();    /* gate GPU/codec/USB3/GMAC/TCPD + USB2 (~35 mA) */
