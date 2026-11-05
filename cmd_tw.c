@@ -2097,6 +2097,14 @@ static void tw_handle_key(struct tw_state *s, int key)
 	}
 
 	switch (key) {
+ 	case KEY_CTRL_L:
+ 		s->first_paint = 1;   /* 物理信号：强制下一帧重走底册全清除重绘 */
+ 		s->dirty_all = 1;
+ 		s->dirty_title = 1;
+ 		s->dirty_bar = 1;
+ 		s->dirty_hints = 1;
+ 		tw_status(s, "[ Screen refreshed ]");
+ 		break;
 	case KEY_CTRL_S:            /* save (one-handed) */
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;

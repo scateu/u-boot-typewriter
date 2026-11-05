@@ -534,7 +534,9 @@ static void draw_text_from(struct tw_state *s, int sr0, int fr0)
 		int col = 0, i, px0, py;
 
 		tw_vrow_to_px(s, sr, &px0, &py);
-		clear_row(s, sr);
+ 		/* 🔧 改良一：每一次重绘该行时，先用条带矩形将这单单一行的整条轨迹直接抹净 
+ 		   这能够100% 确保退格删除、合并行、字数变短时，尾部和行缩进留下的脏字符被擦洗得一干二净！*/
+ 		fill_rect(px0, py, s->text_cols * TW_CELL_PX, TW_ROW_PX, C_BG);
 		for (i = 0; i < s->line_len[fr]; i++) {
 			u32 cp = s->lines[fr][i];
 			int cw = tw_cp_cols(cp);
@@ -545,7 +547,8 @@ static void draw_text_from(struct tw_state *s, int sr0, int fr0)
 					break;
 				col = 0;
 				tw_vrow_to_px(s, sr, &px0, &py);
-				clear_row(s, sr);
+ 				/* 🔧 换行时同步执行单行物理净空 */
+ 				fill_rect(px0, py, s->text_cols * TW_CELL_PX, TW_ROW_PX, C_BG);
 			}
 			draw_glyph(px0 + col * TW_CELL_PX, py, cp, C_FG, C_BG);
 			col += cw;
@@ -553,9 +556,13 @@ static void draw_text_from(struct tw_state *s, int sr0, int fr0)
 		sr++;                   /* next logical line starts a new row */
 		fr++;
 	}
-	/* clear any leftover rows below the last content line */
-	while (sr < cap)
-		clear_row(s, sr++);
+ 	/* 🔧 改良二：如果有行往上缩进（如退格删掉一整行），下方空出来的多余物理行也必须条带清除，不留旧影 */
+ 	while (sr < cap) {
+ 		int px0, py;
+ 		tw_vrow_to_px(s, sr, &px0, &py);
+ 		fill_rect(px0, py, s->text_cols * TW_CELL_PX, TW_ROW_PX, C_BG);
+ 		sr++;
+ 	}
 }
 
 /* In two-panel mode, paint the thin vertical divider centered in the gutter
@@ -760,7 +767,7 @@ static void draw_bar(struct tw_state *s)
  * (inverse-video) block; the description sits on the plain hint-bar background.
  * The hint bar bg (C_HINT) is a touch darker than the title/candidate bar.
  */
-#define TW_HINT_COLS   7
+#define TW_HINT_COLS   8
 #define TW_HINT_COL    16    /* full cell width, in character cells */
 #define TW_HINT_KEYW   6     /* key sub-column width (chars) before the desc */
 struct hint { const char *key, *desc; };
@@ -806,21 +813,22 @@ static void draw_hints(struct tw_state *s)
 	static const struct hint edit1[TW_HINT_COLS] = {
 		{"^S", "Save"},  {"^A/^E", "BOL/EOL"}, {"^B/^F", "back/fwd"},
 		{"^K", "Kill"},  {"^W", "DelWord"},    {"^Spc", "Wubi"},
-		{"^T", "Battery"},
+		{"^T", "Battery"}, {"^\\", "1/2-col"}, /* ⬅️ 第 8 列第 1 行 */
 	};
 	static const struct hint edit2[TW_HINT_COLS] = {
 		{"^X", "Exit"},  {"^R", "Open"},       {"^P/^N", "prev/next"},
 		{"^D", "Del"},   {"^-/^]", "Bright"},  {"^Q", "PowerOff"},
 		{"^V", "Run cmd"},  /* 7th slot: directly below ^T Battery */
+ 		{"^L", "Refresh"},   
 	};
 	/* Picker bar: only what works in the file browser. */
 	static const struct hint pick1[TW_HINT_COLS] = {
 		{"Enter", "Open"}, {"n", "New"},    {"r", "Rename"},
-		{"d", "Delete"},   {NULL, NULL},    {NULL, NULL}, {NULL, NULL},
+		{"d", "Delete"},   {NULL, NULL},    {NULL, NULL}, {NULL, NULL}, {NULL, NULL},
 	};
 	static const struct hint pick2[TW_HINT_COLS] = {
 		{"Arrow", "Move"}, {"^P/^N", "Move"}, {"Esc", "Cancel"},
-		{NULL, NULL}, {NULL, NULL}, {NULL, NULL}, {NULL, NULL},
+		{NULL, NULL}, {NULL, NULL}, {NULL, NULL}, {NULL, NULL}, {NULL, NULL},
 	};
 	int in_picker = (s->prompt == TW_PROMPT_PICK ||
 			 s->prompt == TW_PROMPT_NEW ||
@@ -833,27 +841,6 @@ static void draw_hints(struct tw_state *s)
 	}
 
 	draw_hint_rows(s, edit1, edit2);
-
-	/*
-	 * The two-column toggle (^\) doesn't fit the 7-column grid stride, but
-	 * there's free space at the right edge past the last cell. Draw it there
-	 * as its own key/desc pair on the second row, and reflect the current
-	 * mode in the label. Only on the editing bar (^\ is a no-op in the
-	 * picker). Key is inverse-video like the grid keys.
-	 */
-	{
-		int kx = TW_CELL_PX + 7 * TW_HINT_COL * TW_CELL_PX;  /* 8th column */
-		int py = s->hint_y + TW_ROW_PX;                      /* second row */
-		int dx = kx + 3 * TW_CELL_PX;                        /* short gap */
-		const char *desc = s->two_panel ? "1-col" : "2-col";
-		/* end of the label (key gap + 5-char desc), in px */
-		int end = dx + (int)strlen(desc) * TW_CELL_PX;
-
-		if (end <= s->fb_w) {   /* only draw if the whole cell fits */
-			draw_str(kx, py, "^\\", C_HINT, C_BARTX);
-			draw_str(dx, py, desc, C_BARTX, C_HINT);
-		}
-	}
 }
 
 /*

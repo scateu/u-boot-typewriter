@@ -71,6 +71,7 @@
 #define KEY_CTRL_F    0x06       /* forward one char */
 #define KEY_CTRL_G    0x07       /* unused: emits as Backspace on this keyboard */
 #define KEY_CTRL_K    0x0B       /* kill to end of line */
+#define KEY_CTRL_L    0x0C       /* 新增：Ctrl-L 物理全屏强制刷新重绘 */
 #define KEY_CTRL_N    0x0E       /* next line */
 #define KEY_CTRL_P    0x10       /* previous line */
 #define KEY_CTRL_Q    0x11       /* power off (save+sync+EC hibernate), confirmed */
